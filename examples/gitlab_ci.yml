@@ -1,0 +1,17 @@
+stages:
+  - docs
+
+docflow-update:
+  stage: docs
+  image: python:3.12
+  only:
+    - main
+    - develop
+  script:
+    - pip install docflow
+    - git clone https://oauth2:${DOCS_REPO_TOKEN}@gitlab.com/your-org/project-docs.git docs-repo
+    - docflow generate --repo . --docs docs-repo --branch $CI_COMMIT_REF_NAME
+    - docflow status --repo . --docs docs-repo
+    - docflow publish --docs docs-repo --platform gitlab
+  variables:
+    GITLAB_PRIVATE_TOKEN: $DOCS_REPO_TOKEN

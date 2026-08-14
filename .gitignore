@@ -1,0 +1,67 @@
+# Python
+**/__pycache__/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Local DocFlow pairing for this working tree (not product source)
+.docflow.yml
+.docflow-state.json
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Local DocFlow config for this working tree (not product source)
+.docflow.yml
+.docflow-state.json
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local test docs repositories
+test-docs-repo/
+docs-repo/
+*.log
+
+# IDE & OS
+.idea/
+.vscode/
+.DS_Store

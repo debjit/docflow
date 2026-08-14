@@ -1,0 +1,51 @@
+name: DocFlow — Automated Documentation Update
+
+on:
+  push:
+    branches: [main, develop]
+  workflow_dispatch:
+    inputs:
+      full_regen:
+        description: 'Perform full documentation regeneration'
+        type: boolean
+        default: false
+
+jobs:
+  update-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Application Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout Documentation Repository
+        uses: actions/checkout@v4
+        with:
+          repository: 'your-org/project-docs'
+          token: ${{ secrets.DOCS_REPO_TOKEN }}
+          path: 'docs-repo'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install DocFlow
+        run: pip install docflow
+
+      - name: Generate Documentation Prompt / Update
+        run: |
+          if [ "${{ inputs.full_regen }}" = "true" ]; then
+            docflow generate --repo . --docs docs-repo --full
+          else
+            docflow generate --repo . --docs docs-repo --branch ${{ github.ref_name }}
+          fi
+
+      - name: Update Work-in-Progress Status
+        run: docflow status --repo . --docs docs-repo
+
+      - name: Publish & Create Pull Request
+        run: docflow publish --docs docs-repo --platform github
+        env:
+          GITHUB_TOKEN: ${{ secrets.DOCS_REPO_TOKEN }}

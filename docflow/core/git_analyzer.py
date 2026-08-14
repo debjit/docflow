@@ -1,0 +1,316 @@
+"""
+Git repository analyzer for extracting change manifests and feature chunks.
+"""
+
+import os
+from pathlib import Path
+from typing import List, Dict, Optional, Set
+from git import Repo
+from unidiff import PatchSet
+
+from docflow.core.models import ChangeManifest, FileChange, BranchInfo, FeatureChunk
+
+# File extensions mapped to language names
+LANGUAGE_MAP = {
+    ".py": "python",
+    ".js": "javascript",
+    ".ts": "typescript",
+    ".jsx": "react",
+    ".tsx": "react-typescript",
+    ".go": "go",
+    ".rs": "rust",
+    ".java": "java",
+    ".kt": "kotlin",
+    ".cpp": "cpp",
+    ".c": "c",
+    ".h": "c",
+    ".hpp": "cpp",
+    ".sh": "bash",
+    ".yaml": "yaml",
+    ".yml": "yaml",
+    ".json": "json",
+    ".md": "markdown",
+    ".sql": "sql",
+    ".html": "html",
+    ".css": "css",
+}
+
+DEFAULT_IGNORE = {
+    ".git", ".github", "node_modules", "dist", "build", "__pycache__",
+    ".venv", "venv", ".idea", ".vscode", "*.lock", "package-lock.json",
+    ".pytest_cache", "test-docs-repo", "docs-repo", "*.egg-info", "docflow.egg-info"
+}
+
+
+class GitAnalyzer:
+    """Analyzes git repositories to generate change manifests and feature chunkings."""
+
+    def __init__(self, repo_path: str):
+        self.repo_path = os.path.abspath(repo_path)
+        if not os.path.isdir(self.repo_path):
+            raise ValueError(f"Repository path does not exist: {self.repo_path}")
+        try:
+            self.repo = Repo(self.repo_path)
+        except Exception as e:
+            raise ValueError(f"Failed to open git repository at {self.repo_path}: {e}")
+
+    def _detect_language(self, path: str) -> Optional[str]:
+        ext = Path(path).suffix.lower()
+        return LANGUAGE_MAP.get(ext)
+
+    def extract_diff(
+        self,
+        base_ref: str = "HEAD~1",
+        head_ref: str = "HEAD",
+        full_diff_threshold: int = 200,
+        ignore_patterns: Optional[Set[str]] = None,
+    ) -> ChangeManifest:
+        """
+        Extracts a ChangeManifest representing differences between base_ref and head_ref.
+        """
+        ignore = ignore_patterns or DEFAULT_IGNORE
+        try:
+            if base_ref == head_ref:
+                raw_diff = self.repo.git.diff("4b825dc642cb6eb9a060e54bf8d69288fbee4904", head_ref)
+            else:
+                raw_diff = self.repo.git.diff(base_ref, head_ref)
+        except Exception:
+            # Fallback to initial commit or empty tree diff if base_ref (e.g. HEAD~1) is invalid
+            try:
+                # 4b825dc642cb6eb9a060e54bf8d69288fbee4904 is Git's magic empty tree SHA
+                raw_diff = self.repo.git.diff("4b825dc642cb6eb9a060e54bf8d69288fbee4904", head_ref)
+            except Exception:
+                raw_diff = ""
+        patch = PatchSet(raw_diff)
+
+        file_changes: List[FileChange] = []
+        for patched_file in patch:
+            path = patched_file.path
+            # Check ignore rules
+            if any(part in ignore for part in Path(path).parts):
+                continue
+
+            change_type = "modified"
+            if patched_file.is_added_file:
+                change_type = "added"
+            elif patched_file.is_removed_file:
+                change_type = "deleted"
+            elif patched_file.is_rename:
+                change_type = "renamed"
+
+            added_lines = patched_file.added
+            removed_lines = patched_file.removed
+            full_diff_str = str(patched_file)
+
+            # Condense diff if it exceeds threshold
+            if (added_lines + removed_lines) > full_diff_threshold:
+                # Create a condensed diff summary (hunk headers + signatures)
+                summary_lines = []
+                for hunk in patched_file:
+                    summary_lines.append(f"@@ -{hunk.source_start},{hunk.source_length} +{hunk.target_start},{hunk.target_length} @@")
+                    for line in hunk:
+                        # Include additions and signatures
+                        if line.is_added or line.is_removed:
+                            val = str(line.value).strip()
+                            if val.startswith("def ") or val.startswith("class ") or val.startswith("export ") or val.startswith("func "):
+                                prefix = "+" if line.is_added else "-"
+                                summary_lines.append(f"{prefix} {val}")
+                diff_summary = "\n".join(summary_lines[:50])
+            else:
+                diff_summary = full_diff_str
+
+            file_changes.append(
+                FileChange(
+                    path=path,
+                    old_path=patched_file.source_file if patched_file.is_rename else None,
+                    change_type=change_type,
+                    language=self._detect_language(path),
+                    diff_summary=diff_summary,
+                    full_diff=full_diff_str,
+                    added_lines=added_lines,
+                    removed_lines=removed_lines,
+                )
+            )
+
+        # Collect commit messages
+        commit_messages = []
+        try:
+            commits = list(self.repo.iter_commits(f"{base_ref}..{head_ref}"))
+            commit_messages = [c.message.strip() for c in commits]
+        except Exception:
+            commit_messages = [f"Changes from {base_ref} to {head_ref}"]
+
+        # Extract branch info if available
+        branch_info = BranchInfo(
+            source_branch=head_ref,
+            target_branch=base_ref,
+        )
+
+        return ChangeManifest(
+            repo_path=self.repo_path,
+            base_ref=base_ref,
+            head_ref=head_ref,
+            merge_description="\n".join(commit_messages[:5]),
+            changed_files=file_changes,
+            commit_messages=commit_messages,
+            branch_info=branch_info,
+        )
+
+    def list_commits(self, max_count: int = 15, rev: str = "HEAD") -> List[Dict[str, str]]:
+        """Recent commits on rev (HEAD or a branch), newest first."""
+        commits = []
+        try:
+            for commit in self.repo.iter_commits(rev or "HEAD", max_count=max_count):
+                commits.append({
+                    "sha": commit.hexsha,
+                    "short_sha": commit.hexsha[:8],
+                    "message": commit.message.strip().splitlines()[0],
+                    "author": str(commit.author),
+                })
+        except Exception:
+            return []
+        return commits
+
+    def list_branches(self) -> List[str]:
+        names = [head.name for head in self.repo.heads]
+        try:
+            current = self.repo.active_branch.name
+            names.sort(key=lambda name: (name != current, name.lower()))
+        except Exception:
+            names.sort(key=str.lower)
+        return names
+
+    def is_ancestor(self, maybe_ancestor: str, rev: str = "HEAD") -> bool:
+        if not maybe_ancestor:
+            return False
+        try:
+            return bool(self.repo.is_ancestor(maybe_ancestor, rev or "HEAD"))
+        except Exception:
+            return False
+
+    def head_commit(self, rev: str = "HEAD") -> Optional[Dict[str, str]]:
+        rows = self.list_commits(max_count=1, rev=rev)
+        return rows[0] if rows else None
+
+    def commits_between(self, base_ref: str, head_ref: str) -> List[Dict[str, str]]:
+        """Commits reachable from head_ref but not base_ref (newest first)."""
+        commits = []
+        try:
+            iterable = self.repo.iter_commits(f"{base_ref}..{head_ref}")
+            for commit in iterable:
+                commits.append({
+                    "sha": commit.hexsha,
+                    "short_sha": commit.hexsha[:8],
+                    "message": commit.message.strip().splitlines()[0],
+                    "author": str(commit.author),
+                })
+        except Exception:
+            return self.list_commits(max_count=1)
+        return commits
+
+    def scan_features(
+        self,
+        ignore_patterns: Optional[Set[str]] = None,
+        include_architecture: bool = True,
+    ) -> List[FeatureChunk]:
+        """
+        Scans the repository structure and groups source files into logical feature chunks for init.
+        """
+        ignore = ignore_patterns or DEFAULT_IGNORE
+        feature_map: Dict[str, List[str]] = {}
+
+        for root, dirs, files in os.walk(self.repo_path):
+            # Exclude ignored directories in-place
+            dirs[:] = [d for d in dirs if d not in ignore]
+
+            rel_root = os.path.relpath(root, self.repo_path)
+            if rel_root == ".":
+                parts = []
+            else:
+                parts = Path(rel_root).parts
+
+            for file in files:
+                if any(file.endswith(ext.replace("*", "")) for ext in ignore if "*" in ext):
+                    continue
+
+                rel_file_path = os.path.normpath(os.path.join(rel_root, file))
+
+                # Determine feature bucket
+                if len(parts) == 0:
+                    feature_name = "core"
+                elif parts[0].startswith("."):
+                    feature_name = "config"
+                elif parts[0] in ("src", "lib", "app", "pkg"):
+                    if len(parts) > 1:
+                        feature_name = parts[1]
+                    else:
+                        feature_name = "core"
+                else:
+                    feature_name = parts[0]
+
+                if feature_name.startswith("."):
+                    feature_name = "config"
+
+                feature_map.setdefault(feature_name, []).append(rel_file_path)
+
+        # Convert feature map to FeatureChunk models
+        chunks = []
+
+        # 1. First: Infrastructure & Architecture chunk
+        infra_files = [f for f in feature_map.get("core", []) if any(k in f.lower() for k in ("docker", "compose", "k8s", "deploy", "config", "env", "helm", "terraform", "server", "main", "app"))]
+        if not infra_files:
+            infra_files = feature_map.get("core", [])[:5]
+
+        if include_architecture:
+            chunks.append(
+                FeatureChunk(
+                    feature_name="architecture",
+                    description="System architecture, hosting environment (Dev/Staging/Prod), frameworks, and core dependencies.",
+                    file_paths=infra_files or ["pyproject.toml", "Dockerfile", "docker-compose.yml"],
+                    sample_snippets={}
+                )
+            )
+
+        for feature, files in feature_map.items():
+            if feature == "architecture":
+                continue
+            # Grab short snippets for entry files
+            snippets = {}
+            for fpath in files[:5]:
+                full_p = os.path.join(self.repo_path, fpath)
+                try:
+                    with open(full_p, "r", encoding="utf-8", errors="ignore") as f:
+                        lines = [f.readline() for _ in range(20)]
+                        snippets[fpath] = "".join(lines)
+                except Exception:
+                    pass
+
+            chunks.append(
+                FeatureChunk(
+                    feature_name=feature,
+                    description=f"Feature module for '{feature}' containing {len(files)} file(s).",
+                    file_paths=files,
+                    sample_snippets=snippets,
+                )
+            )
+
+        return chunks
+
+    def find_existing_docs(self) -> Dict[str, str]:
+        """Finds pre-existing documentation files in the repository (e.g. README.md, docs/, etc.)."""
+        existing_docs = {}
+        for root, _, files in os.walk(self.repo_path):
+            rel_root = os.path.relpath(root, self.repo_path)
+            if rel_root.startswith(".git") or rel_root.startswith(".venv") or "node_modules" in rel_root:
+                continue
+            for file in files:
+                if file.endswith(".md") and not file.startswith("."):
+                    rel_path = os.path.normpath(os.path.join(rel_root, file))
+                    full_p = os.path.join(self.repo_path, rel_path)
+                    try:
+                        with open(full_p, "r", encoding="utf-8", errors="ignore") as f:
+                            existing_docs[rel_path] = f.read()
+                    except Exception:
+                        pass
+        return existing_docs
+

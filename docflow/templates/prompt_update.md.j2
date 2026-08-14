@@ -1,0 +1,68 @@
+# Documentation Task: Update "{{ feature_name }}" ({{ doc_type }})
+
+## What Happened
+Merge from `{{ change_manifest.base_ref }}` to `{{ change_manifest.head_ref }}` in project **{{ project_name }}**.
+
+Doc type: **{{ doc_type }}**
+{% if doc_type_description %}
+What belongs here: {{ doc_type_description }}
+{% endif %}
+Output directory: `{{ output_dir }}/`
+
+### Commit Messages
+{% for msg in change_manifest.commit_messages %}
+- {{ msg }}
+{% endfor %}
+
+### Changed Files
+| File | Change | Additions | Deletions |
+|------|--------|-----------|-----------|
+{% for file in change_manifest.changed_files %}
+| `{{ file.path }}` | {{ file.change_type }} | +{{ file.added_lines }} | -{{ file.removed_lines }} |
+{% endfor %}
+
+### Key Diffs
+{% for file in change_manifest.changed_files %}
+#### `{{ file.path }}` ({{ file.change_type }})
+```diff
+{{ file.diff_summary }}
+```
+{% endfor %}
+
+{% if existing_index_md %}
+## Existing `{{ output_dir }}/index.md`
+```markdown
+{{ existing_index_md }}
+```
+{% endif %}
+
+{% if existing_context_json %}
+## Existing `{{ output_dir }}/context.json`
+```json
+{{ existing_context_json }}
+```
+{% endif %}
+
+## Task Instructions
+
+Update the **{{ doc_type }}** documentation for `{{ feature_name }}` under `{{ output_dir }}/` based on the code changes. Stay within this type's purpose.
+
+{% if docs_repo_path %}
+### CRITICAL OUTPUT FILE LOCATION DIRECTIVE
+Exact Absolute File Paths to Create/Update:
+- `{{ docs_repo_path }}/{{ output_dir }}/index.md`
+- `{{ docs_repo_path }}/{{ output_dir }}/context.json`
+- `{{ docs_repo_path }}/{{ output_dir }}/files.md`
+- `{{ docs_repo_path }}/{{ output_dir }}/changelog.md`
+{% endif %}
+
+1. **`{{ output_dir }}/index.md`**: Update content; append Change History.
+2. **`{{ output_dir }}/context.json`**: Update JSON metadata.
+3. **`{{ output_dir }}/files.md`**: Update file manifest.
+4. **`{{ output_dir }}/changelog.md`**: Add a change log entry.
+
+## Formatting Rules & Conventions
+
+```markdown
+{{ conventions_text }}
+```

@@ -1,0 +1,67 @@
+# Documentation Task: Initialize "{{ feature_name }}" ({{ doc_type }})
+
+## Context
+Project: **{{ project_name }}**
+Doc type: **{{ doc_type }}**
+{% if doc_type_description %}
+What belongs here: {{ doc_type_description }}
+{% endif %}
+Target section: **{{ feature_name }}**
+Output directory: `{{ output_dir }}/`
+
+## Description
+{% if feature_chunk %}{{ feature_chunk.description }}{% else %}{{ doc_type_description }}{% endif %}
+
+{% if feature_chunk and feature_chunk.file_paths %}
+## Implementation Files
+{% for path in feature_chunk.file_paths %}
+- `{{ path }}`
+{% endfor %}
+{% endif %}
+
+{% if feature_chunk and feature_chunk.sample_snippets %}
+## File Snippets (First 20 Lines)
+{% for path, snippet in feature_chunk.sample_snippets.items() %}
+### File: `{{ path }}`
+```
+{{ snippet }}
+```
+{% endfor %}
+{% endif %}
+
+{% if existing_index_md %}
+## Existing / imported reference material
+```markdown
+{{ existing_index_md }}
+```
+{% endif %}
+
+## Task Instructions
+
+Create documentation for this **{{ doc_type }}** section. Write the kind of content described above (not a generic feature dump).
+
+{% if docs_repo_path %}
+### CRITICAL OUTPUT FILE LOCATION DIRECTIVE
+You MUST write files directly into the target documentation repository:
+Target Base Directory: `{{ docs_repo_path }}`
+
+Exact Absolute File Paths to Create/Write:
+- `{{ docs_repo_path }}/{{ output_dir }}/index.md`
+- `{{ docs_repo_path }}/{{ output_dir }}/context.json`
+- `{{ docs_repo_path }}/{{ output_dir }}/files.md`
+- `{{ docs_repo_path }}/{{ output_dir }}/changelog.md`
+DO NOT overwrite files that already exist unless you are filling in a missing counterpart. Prefer updating empty new files created by init.
+{% endif %}
+
+1. **`{{ output_dir }}/index.md`**: Human-readable docs with YAML frontmatter (`type: "{{ doc_type }}"`). Cover what this type is for.
+2. **`{{ output_dir }}/context.json`**: Compact LLM JSON for this section.
+3. **`{{ output_dir }}/files.md`**: Manifest of relevant source files.
+4. **`{{ output_dir }}/changelog.md`**: Initial change log entry.
+
+## Formatting Rules & Conventions
+
+Follow all standards defined in the conventions document below:
+
+```markdown
+{{ conventions_text }}
+```

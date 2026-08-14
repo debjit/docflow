@@ -1,0 +1,49 @@
+# Documentation Task: Full Regeneration of "{{ feature_name }}" ({{ doc_type }})
+
+## Context
+Project: **{{ project_name }}**
+Doc type: **{{ doc_type }}**
+{% if doc_type_description %}
+What belongs here: {{ doc_type_description }}
+{% endif %}
+Section: **{{ feature_name }}**
+Output directory: `{{ output_dir }}/`
+
+Full regeneration requested.
+
+{% if feature_chunk and feature_chunk.file_paths %}
+### Implementation Files
+{% for path in feature_chunk.file_paths %}
+- `{{ path }}`
+{% endfor %}
+{% endif %}
+
+{% if existing_index_md %}
+## Previous `{{ output_dir }}/index.md` (Reference)
+```markdown
+{{ existing_index_md }}
+```
+{% endif %}
+
+## Task Instructions
+
+Completely regenerate **{{ doc_type }}** documentation for `{{ feature_name }}` under `{{ output_dir }}/`.
+
+{% if docs_repo_path %}
+### CRITICAL OUTPUT FILE LOCATION DIRECTIVE
+- `{{ docs_repo_path }}/{{ output_dir }}/index.md`
+- `{{ docs_repo_path }}/{{ output_dir }}/context.json`
+- `{{ docs_repo_path }}/{{ output_dir }}/files.md`
+- `{{ docs_repo_path }}/{{ output_dir }}/changelog.md`
+{% endif %}
+
+1. **`{{ output_dir }}/index.md`**: Fully rewrite human-readable documentation (`type: "{{ doc_type }}"`).
+2. **`{{ output_dir }}/context.json`**: Rebuild compact JSON metadata.
+3. **`{{ output_dir }}/files.md`**: Re-index relevant files.
+4. **`{{ output_dir }}/changelog.md`**: Add a full regeneration entry.
+
+## Formatting Rules & Conventions
+
+```markdown
+{{ conventions_text }}
+```
