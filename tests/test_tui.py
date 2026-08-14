@@ -4,7 +4,13 @@ Smoke test for the Textual UI.
 
 import pytest
 
-from docflow.tui.app import DocFlowApp
+from docflow.tui.app import DocFlowApp, _agent_select_options
+
+
+def test_agent_select_includes_cursor_agent():
+    keys = [key for _label, key in _agent_select_options()]
+    assert "cursor-agent" in keys
+    assert "cursor-interactive" in keys
 
 
 @pytest.mark.asyncio
@@ -15,6 +21,21 @@ async def test_tui_composes():
         assert app.query_one("#summary")
         assert app.query_one("#log")
         assert app.query_one("#btn-generate")
+
+
+@pytest.mark.asyncio
+async def test_update_docs_modal_has_agent_select():
+    app = DocFlowApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.click("#btn-generate")
+        await pilot.pause()
+        generate = next(
+            screen for screen in app.screen_stack if screen.__class__.__name__ == "GenerateScreen"
+        )
+        assert generate.query_one("#agent")
+        assert generate.query_one("#model-picker")
+        assert generate.query_one("#model-list")
 
 
 @pytest.mark.asyncio

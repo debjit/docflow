@@ -12,6 +12,7 @@ import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+import shlex
 from typing import Callable, List, Optional, Sequence, Tuple
 
 from docflow.config.settings import DocFlowConfig, DocTypeSettings
@@ -136,6 +137,16 @@ class AgentSpec:
     mode: str
     command: str
     name: str = ""
+
+
+@dataclass(frozen=True)
+class ModelChoice:
+    """One LLM a coding agent can run."""
+
+    key: str
+    value: str
+    label: str
+    group: str  # current | third_party
 
 
 @dataclass
@@ -267,11 +278,18 @@ AGENT_CHOICES: Sequence[Tuple[str, str]] = (
     ("agy", "agy — Antigravity CLI (non-interactive)"),
     ("agy-interactive", "agy-interactive — Antigravity CLI (interactive)"),
     ("opencode", "opencode — OpenCode agent"),
-    ("cursor", "cursor — Cursor editor"),
+    ("cursor-agent", "cursor-agent — Cursor agent (non-interactive)"),
+    ("cursor-interactive", "cursor-interactive — Cursor agent (interactive)"),
     ("claude", "claude — Claude Code CLI"),
     ("cline", "cline — Cline"),
     ("manual", "manual — write prompts only, do not run an agent"),
     ("custom", "custom — your own shell command"),
+)
+
+CURSOR_AGENT_KEYS = frozenset({"cursor", "cursor-agent", "cursor-interactive"})
+AGY_AGENT_KEYS = frozenset({"agy", "agy-interactive"})
+_MODEL_FLAG = re.compile(
+    r"\s+--model(?:\s+|=)(?:'(?:\\'|[^'])*'|\"(?:\\\"|[^\"])*\"|\S+)"
 )
 
 
@@ -290,38 +308,209 @@ def is_configured(config: Optional[DocFlowConfig] = None) -> bool:
     return bool(cfg.source_path and cfg.app.repo_path and cfg.docs.repo_path)
 
 
+def agent_supports_models(agent_key: str) -> bool:
+    return agent_key in CURSOR_AGENT_KEYS or agent_key in AGY_AGENT_KEYS
+
+
+def parse_cursor_model_list(output: str) -> List[Tuple[str, str]]:
+    """Parse `agent models` text into (id, label) pairs."""
+    rows: List[Tuple[str, str]] = []
+    seen = set()
+    for raw in (output or "").splitlines():
+        line = raw.strip()
+        if not line or " - " not in line:
+            continue
+        lower = line.lower()
+        if lower.startswith("available") or lower.startswith("tip:"):
+            continue
+        key, label = line.split(" - ", 1)
+        key = key.strip()
+        label = label.strip()
+        if not key or " " in key or key in seen:
+            continue
+        seen.add(key)
+        rows.append((key, label))
+    return rows
+
+
+def parse_agy_model_list(output: str) -> List[Tuple[str, str]]:
+    """Parse `agy models` text into (id, display name) pairs."""
+    rows: List[Tuple[str, str]] = []
+    seen = set()
+    for raw in (output or "").splitlines():
+        line = raw.strip()
+        if not line or line.lower().startswith("fetching"):
+            continue
+        if "\t" in line:
+            key, label = line.split("\t", 1)
+        else:
+            parts = re.split(r"\s{2,}", line, maxsplit=1)
+            if len(parts) != 2:
+                continue
+            key, label = parts
+        key, label = key.strip(), label.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        rows.append((key, label or key))
+    return rows
+
+
+def _label_normal_variants(rows: Sequence[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    keys = {key for key, _ in rows}
+    labeled: List[Tuple[str, str]] = []
+    for key, label in rows:
+        if (
+            f"{key}-fast" in keys
+            and "fast" not in label.lower()
+            and "(normal)" not in label.lower()
+        ):
+            label = f"{label} (normal)"
+        labeled.append((key, label))
+    return labeled
+
+
+def _is_cursor_current(key: str) -> bool:
+    return key == "auto" or key.startswith(("composer-", "cursor-"))
+
+
+def _cursor_current_rank(key: str) -> Tuple[int, str, int]:
+    if key == "auto":
+        return (0, "", 0)
+    if key.startswith("composer-"):
+        return (1, key.replace("-fast", ""), 1 if key.endswith("-fast") else 0)
+    if key.startswith("cursor-"):
+        return (2, key, 0)
+    return (3, key, 0)
+
+
+def catalog_cursor_models(rows: Sequence[Tuple[str, str]]) -> List[ModelChoice]:
+    """Current (Composer, Grok, Auto) first; third-party models underneath."""
+    rows = _label_normal_variants(list(rows))
+    if not any(key == "auto" for key, _ in rows):
+        rows = [("auto", "Auto (default)")] + rows
+    current = [(k, lab) for k, lab in rows if _is_cursor_current(k)]
+    third = [(k, lab) for k, lab in rows if not _is_cursor_current(k)]
+    current.sort(key=lambda item: _cursor_current_rank(item[0]))
+    third.sort(key=lambda item: item[1].lower())
+    choices = [
+        ModelChoice(key=k, value=k, label=lab, group="current") for k, lab in current
+    ]
+    choices.extend(
+        ModelChoice(key=k, value=k, label=lab, group="third_party") for k, lab in third
+    )
+    return choices
+
+
+def catalog_agy_models(rows: Sequence[Tuple[str, str]]) -> List[ModelChoice]:
+    """Gemini first (Antigravity current); Claude/GPT and others under Third-party."""
+    current = [(k, lab) for k, lab in rows if k.startswith("gemini-")]
+    third = [(k, lab) for k, lab in rows if not k.startswith("gemini-")]
+    choices = [
+        ModelChoice(key="default", value="", label="Default (agy default)", group="current")
+    ]
+    choices.extend(
+        ModelChoice(key=k, value=lab, label=lab, group="current") for k, lab in current
+    )
+    choices.extend(
+        ModelChoice(key=k, value=lab, label=lab, group="third_party") for k, lab in third
+    )
+    return choices
+
+
+def list_cursor_models(timeout: float = 20.0) -> List[Tuple[str, str]]:
+    """Ask the Cursor CLI which models this account can use. Empty if unavailable."""
+    try:
+        proc = subprocess.run(
+            ["agent", "models"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
+    return parse_cursor_model_list((proc.stdout or "") + "\n" + (proc.stderr or ""))
+
+
+def list_agy_models(timeout: float = 20.0) -> List[Tuple[str, str]]:
+    """Ask the Antigravity CLI which models this account can use."""
+    try:
+        proc = subprocess.run(
+            ["agy", "models"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
+    return parse_agy_model_list((proc.stdout or "") + "\n" + (proc.stderr or ""))
+
+
+def list_agent_models(agent_key: str) -> List[ModelChoice]:
+    """Grouped model catalog for the selected coding agent."""
+    if agent_key in CURSOR_AGENT_KEYS:
+        return catalog_cursor_models(list_cursor_models())
+    if agent_key in AGY_AGENT_KEYS:
+        return catalog_agy_models(list_agy_models())
+    return []
+
+
+def apply_agent_model(spec: AgentSpec, model: Optional[str]) -> AgentSpec:
+    """Insert or strip `--model` on Cursor/agy/Claude command templates."""
+    cmd = _MODEL_FLAG.sub("", spec.command or "")
+    chosen = (model or "").strip()
+    if not chosen or chosen == "auto":
+        return AgentSpec(mode=spec.mode, command=cmd, name=spec.name)
+    quoted = shlex.quote(chosen)
+    stripped = cmd.lstrip()
+    if spec.name in CURSOR_AGENT_KEYS or stripped.startswith("agent "):
+        cmd = re.sub(r"^(\s*agent)\b", rf"\1 --model {quoted}", cmd, count=1)
+    elif spec.name in AGY_AGENT_KEYS or stripped.startswith("agy "):
+        cmd = re.sub(r"^(\s*agy)\b", rf"\1 --model {quoted}", cmd, count=1)
+    elif spec.name == "claude" or stripped.startswith("claude "):
+        cmd = re.sub(r"^(\s*claude)\b", rf"\1 --model {quoted}", cmd, count=1)
+    return AgentSpec(mode=spec.mode, command=cmd, name=spec.name)
+
+
 def resolve_agent(
     agent: Optional[str] = None,
     mode: Optional[str] = None,
     command: Optional[str] = None,
     config: Optional[DocFlowConfig] = None,
+    model: Optional[str] = None,
 ) -> Optional[AgentSpec]:
     """Resolve agent execution from flags, then saved config. Returns None if unset."""
+    spec: Optional[AgentSpec] = None
     if command:
-        return AgentSpec(mode="shell", command=command, name="custom")
-    if agent:
+        spec = AgentSpec(mode="shell", command=command, name="custom")
+    elif agent:
         name = agent.lower()
         if name == "manual":
-            return AgentSpec(mode="manual", command="", name="manual")
-        if name == "custom":
-            return None
-        cmd = AGENT_PRESETS.get(name, f"{agent} {{prompt_file}}")
-        return AgentSpec(mode="shell", command=cmd, name=name)
-    if mode:
+            spec = AgentSpec(mode="manual", command="", name="manual")
+        elif name != "custom":
+            cmd = AGENT_PRESETS.get(name, f"{agent} {{prompt_file}}")
+            spec = AgentSpec(mode="shell", command=cmd, name=name)
+    elif mode:
         if mode == "manual":
-            return AgentSpec(mode="manual", command="", name="manual")
-        cfg_cmd = (config.agent.command if config else "") or AGENT_PRESETS["agy"]
-        return AgentSpec(mode=mode, command=cfg_cmd, name="shell")
-    if config and config.source_path:
+            spec = AgentSpec(mode="manual", command="", name="manual")
+        else:
+            cfg_cmd = (config.agent.command if config else "") or AGENT_PRESETS["agy"]
+            spec = AgentSpec(mode=mode, command=cfg_cmd, name="shell")
+    elif config and config.source_path:
         saved_mode = (config.agent.mode or "manual").lower()
         if saved_mode == "manual":
-            return AgentSpec(mode="manual", command="", name="manual")
-        return AgentSpec(
-            mode=saved_mode,
-            command=config.agent.command or AGENT_PRESETS["agy"],
-            name="saved",
-        )
-    return None
+            spec = AgentSpec(mode="manual", command="", name="manual")
+        else:
+            spec = AgentSpec(
+                mode=saved_mode,
+                command=config.agent.command or AGENT_PRESETS["agy"],
+                name="saved",
+            )
+    if spec is None:
+        return None
+    if model:
+        spec = apply_agent_model(spec, model)
+    return spec
 
 
 def resolve_paths(

@@ -14,17 +14,21 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Header, Input, Label, LoadingIndicator, Select, Static, TextArea
+from textual.widgets import Button, Footer, Header, Input, Label, LoadingIndicator, OptionList, Select, Static, TextArea
+from textual.widgets.option_list import Option
 
+from docflow.core.agent_runner import AGENT_PRESETS
 from docflow.core.operations import (
     AGENT_CHOICES,
     ConfigError,
     DEFAULT_DOC_TYPES,
+    agent_supports_models,
     default_docs_path,
     generate_docs,
     get_dashboard,
     import_docs,
     init_docs,
+    list_agent_models,
     list_app_branches,
     list_recent_commits,
     parse_doc_types_text,
@@ -37,6 +41,149 @@ from docflow.core.operations import (
 
 def _agent_select_options():
     return [(label, key) for key, label in AGENT_CHOICES if key != "custom"]
+
+
+def _agent_key_from_dash(dash) -> str:
+    """Map saved agent config to a Select value."""
+    if not dash.configured or dash.agent_mode == "manual":
+        return "manual"
+    cmd = dash.agent_command or ""
+    select_keys = {key for key, _ in AGENT_CHOICES if key != "custom"}
+    for key, preset in AGENT_PRESETS.items():
+        if key in select_keys and cmd == preset:
+            return key
+    return "agy"
+
+
+class ModelPicker(Vertical):
+    """Filterable model list: Current on top, third-party underneath."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._choices = []
+        self._selected_value = ""
+        self._id_to_value: dict[str, str] = {}
+
+    def compose(self) -> ComposeResult:
+        yield Label("Model")
+        yield Input(placeholder="Filter models…  try composer, grok, gemini", id="model-filter")
+        yield OptionList(id="model-list")
+
+    def selected_value(self) -> str:
+        return self._selected_value
+
+    def set_loading(self) -> None:
+        listing = self.query_one("#model-list", OptionList)
+        listing.clear_options()
+        listing.add_option(Option("Loading models…", disabled=True))
+
+    def set_choices(self, choices, selected: str = "") -> None:
+        self._choices = list(choices)
+        if selected:
+            self._selected_value = selected
+        elif not self._selected_value and choices:
+            self._selected_value = choices[0].value
+        query = ""
+        try:
+            query = self.query_one("#model-filter", Input).value
+        except Exception:
+            pass
+        self._rebuild(query)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "model-filter":
+            event.stop()
+            self._rebuild(event.value)
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
+        self._remember(event.option)
+
+    def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        event.stop()
+        self._remember(event.option)
+
+    def _remember(self, option: Optional[Option]) -> None:
+        if option is None or option.disabled or not option.id:
+            return
+        if option.id in self._id_to_value:
+            self._selected_value = self._id_to_value[option.id]
+
+    def _match(self, choice, query: str) -> bool:
+        if not query:
+            return True
+        blob = f"{choice.label} {choice.key} {choice.value}".lower()
+        return query in blob
+
+    def _rebuild(self, query: str) -> None:
+        listing = self.query_one("#model-list", OptionList)
+        q = (query or "").strip().lower()
+        current = [c for c in self._choices if c.group == "current" and self._match(c, q)]
+        third = [c for c in self._choices if c.group == "third_party" and self._match(c, q)]
+        options: list = []
+        self._id_to_value = {}
+        index = 0
+
+        def add_group(title: str, items) -> None:
+            nonlocal index
+            if not items:
+                return
+            if options:
+                options.append(None)
+            options.append(Option(title, disabled=True))
+            for choice in items:
+                oid = f"m{index}"
+                index += 1
+                self._id_to_value[oid] = choice.value
+                marker = "▸ " if choice.value == self._selected_value else "  "
+                options.append(Option(f"{marker}{choice.label}", id=oid))
+
+        add_group("Current", current)
+        add_group("Third-party", third)
+        listing.clear_options()
+        if not options:
+            listing.add_option(Option("No models match that filter", disabled=True))
+            return
+        listing.add_options(options)
+        highlight = None
+        for i in range(listing.option_count):
+            option = listing.get_option_at_index(i)
+            if option.disabled or getattr(option, "_divider", False) or not option.id:
+                continue
+            if highlight is None:
+                highlight = i
+            if self._id_to_value.get(option.id) == self._selected_value:
+                highlight = i
+                break
+        if highlight is not None:
+            listing.highlighted = highlight
+            self._remember(listing.get_option_at_index(highlight))
+
+
+def _sync_model_select(screen, agent_key: str) -> None:
+    picker = screen.query_one("#model-picker", ModelPicker)
+    show = agent_supports_models(agent_key)
+    picker.display = show
+    if show:
+        picker.set_loading()
+        screen.run_worker(_load_models(screen, agent_key), exclusive=True, group="models")
+
+
+async def _load_models(screen, agent_key: str) -> None:
+    choices = await asyncio.to_thread(list_agent_models, agent_key)
+    if not screen.is_attached:
+        return
+    current = str(screen.query_one("#agent", Select).value)
+    if current != agent_key:
+        return
+    screen.query_one("#model-picker", ModelPicker).set_choices(choices)
+
+
+def _selected_model(screen) -> str:
+    picker = screen.query_one("#model-picker", ModelPicker)
+    if not picker.display:
+        return ""
+    return picker.selected_value()
 
 
 def _default_types_text() -> str:
@@ -52,9 +199,7 @@ class SetupScreen(ModalScreen[Optional[dict]]):
         dash = get_dashboard()
         app_default = dash.app_repo_path or os.getcwd()
         docs_default = dash.docs_repo_path or default_docs_path(app_default)
-        agent_default = "manual"
-        if dash.configured and dash.agent_mode == "shell":
-            agent_default = "agy"
+        agent_default = _agent_key_from_dash(dash)
         with Vertical(id="dialog"):
             yield Label("Set up DocFlow", classes="title")
             yield Label("Application repo")
@@ -68,6 +213,7 @@ class SetupScreen(ModalScreen[Optional[dict]]):
                 id="agent",
                 allow_blank=False,
             )
+            yield ModelPicker(id="model-picker")
             yield Label("Doc types (one per line: name: description)")
             yield TextArea(_default_types_text(), id="types")
             yield Label("Import from path/folder (optional, never overwrites)")
@@ -77,6 +223,13 @@ class SetupScreen(ModalScreen[Optional[dict]]):
             with Horizontal(classes="buttons"):
                 yield Button("Start", variant="primary", id="ok")
                 yield Button("Cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        _sync_model_select(self, str(self.query_one("#agent", Select).value))
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "agent":
+            _sync_model_select(self, str(event.value))
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -93,6 +246,7 @@ class SetupScreen(ModalScreen[Optional[dict]]):
                 "app": self.query_one("#app-path", Input).value.strip(),
                 "docs": self.query_one("#docs-path", Input).value.strip(),
                 "agent": agent_key,
+                "model": _selected_model(self),
                 "types": types or list(DEFAULT_DOC_TYPES),
                 "import_from": self.query_one("#import-from", Input).value.strip(),
                 "import_into": self.query_one("#import-into", Input).value.strip(),
@@ -176,12 +330,21 @@ class GenerateScreen(ModalScreen[Optional[dict]]):
             yield Static("Loading commit preview…", id="preview")
             yield Label("Feature / type (optional)")
             yield Input(placeholder="leave blank to infer from the diff", id="feature")
+            yield Label("Agent")
+            yield Select(
+                _agent_select_options(),
+                value=_agent_key_from_dash(dash),
+                id="agent",
+                allow_blank=False,
+            )
+            yield ModelPicker(id="model-picker")
             with Horizontal(classes="buttons"):
                 yield Button("Generate", variant="primary", id="ok")
                 yield Button("Cancel", id="cancel")
 
     def on_mount(self) -> None:
         self._apply_mode("new")
+        _sync_model_select(self, str(self.query_one("#agent", Select).value))
 
     def _commit_count(self) -> int:
         raw = self.query_one("#commit-count", Input).value.strip()
@@ -245,6 +408,8 @@ class GenerateScreen(ModalScreen[Optional[dict]]):
             self._apply_mode(str(event.value))
         elif event.select.id == "tip":
             self._refresh_preview()
+        elif event.select.id == "agent":
+            _sync_model_select(self, str(event.value))
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "commit-count":
@@ -267,6 +432,8 @@ class GenerateScreen(ModalScreen[Optional[dict]]):
                 "commit_count": None if source != "commits" else self._commit_count(),
                 "branch": "" if source != "commits" or tip == "HEAD" else tip,
                 "feature": self.query_one("#feature", Input).value.strip(),
+                "agent": str(self.query_one("#agent", Select).value),
+                "model": _selected_model(self),
             }
         )
 
@@ -341,27 +508,41 @@ class DocFlowApp(App[None]):
         margin-right: 1;
     }
     #dialog {
-        width: 70;
+        width: 84;
         height: auto;
+        max-height: 90%;
         padding: 1 2;
         border: round $accent;
         background: $surface;
-        margin: 2 4;
+        margin: 1 3;
+        overflow-y: auto;
     }
     #dialog .title {
         text-style: bold;
         margin-bottom: 1;
     }
-    #dialog Input, #dialog Select, #dialog TextArea, #preview {
+    #dialog Input, #dialog Select, #dialog TextArea, #preview, #model-picker {
         margin-bottom: 1;
     }
     #dialog TextArea {
         height: 8;
     }
+    #model-picker {
+        height: auto;
+    }
+    #model-list {
+        height: 14;
+        border: tall $border-blurred;
+        background: $surface;
+        padding: 0 1;
+    }
+    #model-filter {
+        margin-bottom: 0;
+    }
     #preview {
         color: $text-muted;
         height: auto;
-        max-height: 12;
+        max-height: 8;
     }
     .buttons {
         height: auto;
@@ -548,7 +729,7 @@ class DocFlowApp(App[None]):
         data = await self.push_screen_wait(SetupScreen())
         if not data:
             return
-        spec = resolve_agent(agent=data["agent"])
+        spec = resolve_agent(agent=data["agent"], model=data.get("model"))
         if spec is None:
             spec = resolve_agent(agent="manual")
         self._begin_run("Setup running…")
@@ -615,7 +796,9 @@ class DocFlowApp(App[None]):
         data = await self.push_screen_wait(GenerateScreen())
         if not data:
             return
-        spec = resolve_agent(config=paths.config) or resolve_agent(agent="manual")
+        spec = resolve_agent(
+            agent=data.get("agent"), model=data.get("model"), config=paths.config
+        ) or resolve_agent(config=paths.config) or resolve_agent(agent="manual")
         branch = data.get("branch") or ""
         if data["full"]:
             label = "Full regeneration"

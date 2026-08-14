@@ -11,7 +11,13 @@ import click
 
 from docflow import __version__
 from docflow.cli import menu, ux
-from docflow.core.operations import ConfigError, generate_docs, resolve_agent, resolve_paths
+from docflow.core.operations import (
+    ConfigError,
+    apply_agent_model,
+    generate_docs,
+    resolve_agent,
+    resolve_paths,
+)
 
 
 def _from_ctx(ctx: click.Context, name: str, value: str) -> str:
@@ -43,7 +49,8 @@ def cli(ctx: click.Context, repo: str, docs: str):
 @click.pass_context
 @click.option("--repo", default="", help="Path to application source repository.")
 @click.option("--docs", default="", help="Path to dedicated documentation repository.")
-@click.option("--agent", help="Coding agent (agy, opencode, cursor, claude, cline, manual).")
+@click.option("--agent", help="Coding agent (agy, opencode, cursor-agent, claude, cline, manual).")
+@click.option("--model", default="", help="LLM model id for the agent (Cursor: agent models).")
 @click.option("--import-existing/--fresh", default=None, help="Ask to import files vs start blank.")
 @click.option("--import-from", default="", help="Path or folder to import (never overwrites).")
 @click.option("--import-into", default="", help="Doc type folder to import into.")
@@ -55,6 +62,7 @@ def init(
     repo: str,
     docs: str,
     agent: Optional[str],
+    model: str,
     import_existing: Optional[bool],
     import_from: str,
     import_into: str,
@@ -67,6 +75,7 @@ def init(
         repo=_from_ctx(ctx, "repo", repo),
         docs=_from_ctx(ctx, "docs", docs),
         agent=agent,
+        model=model,
         mode=mode,
         command=command,
         import_existing=import_existing,
@@ -94,7 +103,8 @@ def import_cmd(ctx, docs: str, import_from: str, type_name: str):
 @click.pass_context
 @click.option("--repo", default="", help="Path to application source repository.")
 @click.option("--docs", default="", help="Path to dedicated documentation repository.")
-@click.option("--agent", help="Coding agent (agy, opencode, cursor, claude, cline, manual).")
+@click.option("--agent", help="Coding agent (agy, opencode, cursor-agent, claude, cline, manual).")
+@click.option("--model", default="", help="LLM model id for the agent (Cursor: agent models).")
 @click.option("--branch", default="", help="Branch or tip to read commits from (default: current HEAD).")
 @click.option("--from", "from_ref", default="", help="Base commit/branch (advanced).")
 @click.option("--to", "to_ref", default="", help="Head commit/branch (advanced).")
@@ -108,6 +118,7 @@ def generate(
     repo: str,
     docs: str,
     agent: Optional[str],
+    model: str,
     branch: str,
     from_ref: str,
     to_ref: str,
@@ -128,6 +139,7 @@ def generate(
                 repo=repo,
                 docs=docs,
                 agent=agent,
+                model=model,
                 mode=mode,
                 command=command,
                 branch=branch,
@@ -140,10 +152,12 @@ def generate(
             return
         ux.print_error("Application or docs repo is not set. Run `docflow init` or pass --repo / --docs.")
         raise click.Abort()
-    spec = resolve_agent(agent=agent, mode=mode, command=command, config=paths.config)
+    spec = resolve_agent(agent=agent, mode=mode, command=command, config=paths.config, model=model)
     if spec is None:
         if sys.stdout.isatty():
             spec = menu.pick_agent()
+            if model:
+                spec = apply_agent_model(spec, model)
         else:
             spec = resolve_agent(agent="manual")
     if (
@@ -158,6 +172,7 @@ def generate(
             repo=repo,
             docs=docs,
             agent=agent,
+            model=model,
             mode=mode,
             command=command,
             branch=branch,

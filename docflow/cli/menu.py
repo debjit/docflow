@@ -19,6 +19,8 @@ from docflow.core.operations import (
     ConfigError,
     DEFAULT_DOC_TYPES,
     AlreadyInitialized,
+    agent_supports_models,
+    apply_agent_model,
     assert_can_init,
     default_docs_path,
     generate_docs,
@@ -26,6 +28,7 @@ from docflow.core.operations import (
     import_docs,
     init_docs,
     list_app_branches,
+    list_agent_models,
     parse_doc_type,
     publish_docs,
     pull_app_repo,
@@ -49,7 +52,38 @@ def pick_agent(default_key: str = "agy"):
             default=AGENT_PRESETS["agy"],
         )
         return resolve_agent(command=cmd)
-    return resolve_agent(agent=key)
+    spec = resolve_agent(agent=key)
+    return pick_model(spec)
+
+
+def pick_model(spec, model: str = ""):
+    if spec is None:
+        return spec
+    if model:
+        return apply_agent_model(spec, model)
+    if not agent_supports_models(spec.name) and not (spec.command or "").lstrip().startswith(
+        ("agent ", "agy ")
+    ):
+        return spec
+    choices = list_agent_models(spec.name)
+    ux.console.print("\n[bold]Which LLM model?[/bold]")
+    current = [c for c in choices if c.group == "current"]
+    third = [c for c in choices if c.group == "third_party"]
+    if current:
+        ux.console.print("[dim]Current[/dim]")
+        for choice in current:
+            ux.console.print(f"  [cyan]{choice.value or choice.key}[/cyan]  {choice.label}")
+    if third:
+        ux.console.print("[dim]Third-party[/dim]")
+        for choice in third:
+            ux.console.print(f"  [cyan]{choice.value or choice.key}[/cyan]  {choice.label}")
+    default = "auto" if spec.name.startswith("cursor") or spec.name == "cursor" else "default"
+    if spec.name in ("agy", "agy-interactive"):
+        default = ""
+    chosen = Prompt.ask("Model", default=default or "default")
+    if chosen in ("default", "auto"):
+        chosen = ""
+    return apply_agent_model(spec, chosen)
 
 
 def ensure_paths(repo: str, docs: str, prompt_missing: bool = True):
@@ -122,6 +156,7 @@ def collect_import(
 
 def run_init(repo: str = "", docs: str = "", agent: Optional[str] = None,
              mode: Optional[str] = None, command: Optional[str] = None,
+             model: str = "",
              import_existing: Optional[bool] = None, import_from: str = "",
              import_into: str = "", doc_types: Sequence[str] = ()) -> None:
     app = repo or Prompt.ask("Application repo path", default=os.getcwd())
@@ -136,7 +171,7 @@ def run_init(repo: str = "", docs: str = "", agent: Optional[str] = None,
     except (AlreadyInitialized, ConfigError) as exc:
         ux.print_error(str(exc))
         raise click.Abort()
-    spec = resolve_agent(agent=agent, mode=mode, command=command, config=paths.config) or pick_agent()
+    spec = resolve_agent(agent=agent, mode=mode, command=command, config=paths.config, model=model) or pick_agent()
     types = collect_doc_types(doc_types)
     source, into = collect_import(types, import_from, import_into, import_existing)
     try:
@@ -189,11 +224,13 @@ def run_import(docs: str = "", source: str = "", type_name: str = "") -> None:
 
 def run_generate(repo: str = "", docs: str = "", agent: Optional[str] = None,
                  mode: Optional[str] = None, command: Optional[str] = None,
+                 model: str = "",
                  branch: str = "", from_ref: str = "", to_ref: str = "",
                  feature: str = "", full: bool = False, interactive_mode: bool = False,
                  commit_count: Optional[int] = None) -> None:
     paths = ensure_paths(repo, docs)
     spec = ensure_agent(paths, agent, mode, command)
+    spec = apply_agent_model(spec, model) if model else spec
     is_full = full
     if interactive_mode and not from_ref and not to_ref and not branch and not full and commit_count is None:
         dash = get_dashboard(paths.app_repo_path, paths.docs_repo_path)

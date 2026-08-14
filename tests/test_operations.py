@@ -7,12 +7,17 @@ from docflow.core.agent_runner import AGENT_PRESETS
 from docflow.core.operations import (
     AlreadyInitialized,
     ConfigError,
+    apply_agent_model,
     assert_can_init,
+    catalog_agy_models,
+    catalog_cursor_models,
     import_docs,
     init_docs,
     load_generate_cursor,
     mark_repo_documented,
     new_commits_since,
+    parse_agy_model_list,
+    parse_cursor_model_list,
     parse_doc_type,
     parse_doc_types_text,
     pull_app_repo,
@@ -27,6 +32,78 @@ def test_resolve_agent_flags_win():
     assert spec is not None
     assert spec.mode == "shell"
     assert spec.command == AGENT_PRESETS["claude"]
+
+
+def test_resolve_agent_cursor_cli():
+    spec = resolve_agent(agent="cursor-agent")
+    assert spec is not None
+    assert spec.mode == "shell"
+    assert spec.command == AGENT_PRESETS["cursor-agent"]
+    assert spec.command.startswith("agent ")
+    assert "-p" in spec.command
+    editor = resolve_agent(agent="cursor")
+    assert editor is not None
+    assert editor.command == spec.command
+
+
+def test_parse_cursor_model_list():
+    rows = parse_cursor_model_list(
+        "Available models\n\n"
+        "auto - Auto (current, default)\n"
+        "composer-2.5 - Composer 2.5\n"
+        "cursor-grok-4.6-high - Cursor Grok 4.6\n"
+        "\nTip: use --model <id>\n"
+    )
+    assert rows[0] == ("auto", "Auto (current, default)")
+    assert ("composer-2.5", "Composer 2.5") in rows
+    assert ("cursor-grok-4.6-high", "Cursor Grok 4.6") in rows
+
+
+def test_catalog_cursor_models_groups_and_labels_normal():
+    catalog = catalog_cursor_models(
+        [
+            ("auto", "Auto (current, default)"),
+            ("gpt-5.2", "GPT-5.2"),
+            ("composer-2.5", "Composer 2.5"),
+            ("composer-2.5-fast", "Composer 2.5 Fast"),
+            ("cursor-grok-4.6-high", "Cursor Grok 4.6"),
+            ("claude-opus-5-high", "Opus 5 1M"),
+        ]
+    )
+    current = [c for c in catalog if c.group == "current"]
+    third = [c for c in catalog if c.group == "third_party"]
+    assert [c.key for c in current][:3] == ["auto", "composer-2.5", "composer-2.5-fast"]
+    assert "Composer 2.5 (normal)" in {c.label for c in current}
+    assert {c.key for c in third} == {"gpt-5.2", "claude-opus-5-high"}
+    assert all(c.group == "third_party" for c in third)
+
+
+def test_parse_and_catalog_agy_models():
+    rows = parse_agy_model_list(
+        "Fetching available models...\n"
+        "gemini-3.7-flash-high\tGemini 3.7 Flash (High)\n"
+        "claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\n"
+        "gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n"
+    )
+    assert rows[0] == ("gemini-3.7-flash-high", "Gemini 3.7 Flash (High)")
+    catalog = catalog_agy_models(rows)
+    current = [c for c in catalog if c.group == "current"]
+    third = [c for c in catalog if c.group == "third_party"]
+    assert any(c.label == "Gemini 3.7 Flash (High)" for c in current)
+    assert {c.label for c in third} == {"Claude Sonnet 4.6 (Thinking)", "GPT-OSS 120B (Medium)"}
+
+
+def test_apply_agent_model_cursor():
+    spec = resolve_agent(agent="cursor-agent")
+    updated = apply_agent_model(spec, "composer-2.5")
+    assert updated.command.startswith("agent --model composer-2.5 ")
+    cleared = apply_agent_model(updated, "auto")
+    assert "--model" not in cleared.command
+    flagged = resolve_agent(agent="cursor-agent", model="gpt-5.2")
+    assert "--model gpt-5.2" in flagged.command
+    agy = apply_agent_model(resolve_agent(agent="agy"), "Gemini 3.7 Flash (High)")
+    assert agy.command.startswith("agy --model ")
+    assert agy.command.index("--model") < agy.command.index(" -p ")
 
 
 def test_resolve_agent_manual():
