@@ -379,7 +379,7 @@ class GenerateScreen(ModalScreen[Optional[dict]]):
                 if len(dash.new_commits) > 15:
                     lines.append(f"… {len(dash.new_commits) - 15} more")
             else:
-                lines.append("Nothing new. Pull to fetch from the server, or pick last N / full.")
+                lines.append("Nothing new locally. Update docs will fetch the remote first.")
             return "\n".join(lines)
         count = self._commit_count()
         try:
@@ -432,6 +432,59 @@ class GenerateScreen(ModalScreen[Optional[dict]]):
                 "commit_count": None if source != "commits" else self._commit_count(),
                 "branch": "" if source != "commits" or tip == "HEAD" else tip,
                 "feature": self.query_one("#feature", Input).value.strip(),
+                "agent": str(self.query_one("#agent", Select).value),
+                "model": _selected_model(self),
+            }
+        )
+
+
+class RegenLastScreen(ModalScreen[Optional[dict]]):
+    """Offer to redo the last documented commit with another agent/model."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def compose(self) -> ComposeResult:
+        dash = get_dashboard()
+        with Vertical(id="dialog"):
+            yield Label("Already documented", classes="title")
+            yield Static(
+                "HEAD is already covered by the last docs update.\n"
+                "Regenerate that commit with another LLM, or exit."
+            )
+            if dash.last_documented:
+                yield Label(
+                    f"Last documented: {dash.last_documented.short_sha}  "
+                    f"{dash.last_documented.message}"
+                )
+            yield Label("Agent")
+            yield Select(
+                _agent_select_options(),
+                value=_agent_key_from_dash(dash),
+                id="agent",
+                allow_blank=False,
+            )
+            yield ModelPicker(id="model-picker")
+            with Horizontal(classes="buttons"):
+                yield Button("Regenerate", variant="primary", id="ok")
+                yield Button("Exit", id="cancel")
+
+    def on_mount(self) -> None:
+        _sync_model_select(self, str(self.query_one("#agent", Select).value))
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "agent":
+            _sync_model_select(self, str(event.value))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == "cancel":
+            self.dismiss(None)
+            return
+        self.dismiss(
+            {
                 "agent": str(self.query_one("#agent", Select).value),
                 "model": _selected_model(self),
             }
@@ -831,9 +884,43 @@ class DocFlowApp(App[None]):
             self._finish_run(f"Update failed: {exc}")
             return
         if result.already_current:
-            self._finish_run("Already documented. Pull to fetch new commits, or use last N / full.")
+            self._set_busy(False)
+            self.refresh_summary()
+            regen = await self.push_screen_wait(RegenLastScreen())
+            if not regen:
+                self._finish_run("Already documented. Exited without regenerating.")
+                return
+            spec = resolve_agent(
+                agent=regen.get("agent"), model=regen.get("model"), config=paths.config
+            ) or spec
+            self._begin_run("Regenerating last documented commit…")
+            try:
+                result = await asyncio.to_thread(
+                    generate_docs,
+                    app_repo_path=paths.app_repo_path,
+                    docs_repo_path=paths.docs_repo_path,
+                    agent=spec,
+                    config=paths.config,
+                    from_ref="",
+                    to_ref="",
+                    branch="",
+                    feature=data["feature"],
+                    full=False,
+                    capture_output=True,
+                    on_progress=self._thread_progress,
+                    commit_count=1,
+                    sync_remote=False,
+                )
+            except Exception as exc:
+                self._finish_run(f"Regenerate failed: {exc}")
+                return
+        if result.already_current:
+            self._finish_run("Already documented through current HEAD.")
         elif result.no_changes:
             self._finish_run("Update finished: no changed files in those commits")
+        elif result.features and not all(item.success for item in result.features):
+            failed = [item.feature_name for item in result.features if not item.success]
+            self._finish_run(f"Update failed for: {', '.join(failed)}")
         elif result.run and result.run.success:
             if result.commits:
                 tip = result.commits[0]

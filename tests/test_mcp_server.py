@@ -40,3 +40,38 @@ async def test_mcp_server_creation_and_tools():
         feat_res = await server.call_tool("get_feature", {"feature_name": "authentication"})
         assert feat_res.is_error is False
         assert "OAuth2 token verification" in str(feat_res.content)
+
+        list_res = await server.call_tool("list_features", {})
+        assert "authentication" in str(list_res.content)
+
+
+@pytest.mark.asyncio
+async def test_mcp_lists_all_doc_types_and_rejects_traversal():
+    with tempfile.TemporaryDirectory() as docs_dir:
+        arch = os.path.join(docs_dir, "architecture")
+        os.makedirs(arch, exist_ok=True)
+        with open(os.path.join(arch, "index.md"), "w") as f:
+            f.write("# Architecture\n")
+        feat = os.path.join(docs_dir, "features", "auth")
+        os.makedirs(feat, exist_ok=True)
+        with open(os.path.join(feat, "index.md"), "w") as f:
+            f.write("# Auth\n")
+        prompts = os.path.join(docs_dir, "prompts", "pending")
+        os.makedirs(prompts, exist_ok=True)
+        with open(os.path.join(prompts, "secret.md"), "w") as f:
+            f.write("PROMPT_SECRET_TOKEN\n")
+
+        server = create_mcp_server(docs_dir)
+        listed = await server.call_tool("list_features", {})
+        body = str(listed.content)
+        assert "architecture" in body
+        assert "auth" in body
+
+        arch_res = await server.call_tool("get_feature", {"feature_name": "architecture"})
+        assert "Architecture" in str(arch_res.content)
+
+        traverse = await server.call_tool("get_feature", {"feature_name": "../prompts"})
+        assert "not found" in str(traverse.content).lower() or "error" in str(traverse.content).lower()
+
+        search = await server.call_tool("search_docs", {"query": "PROMPT_SECRET_TOKEN"})
+        assert "PROMPT_SECRET_TOKEN" not in str(search.content)

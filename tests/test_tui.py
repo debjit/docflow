@@ -39,6 +39,23 @@ async def test_update_docs_modal_has_agent_select():
 
 
 @pytest.mark.asyncio
+async def test_regen_last_modal_has_agent_and_exit():
+    from docflow.tui.app import RegenLastScreen
+
+    app = DocFlowApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.push_screen(RegenLastScreen())
+        await pilot.pause()
+        regen = next(
+            screen for screen in app.screen_stack if screen.__class__.__name__ == "RegenLastScreen"
+        )
+        assert regen.query_one("#agent")
+        assert regen.query_one("#ok")
+        assert regen.query_one("#cancel")
+
+
+@pytest.mark.asyncio
 async def test_setup_and_publish_open_modals():
     app = DocFlowApp()
     async with app.run_test() as pilot:

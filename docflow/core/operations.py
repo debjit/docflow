@@ -17,13 +17,13 @@ from typing import Callable, List, Optional, Sequence, Tuple
 
 from docflow.config.settings import DocFlowConfig, DocTypeSettings
 from docflow.core.agent_runner import AGENT_PRESETS, AgentRunner
-from docflow.core.git_analyzer import GitAnalyzer
+from docflow.core.git_analyzer import GitAnalyzer, feature_bucket_for_path
 from docflow.core.llms_txt_generator import LLMSTxtGenerator
 from docflow.core.models import AgentRunResult, FeatureChunk, PromptContext
 from docflow.core.prompt_builder import PromptBuilder
 from docflow.core.status_tracker import StatusTracker
 from docflow.git_ops.branch_manager import DocBranchManager
-from docflow.git_ops.mr_creator import MRCreator
+from docflow.git_ops.mr_creator import MRCreator, git_origin_slug
 
 
 class ConfigError(Exception):
@@ -106,6 +106,21 @@ def resolve_doc_section(config: Optional[DocFlowConfig], feature: str) -> Tuple[
         t = types[0]
         return t.name, t.description, type_output_dir(t.name, t.name)
     return "features", "", type_output_dir("features", wanted or "core")
+
+
+def generate_section_names(changed_files: Sequence, feature: str = "") -> List[str]:
+    """Unique feature/section buckets for a generate run, preserving first-seen order."""
+    if feature:
+        return [feature]
+    names: List[str] = []
+    seen = set()
+    for item in changed_files:
+        path = item.path if hasattr(item, "path") else str(item)
+        bucket = feature_bucket_for_path(path)
+        if bucket not in seen:
+            seen.add(bucket)
+            names.append(bucket)
+    return names or ["architecture"]
 
 
 def is_initialized(docs_repo_path: str) -> bool:
@@ -210,6 +225,8 @@ class GenerateResult:
     already_current: bool = False
     watermark_stale: bool = False
     used_cursor: bool = False
+    features: List[FeatureRunResult] = field(default_factory=list)
+    synced_remote: bool = False
 
 
 @dataclass
@@ -351,6 +368,8 @@ def parse_agy_model_list(output: str) -> List[Tuple[str, str]]:
         key, label = key.strip(), label.strip()
         if not key or key in seen:
             continue
+        if not re.match(r"^[A-Za-z][A-Za-z0-9._+-]*$", key):
+            continue
         seen.add(key)
         rows.append((key, label or key))
     return rows
@@ -410,10 +429,10 @@ def catalog_agy_models(rows: Sequence[Tuple[str, str]]) -> List[ModelChoice]:
         ModelChoice(key="default", value="", label="Default (agy default)", group="current")
     ]
     choices.extend(
-        ModelChoice(key=k, value=lab, label=lab, group="current") for k, lab in current
+        ModelChoice(key=k, value=k, label=lab, group="current") for k, lab in current
     )
     choices.extend(
-        ModelChoice(key=k, value=lab, label=lab, group="third_party") for k, lab in third
+        ModelChoice(key=k, value=k, label=lab, group="third_party") for k, lab in third
     )
     return choices
 
@@ -686,6 +705,184 @@ def new_commits_since(app_repo_path: str, docs_repo_path: str, rev: str = "HEAD"
     return cursor, commits, False
 
 
+def _git_env() -> dict:
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
+def _git(app_repo_path: str, args: Sequence[str], timeout: float = 120) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", app_repo_path, *args],
+        capture_output=True,
+        text=True,
+        env=_git_env(),
+        timeout=timeout,
+    )
+
+
+def _git_text(proc: subprocess.CompletedProcess) -> str:
+    return ((proc.stdout or "") + (proc.stderr or "")).strip()
+
+
+def _has_remotes(app_repo_path: str) -> bool:
+    try:
+        proc = _git(app_repo_path, ["remote"])
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0 and bool((proc.stdout or "").strip())
+
+
+def _rev_exists(app_repo_path: str, rev: str) -> bool:
+    if not rev:
+        return False
+    try:
+        proc = _git(app_repo_path, ["rev-parse", "--verify", rev])
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+def _current_branch(app_repo_path: str) -> str:
+    try:
+        proc = _git(app_repo_path, ["rev-parse", "--abbrev-ref", "HEAD"])
+    except (OSError, subprocess.TimeoutExpired):
+        return "HEAD"
+    name = (proc.stdout or "").strip()
+    return name or "HEAD"
+
+
+def _remote_tip(app_repo_path: str, rev: str = "HEAD") -> Optional[str]:
+    """Best remote tracking ref for this checkout or named branch, after fetch."""
+    candidates: List[str] = []
+    local = (rev or "HEAD").strip() or "HEAD"
+    if local in ("HEAD", _current_branch(app_repo_path)):
+        try:
+            upstream = _git(app_repo_path, ["rev-parse", "--abbrev-ref", "@{upstream}"])
+        except (OSError, subprocess.TimeoutExpired):
+            upstream = None
+        if upstream and upstream.returncode == 0:
+            name = (upstream.stdout or "").strip()
+            if name:
+                candidates.append(name)
+        candidates.extend(["origin/HEAD", "origin/main", "origin/master"])
+    else:
+        candidates.append(f"origin/{local}")
+    for name in candidates:
+        if _rev_exists(app_repo_path, name):
+            return name
+    return None
+
+
+def _commits_not_in_local(app_repo_path: str, local_rev: str, remote_rev: str) -> int:
+    try:
+        proc = _git(app_repo_path, ["rev-list", "--count", f"{local_rev}..{remote_rev}"])
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
+    if proc.returncode != 0:
+        return 0
+    try:
+        return int((proc.stdout or "0").strip() or "0")
+    except ValueError:
+        return 0
+
+
+def fetch_app_repo(
+    app_repo_path: str,
+    on_progress: Optional[Callable[[str], None]] = None,
+) -> Tuple[bool, str]:
+    """Update remote-tracking refs. False if there is no remote or fetch failed."""
+    app_repo_path = os.path.abspath(app_repo_path)
+    if not _has_remotes(app_repo_path):
+        return False, ""
+    if on_progress:
+        on_progress(f"git fetch in {app_repo_path}…")
+    try:
+        proc = _git(app_repo_path, ["fetch", "--all", "--prune"])
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    output = _git_text(proc)
+    if on_progress and output:
+        on_progress(output)
+    return proc.returncode == 0, output
+
+
+def ensure_app_repo_current(
+    app_repo_path: str,
+    docs_repo_path: str = "",
+    rev: str = "HEAD",
+    on_progress: Optional[Callable[[str], None]] = None,
+) -> PullResult:
+    """Fetch remotes and fast-forward the working branch when origin is ahead."""
+    app_repo_path = os.path.abspath(app_repo_path)
+    fetched, fetch_out = fetch_app_repo(app_repo_path, on_progress=on_progress)
+    if not fetched:
+        return PullResult(
+            success=True,
+            output=fetch_out,
+            app_repo_path=app_repo_path,
+            already_up_to_date=True,
+        )
+    local_rev = (rev or "HEAD").strip() or "HEAD"
+    remote_tip = _remote_tip(app_repo_path, local_rev)
+    if not remote_tip:
+        return PullResult(
+            success=True,
+            output=fetch_out,
+            app_repo_path=app_repo_path,
+            already_up_to_date=True,
+        )
+    ahead = _commits_not_in_local(app_repo_path, local_rev, remote_tip)
+    if ahead <= 0:
+        return PullResult(
+            success=True,
+            output=fetch_out,
+            app_repo_path=app_repo_path,
+            already_up_to_date=True,
+        )
+    if on_progress:
+        on_progress(f"Remote is {ahead} commit(s) ahead. Fast-forwarding to {remote_tip}…")
+    current = _current_branch(app_repo_path)
+    on_current = local_rev in ("HEAD", "", current)
+    try:
+        if on_current:
+            proc = _git(app_repo_path, ["merge", "--ff-only", remote_tip])
+        else:
+            ancestor = _git(app_repo_path, ["merge-base", "--is-ancestor", local_rev, remote_tip])
+            if ancestor.returncode != 0:
+                msg = f"Local {local_rev} has diverged from {remote_tip}; using local commits."
+                if on_progress:
+                    on_progress(msg)
+                return PullResult(
+                    success=True,
+                    output=msg,
+                    app_repo_path=app_repo_path,
+                    already_up_to_date=True,
+                )
+            proc = _git(app_repo_path, ["update-ref", f"refs/heads/{local_rev}", remote_tip])
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return PullResult(success=False, output=str(exc), app_repo_path=app_repo_path)
+    output = "\n".join(part for part in (fetch_out, _git_text(proc)) if part)
+    success = proc.returncode == 0
+    if on_progress and _git_text(proc):
+        on_progress(_git_text(proc))
+    new_commits: List[CommitInfo] = []
+    last = None
+    cursor = load_generate_cursor(docs_repo_path) if docs_repo_path else None
+    if cursor:
+        last = CommitInfo(sha=cursor.head_sha, short_sha=cursor.short_sha, message=cursor.message)
+    if success and docs_repo_path:
+        _, new_commits, _ = new_commits_since(app_repo_path, docs_repo_path, rev=local_rev)
+    return PullResult(
+        success=success,
+        output=output,
+        app_repo_path=app_repo_path,
+        new_commits=new_commits,
+        last_documented=last,
+        already_up_to_date=False,
+    )
+
+
 def pull_app_repo(
     app_repo_path: str,
     docs_repo_path: str = "",
@@ -694,16 +891,8 @@ def pull_app_repo(
     app_repo_path = os.path.abspath(app_repo_path)
     if on_progress:
         on_progress(f"git pull in {app_repo_path}…")
-    env = os.environ.copy()
-    env["GIT_TERMINAL_PROMPT"] = "0"
     try:
-        proc = subprocess.run(
-            ["git", "-C", app_repo_path, "pull"],
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=120,
-        )
+        proc = _git(app_repo_path, ["pull"])
     except (OSError, subprocess.TimeoutExpired) as exc:
         return PullResult(success=False, output=str(exc), app_repo_path=app_repo_path)
     output = ((proc.stdout or "") + (proc.stderr or "")).strip()
@@ -1024,6 +1213,7 @@ def generate_docs(
     capture_output: bool = False,
     on_progress: Optional[Callable[[str], None]] = None,
     commit_count: Optional[int] = None,
+    sync_remote: bool = True,
 ) -> GenerateResult:
     app_repo_path = os.path.abspath(app_repo_path)
     docs_repo_path = os.path.abspath(docs_repo_path)
@@ -1031,6 +1221,18 @@ def generate_docs(
 
     is_full = full
     included_count = commit_count or 1
+    synced_remote = False
+    if sync_remote and not from_ref and not to_ref:
+        sync = ensure_app_repo_current(
+            app_repo_path,
+            docs_repo_path,
+            rev=branch or "HEAD",
+            on_progress=on_progress,
+        )
+        synced_remote = bool(sync.success and not sync.already_up_to_date)
+        if not sync.success and on_progress:
+            on_progress(f"Could not update from remote: {sync.output or 'unknown error'}. Using local commits.")
+
     analyzer = GitAnalyzer(app_repo_path)
     used_cursor = False
     watermark_stale = False
@@ -1045,7 +1247,7 @@ def generate_docs(
                     if on_progress:
                         on_progress(
                             f"Already documented through {cursor.short_sha} {cursor.message}. "
-                            "git pull to fetch new commits, or pass --commits / --full."
+                            "Pass --commits / --full to regenerate."
                         )
                     return GenerateResult(
                         app_repo_path=app_repo_path,
@@ -1062,6 +1264,7 @@ def generate_docs(
                         already_current=True,
                         used_cursor=True,
                         commit_count=0,
+                        synced_remote=synced_remote,
                     )
                 from_ref = cursor.head_sha
                 to_ref = analyzer.head_commit(rev)["sha"] if analyzer.head_commit(rev) else rev
@@ -1129,58 +1332,84 @@ def generate_docs(
             commit_count=included_count,
             used_cursor=used_cursor,
             watermark_stale=watermark_stale,
+            synced_remote=synced_remote,
         )
 
-    target_feature = feature or (
-        manifest.changed_files[0].path.split("/")[0] if manifest.changed_files else "architecture"
-    )
-    doc_type, type_desc, output_dir = resolve_doc_section(config, target_feature)
-    feature_dir = os.path.join(docs_repo_path, output_dir)
-    existing_index = None
-    existing_context = None
-    index_path = os.path.join(feature_dir, "index.md")
-    context_path = os.path.join(feature_dir, "context.json")
-    if os.path.exists(index_path):
-        with open(index_path, "r", encoding="utf-8") as f:
-            existing_index = f.read()
-    if os.path.exists(context_path):
-        with open(context_path, "r", encoding="utf-8") as f:
-            existing_context = f.read()
-
+    section_names = generate_section_names(manifest.changed_files, feature)
     task_type = "full-regen" if is_full else "update"
-    context = PromptContext(
-        task_type=task_type,
-        project_name=config.project.name,
-        feature_name=target_feature,
-        docs_repo_path=docs_repo_path,
-        change_manifest=manifest,
-        existing_index_md=existing_index,
-        existing_context_json=existing_context,
-        conventions_text=conventions_text,
-        doc_type=doc_type,
-        doc_type_description=type_desc,
-        output_dir=output_dir,
-    )
     builder = PromptBuilder()
-    prompt_file = os.path.join(docs_repo_path, "prompts", "pending", f"{task_type}-{target_feature}.md")
-    if on_progress:
-        on_progress(f"Writing {task_type} prompt for {target_feature}…")
-    builder.save_prompt(context, prompt_file)
-
     runner = AgentRunner(mode=agent.mode, command_template=agent.command)
-    if on_progress and agent.mode == "shell":
-        on_progress(f"Running agent on {target_feature}…")
-    res = runner.run(
-        prompt_file,
-        docs_repo_path,
-        capture=True if capture_output else None,
-        on_output=on_progress,
-    )
-    if res.success and agent.mode == "shell" and os.path.exists(prompt_file):
-        completed_dir = os.path.join(docs_repo_path, "prompts", "completed")
-        os.makedirs(completed_dir, exist_ok=True)
-        shutil.move(prompt_file, os.path.join(completed_dir, os.path.basename(prompt_file)))
-    if res.success:
+    feature_runs: List[FeatureRunResult] = []
+    last_res: Optional[AgentRunResult] = None
+    last_prompt = ""
+    all_ok = True
+    total = len(section_names)
+
+    for index, target_feature in enumerate(section_names, start=1):
+        section_files = (
+            list(manifest.changed_files)
+            if feature
+            else [f for f in manifest.changed_files if feature_bucket_for_path(f.path) == target_feature]
+        )
+        section_manifest = manifest.model_copy(update={"changed_files": section_files or list(manifest.changed_files)})
+        doc_type, type_desc, output_dir = resolve_doc_section(config, target_feature)
+        feature_dir = os.path.join(docs_repo_path, output_dir)
+        existing_index = None
+        existing_context = None
+        index_path = os.path.join(feature_dir, "index.md")
+        context_path = os.path.join(feature_dir, "context.json")
+        if os.path.exists(index_path):
+            with open(index_path, "r", encoding="utf-8") as f:
+                existing_index = f.read()
+        if os.path.exists(context_path):
+            with open(context_path, "r", encoding="utf-8") as f:
+                existing_context = f.read()
+
+        context = PromptContext(
+            task_type=task_type,
+            project_name=config.project.name,
+            feature_name=target_feature,
+            docs_repo_path=docs_repo_path,
+            change_manifest=section_manifest,
+            existing_index_md=existing_index,
+            existing_context_json=existing_context,
+            conventions_text=conventions_text,
+            doc_type=doc_type,
+            doc_type_description=type_desc,
+            output_dir=output_dir,
+        )
+        prompt_file = os.path.join(docs_repo_path, "prompts", "pending", f"{task_type}-{target_feature}.md")
+        prefix = f"[{index}/{total}] " if total > 1 else ""
+        if on_progress:
+            on_progress(f"{prefix}Writing {task_type} prompt for {target_feature}…")
+        builder.save_prompt(context, prompt_file)
+        if on_progress and agent.mode == "shell":
+            on_progress(f"{prefix}Running agent on {target_feature}…")
+        res = runner.run(
+            prompt_file,
+            docs_repo_path,
+            capture=True if capture_output else None,
+            on_output=on_progress,
+        )
+        last_res = res
+        last_prompt = prompt_file
+        if res.success and agent.mode == "shell" and os.path.exists(prompt_file):
+            completed_dir = os.path.join(docs_repo_path, "prompts", "completed")
+            os.makedirs(completed_dir, exist_ok=True)
+            shutil.move(prompt_file, os.path.join(completed_dir, os.path.basename(prompt_file)))
+        if not res.success:
+            all_ok = False
+        feature_runs.append(
+            FeatureRunResult(
+                feature_name=target_feature,
+                prompt_file=prompt_file,
+                success=res.success,
+                error_message=res.error_message,
+                output_log=res.output_log or "",
+            )
+        )
+
+    if all_ok:
         try:
             mark_repo_documented(app_repo_path, docs_repo_path, included_commits, head_ref)
         except Exception:
@@ -1195,14 +1424,16 @@ def generate_docs(
         base_ref=base_ref,
         head_ref=head_ref,
         task_type=task_type,
-        feature_name=target_feature,
-        prompt_file=prompt_file,
+        feature_name=", ".join(section_names),
+        prompt_file=last_prompt,
         no_changes=False,
-        run=res,
+        run=last_res,
         commits=included_commits,
         commit_count=included_count,
         used_cursor=used_cursor,
         watermark_stale=watermark_stale,
+        features=feature_runs,
+        synced_remote=synced_remote,
     )
 
 
@@ -1234,6 +1465,7 @@ def publish_docs(
             body=f"Automated documentation update generated by DocFlow.\n\nBranch: `{current_branch}`",
             source_branch=current_branch,
             target_branch="main",
+            repo_owner_name=git_origin_slug(docs_repo_path),
         )
         result.mr_success = bool(res.get("success"))
         result.mr_url = res.get("mr_url")

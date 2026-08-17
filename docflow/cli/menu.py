@@ -285,6 +285,43 @@ def run_generate(repo: str = "", docs: str = "", agent: Optional[str] = None,
         ux.print_error(str(exc))
         raise click.Abort()
     ux.print_generate_result(result)
+    maybe_regen_last_docs(paths, spec, result, feature=feature)
+
+
+def maybe_regen_last_docs(paths, spec, result, feature: str = "") -> None:
+    """If HEAD is already documented, ask to redo that commit with another LLM."""
+    if not result.already_current or not sys.stdout.isatty():
+        return
+    dash = get_dashboard(paths.app_repo_path, paths.docs_repo_path)
+    if dash.last_documented:
+        ux.console.print(
+            f"  Last documented: [cyan]{dash.last_documented.short_sha}[/cyan]  "
+            f"{dash.last_documented.message}"
+        )
+    if not Confirm.ask(
+        "Regenerate the last documented commit with another LLM?",
+        default=False,
+    ):
+        ux.console.print("[dim]Exiting without regenerating.[/dim]")
+        return
+    default_key = spec.name if spec and spec.name in {key for key, _ in AGENT_CHOICES} else "agy"
+    spec = pick_agent(default_key=default_key)
+    if spec is None:
+        return
+    try:
+        again = generate_docs(
+            app_repo_path=paths.app_repo_path,
+            docs_repo_path=paths.docs_repo_path,
+            agent=spec,
+            config=paths.config,
+            feature=feature,
+            commit_count=1,
+            sync_remote=False,
+        )
+    except Exception as exc:
+        ux.print_error(str(exc))
+        raise click.Abort()
+    ux.print_generate_result(again)
 
 
 def run_status(repo: str = "", docs: str = "") -> None:

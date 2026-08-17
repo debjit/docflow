@@ -145,17 +145,32 @@ def print_generate_result(result: GenerateResult) -> None:
         f"  Agent:      [yellow]{result.agent_mode}[/yellow] "
         f"({result.agent_command or 'manual prompt generation'})"
     )
+    if result.synced_remote:
+        console.print("  Remote:     [green]pulled latest commits before generate[/green]")
     if result.already_current:
         print_warning(
             "Docs already cover the current HEAD. Nothing new to generate."
         )
-        next_step("`docflow pull` to fetch new commits, then generate — or `--commits N` / `--full`.")
+        next_step("`docflow generate --commits N` or `--full` to regenerate.")
         return
     if result.watermark_stale:
         print_warning("Last documented commit is no longer on this branch; used the latest commit instead.")
     if result.no_changes:
         print_warning("No changed files in that commit range.")
         next_step("`docflow pull` for new commits, or `--full` to regenerate existing docs.")
+        return
+    if result.features and len(result.features) > 1:
+        for item in result.features:
+            if item.success:
+                console.print(f"  [green]✓[/green] [{item.feature_name}] {item.prompt_file}")
+            else:
+                console.print(
+                    f"  [red]✗[/red] [{item.feature_name}] {item.error_message or 'failed'}"
+                )
+        if all(item.success for item in result.features):
+            next_step("`docflow publish` when the docs look right.")
+        else:
+            print_error("One or more feature generations failed; watermark was not advanced.")
         return
     run = result.run
     if run and run.success:

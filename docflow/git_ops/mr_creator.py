@@ -3,8 +3,43 @@ Platform-agnostic Merge Request / Pull Request creator.
 """
 
 import os
+import re
 from typing import Optional, Dict, Any
+from urllib.parse import urlparse
 import httpx
+
+
+def parse_git_remote_slug(remote_url: str) -> Optional[str]:
+    """Extract owner/repo (or GitLab group/project) from a git remote URL."""
+    url = (remote_url or "").strip()
+    if not url:
+        return None
+    slug = ""
+    if url.startswith("git@") or (":" in url and "://" not in url):
+        slug = url.split(":", 1)[-1]
+    else:
+        parsed = urlparse(url)
+        slug = parsed.path or ""
+    slug = slug.lstrip("/").removesuffix(".git").strip("/")
+    if not slug or " " in slug:
+        return None
+    if not re.match(r"^[\w.-]+(?:/[\w.-]+)+$", slug):
+        return None
+    return slug
+
+
+def git_origin_slug(repo_path: str, remote_name: str = "origin") -> Optional[str]:
+    """Read origin (or named remote) from a git repo and return owner/repo."""
+    if not repo_path or not os.path.isdir(repo_path):
+        return None
+    try:
+        from git import Repo
+
+        repo = Repo(repo_path)
+        url = repo.remotes[remote_name].url
+        return parse_git_remote_slug(url)
+    except Exception:
+        return None
 
 
 class MRCreator:

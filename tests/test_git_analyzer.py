@@ -6,7 +6,7 @@ import os
 import tempfile
 import pytest
 from git import Repo
-from docflow.core.git_analyzer import GitAnalyzer
+from docflow.core.git_analyzer import GitAnalyzer, feature_bucket_for_path, path_is_ignored
 
 
 @pytest.fixture
@@ -75,3 +75,14 @@ def test_list_commits_and_range(temp_git_repo):
     assert len(on_branch) >= 1
     assert analyzer.is_ancestor(commit1, commit2)
     assert analyzer.head_commit()["sha"] == commit2
+
+
+def test_feature_bucket_and_ignore_globs():
+    assert feature_bucket_for_path("src/auth/login.py") == "auth"
+    assert feature_bucket_for_path("auth/login.py") == "auth"
+    assert feature_bucket_for_path("README.md") == "core"
+    ignore = {"node_modules/", "*.lock", "dist"}
+    assert path_is_ignored("node_modules/pkg/index.js", ignore)
+    assert path_is_ignored("app/package.lock", ignore)
+    assert path_is_ignored("dist/bundle.js", ignore)
+    assert not path_is_ignored("src/auth/login.py", ignore)

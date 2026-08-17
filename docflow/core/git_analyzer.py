@@ -2,6 +2,7 @@
 Git repository analyzer for extracting change manifests and feature chunks.
 """
 
+import fnmatch
 import os
 from pathlib import Path
 from typing import List, Dict, Optional, Set
@@ -40,6 +41,48 @@ DEFAULT_IGNORE = {
     ".venv", "venv", ".idea", ".vscode", "*.lock", "package-lock.json",
     ".pytest_cache", "test-docs-repo", "docs-repo", "*.egg-info", "docflow.egg-info"
 }
+
+_WRAPPER_DIRS = {"src", "lib", "app", "pkg"}
+
+
+def path_is_ignored(rel_path: str, ignore_patterns: Set[str]) -> bool:
+    """True if a relative path matches any ignore glob (files or directories)."""
+    posix = Path(str(rel_path).replace("\\", "/")).as_posix().lstrip("./")
+    if not posix or posix == ".":
+        return False
+    parts = Path(posix).parts
+    basename = parts[-1] if parts else posix
+    for raw in ignore_patterns:
+        pattern = (raw or "").strip()
+        if not pattern:
+            continue
+        dir_pat = pattern.rstrip("/")
+        if any(fnmatch.fnmatch(part, dir_pat) for part in parts):
+            return True
+        if fnmatch.fnmatch(posix, pattern) or fnmatch.fnmatch(posix, dir_pat):
+            return True
+        if fnmatch.fnmatch(basename, pattern) or fnmatch.fnmatch(basename, dir_pat):
+            return True
+    return False
+
+
+def feature_bucket_for_path(path: str) -> str:
+    """Map a source path to a feature/section name (same rules as scan_features)."""
+    posix = Path(str(path).replace("\\", "/")).as_posix().lstrip("./")
+    parts = Path(posix).parts
+    dir_parts = parts[:-1] if len(parts) > 1 else ()
+    if not dir_parts:
+        return "core"
+    first = dir_parts[0]
+    if first.startswith("."):
+        return "config"
+    if first in _WRAPPER_DIRS:
+        name = dir_parts[1] if len(dir_parts) > 1 else "core"
+    else:
+        name = first
+    if name.startswith("."):
+        return "config"
+    return name
 
 
 class GitAnalyzer:
@@ -86,8 +129,7 @@ class GitAnalyzer:
         file_changes: List[FileChange] = []
         for patched_file in patch:
             path = patched_file.path
-            # Check ignore rules
-            if any(part in ignore for part in Path(path).parts):
+            if path_is_ignored(path, ignore):
                 continue
 
             change_type = "modified"
@@ -220,37 +262,18 @@ class GitAnalyzer:
         feature_map: Dict[str, List[str]] = {}
 
         for root, dirs, files in os.walk(self.repo_path):
-            # Exclude ignored directories in-place
-            dirs[:] = [d for d in dirs if d not in ignore]
-
             rel_root = os.path.relpath(root, self.repo_path)
-            if rel_root == ".":
-                parts = []
-            else:
-                parts = Path(rel_root).parts
+            dirs[:] = [
+                d for d in dirs
+                if not path_is_ignored(os.path.normpath(os.path.join(rel_root, d)), ignore)
+            ]
 
             for file in files:
-                if any(file.endswith(ext.replace("*", "")) for ext in ignore if "*" in ext):
+                rel_file_path = os.path.normpath(os.path.join(rel_root, file))
+                if path_is_ignored(rel_file_path, ignore):
                     continue
 
-                rel_file_path = os.path.normpath(os.path.join(rel_root, file))
-
-                # Determine feature bucket
-                if len(parts) == 0:
-                    feature_name = "core"
-                elif parts[0].startswith("."):
-                    feature_name = "config"
-                elif parts[0] in ("src", "lib", "app", "pkg"):
-                    if len(parts) > 1:
-                        feature_name = parts[1]
-                    else:
-                        feature_name = "core"
-                else:
-                    feature_name = parts[0]
-
-                if feature_name.startswith("."):
-                    feature_name = "config"
-
+                feature_name = feature_bucket_for_path(rel_file_path)
                 feature_map.setdefault(feature_name, []).append(rel_file_path)
 
         # Convert feature map to FeatureChunk models

@@ -201,6 +201,7 @@ def generate(
         ux.print_error(str(exc))
         raise click.Abort()
     ux.print_generate_result(result)
+    menu.maybe_regen_last_docs(paths, spec, result, feature=feature)
 
 
 @cli.command()

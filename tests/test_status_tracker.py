@@ -45,3 +45,31 @@ def test_status_tracker_write_wip_docs(temp_git_repos):
 
     assert "feature/auth-login" in content
     assert "Add auth login function" in content
+
+
+def test_status_tracker_includes_remote_branch(tmp_path):
+    app = tmp_path / "app"
+    remote = tmp_path / "remote.git"
+    docs = tmp_path / "docs"
+    app.mkdir()
+    docs.mkdir()
+    repo = Repo.init(app)
+    Repo.init(remote, bare=True)
+    (app / "README.md").write_text("# App\n")
+    repo.index.add(["README.md"])
+    repo.index.commit("init")
+    default = repo.active_branch.name
+    origin = repo.create_remote("origin", str(remote))
+    origin.push(default)
+    feature = repo.create_head("feature/remote-only")
+    feature.checkout()
+    (app / "extra.py").write_text("x = 1\n")
+    repo.index.add(["extra.py"])
+    repo.index.commit("remote only work")
+    origin.push("feature/remote-only")
+    repo.heads[default].checkout()
+    repo.delete_head("feature/remote-only", force=True)
+
+    tracker = StatusTracker(str(app), str(docs))
+    names = [b["branch"] for b in tracker.scan_wip()["active_branches"]]
+    assert "feature/remote-only" in names

@@ -11,6 +11,8 @@ from docflow.core.operations import (
     assert_can_init,
     catalog_agy_models,
     catalog_cursor_models,
+    generate_docs,
+    generate_section_names,
     import_docs,
     init_docs,
     load_generate_cursor,
@@ -89,8 +91,11 @@ def test_parse_and_catalog_agy_models():
     catalog = catalog_agy_models(rows)
     current = [c for c in catalog if c.group == "current"]
     third = [c for c in catalog if c.group == "third_party"]
-    assert any(c.label == "Gemini 3.7 Flash (High)" for c in current)
+    gemini = next(c for c in current if c.key == "gemini-3.7-flash-high")
+    assert gemini.value == "gemini-3.7-flash-high"
+    assert gemini.label == "Gemini 3.7 Flash (High)"
     assert {c.label for c in third} == {"Claude Sonnet 4.6 (Thinking)", "GPT-OSS 120B (Medium)"}
+    assert all(c.value == c.key for c in third)
 
 
 def test_apply_agent_model_cursor():
@@ -101,8 +106,8 @@ def test_apply_agent_model_cursor():
     assert "--model" not in cleared.command
     flagged = resolve_agent(agent="cursor-agent", model="gpt-5.2")
     assert "--model gpt-5.2" in flagged.command
-    agy = apply_agent_model(resolve_agent(agent="agy"), "Gemini 3.7 Flash (High)")
-    assert agy.command.startswith("agy --model ")
+    agy = apply_agent_model(resolve_agent(agent="agy"), "gemini-3.7-flash-high")
+    assert agy.command.startswith("agy --model gemini-3.7-flash-high ")
     assert agy.command.index("--model") < agy.command.index(" -p ")
 
 
@@ -246,6 +251,98 @@ def test_generate_cursor_tracks_new_commits_only(tmp_path):
     _, new_commits, stale = new_commits_since(str(app), str(docs))
     assert not stale
     assert [c.sha for c in new_commits] == [second.hexsha]
+
+
+def test_generate_section_names_groups_wrappers_and_features():
+    from docflow.core.models import FileChange
+
+    files = [
+        FileChange(path="src/auth/login.py", change_type="modified"),
+        FileChange(path="src/billing/stripe.py", change_type="added"),
+        FileChange(path="ui/header.tsx", change_type="modified"),
+        FileChange(path="auth/tokens.py", change_type="modified"),
+    ]
+    assert generate_section_names(files) == ["auth", "billing", "ui"]
+    assert generate_section_names(files, feature="billing") == ["billing"]
+
+
+def test_generate_docs_writes_prompts_for_each_feature(tmp_path):
+    from git import Repo
+
+    from docflow.core.operations import AgentSpec
+
+    app = tmp_path / "app"
+    docs = tmp_path / "docs"
+    app.mkdir()
+    repo = Repo.init(app)
+    (app / "README.md").write_text("# App\n")
+    repo.index.add(["README.md"])
+    repo.index.commit("init")
+    (app / "auth").mkdir()
+    (app / "billing").mkdir()
+    (app / "auth" / "login.py").write_text("def login(): pass\n")
+    (app / "billing" / "stripe.py").write_text("def charge(): pass\n")
+    repo.index.add(["auth/login.py", "billing/stripe.py"])
+    repo.index.commit("add auth and billing")
+
+    spec = AgentSpec(mode="manual", command="", name="manual")
+    result = generate_docs(
+        app_repo_path=str(app),
+        docs_repo_path=str(docs),
+        agent=spec,
+        config=DocFlowConfig(),
+        from_ref="HEAD~1",
+        to_ref="HEAD",
+    )
+    names = [item.feature_name for item in result.features]
+    assert names == ["auth", "billing"]
+    assert (docs / "prompts" / "pending" / "update-auth.md").exists()
+    assert (docs / "prompts" / "pending" / "update-billing.md").exists()
+    cursor = load_generate_cursor(str(docs))
+    assert cursor is not None
+
+
+def test_generate_docs_pulls_when_remote_is_ahead(tmp_path):
+    from git import Repo
+
+    from docflow.core.operations import AgentSpec
+
+    remote = tmp_path / "remote.git"
+    app = tmp_path / "app"
+    other = tmp_path / "other"
+    docs = tmp_path / "docs"
+    Repo.init(remote, bare=True)
+    repo = Repo.init(app)
+    (app / "README.md").write_text("# App\n")
+    repo.index.add(["README.md"])
+    first = repo.index.commit("init")
+    branch = repo.active_branch.name
+    origin = repo.create_remote("origin", str(remote))
+    origin.push(branch)
+    repo.git.branch(f"--set-upstream-to=origin/{branch}")
+    mark_repo_documented(str(app), str(docs))
+
+    Repo.clone_from(str(remote), other)
+    other_repo = Repo(other)
+    (other / "auth").mkdir()
+    (other / "auth" / "login.py").write_text("def login(): pass\n")
+    other_repo.index.add(["auth/login.py"])
+    other_repo.index.commit("add auth")
+    other_repo.remotes.origin.push()
+
+    spec = AgentSpec(mode="manual", command="", name="manual")
+    result = generate_docs(
+        app_repo_path=str(app),
+        docs_repo_path=str(docs),
+        agent=spec,
+        config=DocFlowConfig(),
+    )
+    assert result.synced_remote
+    assert not result.already_current
+    names = [item.feature_name for item in result.features]
+    assert "auth" in names
+    assert (docs / "prompts" / "pending" / "update-auth.md").exists()
+    assert Repo(app).head.commit.hexsha != first.hexsha
 
 
 def test_pull_without_origin_reports_failure(tmp_path):
