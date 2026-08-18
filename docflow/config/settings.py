@@ -29,7 +29,7 @@ class DocsSettings(BaseModel):
 
 class AgentSettings(BaseModel):
     mode: str = "manual"  # shell | manual
-    command: str = 'agy --dangerously-skip-permissions --add-dir {docs_repo} -p "$(cat {prompt_file})"'
+    command: str = 'agy --dangerously-skip-permissions --add-dir {docs_repo} -p "Follow every instruction in {prompt_file}."'
 
 
 class PlatformSettings(BaseModel):
@@ -41,6 +41,7 @@ class PlatformSettings(BaseModel):
 class GenerationSettings(BaseModel):
     skill_token_budget: int = 8000
     full_diff_threshold: int = 200
+    concurrency: int = 4
     ignore: List[str] = Field(default_factory=lambda: ["*.lock", "node_modules/", "dist/", "__pycache__/"])
 
 
@@ -65,37 +66,43 @@ class DocFlowConfig(BaseModel):
         return target_path
 
     @classmethod
-    def load(cls, app_repo_path: Optional[str] = None) -> "DocFlowConfig":
+    def load(
+        cls,
+        app_repo_path: Optional[str] = None,
+        docs_repo_path: Optional[str] = None,
+    ) -> "DocFlowConfig":
         config_data = {}
         candidate_paths = []
 
-        if app_repo_path and os.path.exists(app_repo_path):
-            candidate_paths.append(os.path.join(os.path.abspath(app_repo_path), ".docflow.yml"))
+        def add_docs_config(directory: Optional[str]) -> None:
+            if not directory:
+                return
+            cpath = os.path.join(os.path.abspath(directory), ".docflow.yml")
+            if os.path.isfile(cpath):
+                candidate_paths.append(cpath)
 
-        cwd = os.getcwd()
-        candidate_paths.append(os.path.join(cwd, ".docflow.yml"))
+        add_docs_config(docs_repo_path)
+        # First positional path may itself be a docs folder (has .docflow.yml).
+        add_docs_config(app_repo_path)
 
-        # Search parent directories for .docflow.yml
-        parent = os.path.dirname(cwd)
-        while parent and parent != os.path.dirname(parent):
-            candidate_paths.append(os.path.join(parent, ".docflow.yml"))
-            parent = os.path.dirname(parent)
+        cwd_config = os.path.join(os.getcwd(), ".docflow.yml")
+        if os.path.isfile(cwd_config):
+            candidate_paths.append(cwd_config)
 
-        # Global user fallback ~/.docflow.yml
-        user_home = os.path.expanduser("~")
-        candidate_paths.append(os.path.join(user_home, ".docflow.yml"))
-
+        seen = set()
         for cpath in candidate_paths:
-            if os.path.exists(cpath):
-                try:
-                    with open(cpath, "r", encoding="utf-8") as f:
-                        loaded = yaml.safe_load(f)
-                        if isinstance(loaded, dict) and loaded:
-                            config_data = loaded
-                            config_data["source_path"] = cpath
-                            break
-                except Exception:
-                    pass
+            if cpath in seen:
+                continue
+            seen.add(cpath)
+            try:
+                with open(cpath, "r", encoding="utf-8") as f:
+                    loaded = yaml.safe_load(f)
+                    if isinstance(loaded, dict) and loaded:
+                        config_data = loaded
+                        config_data["source_path"] = cpath
+                        break
+            except Exception:
+                pass
 
         # Environment variable overrides
         if env_app_path := os.getenv("DOCFLOW_APP_REPO"):

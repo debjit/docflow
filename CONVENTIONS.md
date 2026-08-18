@@ -18,7 +18,7 @@ DocFlow supports two primary agent execution modes:
 
 1. **Shell Mode (`mode: shell`)**:
    - DocFlow automatically executes the configured CLI coding agent (e.g., `agy`, `opencode`, `claude`) via subprocess.
-   - Commands MUST include direct workspace access to the target documentation repository (e.g., `agy --dangerously-skip-permissions --add-dir {docs_repo} -p "$(cat {prompt_file})"`).
+   - Commands MUST include direct workspace access to the target documentation repository (e.g., `agy --dangerously-skip-permissions --add-dir {docs_repo} -p "Follow every instruction in {prompt_file}."`).
    - The coding agent writes documentation files directly into the target paths (`<type>/index.md` or `features/<feature>/index.md`, plus `context.json`, `files.md`, `changelog.md`), and DocFlow automatically moves processed prompts from `prompts/pending/` to `prompts/completed/`.
 
 2. **Manual Mode (`mode: manual`)**:

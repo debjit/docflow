@@ -74,6 +74,42 @@ async def test_setup_and_publish_open_modals():
 
 
 @pytest.mark.asyncio
+async def test_model_picker_cursor_headers_and_default():
+    from textual.app import App, ComposeResult
+
+    from docflow.core.operations import catalog_cursor_models
+    from docflow.tui.app import ModelPicker
+
+    class PickerApp(App):
+        def compose(self) -> ComposeResult:
+            yield ModelPicker(id="model-picker")
+
+    catalog = catalog_cursor_models(
+        [
+            ("auto", "Auto"),
+            ("composer-2.5", "Composer 2.5"),
+            ("gpt-5.2", "GPT-5.2"),
+        ]
+    )
+    app = PickerApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        picker = app.query_one("#model-picker", ModelPicker)
+        picker.set_choices(catalog)
+        assert picker.selected_value() == "composer-2.5"
+        listing = app.query_one("#model-list")
+        prompts = [
+            str(listing.get_option_at_index(i).prompt)
+            for i in range(listing.option_count)
+            if not getattr(listing.get_option_at_index(i), "_divider", False)
+        ]
+        assert "Cursor included usage" in prompts
+        assert "Third-party API usage" in prompts
+        assert "Current" not in prompts
+        assert "Third-party" not in prompts
+
+
+@pytest.mark.asyncio
 async def test_run_clears_log_and_shows_latest_first():
     app = DocFlowApp()
     async with app.run_test() as pilot:

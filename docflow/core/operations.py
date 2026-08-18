@@ -17,7 +17,13 @@ from typing import Callable, List, Optional, Sequence, Tuple
 
 from docflow.config.settings import DocFlowConfig, DocTypeSettings
 from docflow.core.agent_runner import AGENT_PRESETS, AgentRunner
+from docflow.core.projects import (
+    find_by_app,
+    last_project,
+    register_project,
+)
 from docflow.core.git_analyzer import GitAnalyzer, feature_bucket_for_path
+from docflow.core.job_runner import Job, default_concurrency, run_jobs
 from docflow.core.llms_txt_generator import LLMSTxtGenerator
 from docflow.core.models import AgentRunResult, FeatureChunk, PromptContext
 from docflow.core.prompt_builder import PromptBuilder
@@ -162,6 +168,7 @@ class ModelChoice:
     value: str
     label: str
     group: str  # current | third_party
+    group_label: str = ""
 
 
 @dataclass
@@ -305,6 +312,15 @@ AGENT_CHOICES: Sequence[Tuple[str, str]] = (
 
 CURSOR_AGENT_KEYS = frozenset({"cursor", "cursor-agent", "cursor-interactive"})
 AGY_AGENT_KEYS = frozenset({"agy", "agy-interactive"})
+DEFAULT_CURSOR_MODEL = "composer-2.5"
+CURSOR_GROUP_LABELS = {
+    "current": "Cursor included usage",
+    "third_party": "Third-party API usage",
+}
+AGY_GROUP_LABELS = {
+    "current": "Current",
+    "third_party": "Third-party",
+}
 _MODEL_FLAG = re.compile(
     r"\s+--model(?:\s+|=)(?:'(?:\\'|[^'])*'|\"(?:\\\"|[^\"])*\"|\S+)"
 )
@@ -322,7 +338,12 @@ def default_docs_path(app_repo_path: str) -> str:
 
 def is_configured(config: Optional[DocFlowConfig] = None) -> bool:
     cfg = config or DocFlowConfig.load()
-    return bool(cfg.source_path and cfg.app.repo_path and cfg.docs.repo_path)
+    docs_dir = ""
+    if cfg.source_path:
+        docs_dir = os.path.dirname(os.path.abspath(cfg.source_path))
+    elif cfg.docs.repo_path:
+        docs_dir = os.path.abspath(cfg.docs.repo_path)
+    return bool(docs_dir and is_initialized(docs_dir) and cfg.app.repo_path)
 
 
 def agent_supports_models(agent_key: str) -> bool:
@@ -404,7 +425,7 @@ def _cursor_current_rank(key: str) -> Tuple[int, str, int]:
 
 
 def catalog_cursor_models(rows: Sequence[Tuple[str, str]]) -> List[ModelChoice]:
-    """Current (Composer, Grok, Auto) first; third-party models underneath."""
+    """Included usage (Composer, Grok, Auto) first; third-party API models underneath."""
     rows = _label_normal_variants(list(rows))
     if not any(key == "auto" for key, _ in rows):
         rows = [("auto", "Auto (default)")] + rows
@@ -413,12 +434,39 @@ def catalog_cursor_models(rows: Sequence[Tuple[str, str]]) -> List[ModelChoice]:
     current.sort(key=lambda item: _cursor_current_rank(item[0]))
     third.sort(key=lambda item: item[1].lower())
     choices = [
-        ModelChoice(key=k, value=k, label=lab, group="current") for k, lab in current
+        ModelChoice(
+            key=k,
+            value=k,
+            label=lab,
+            group="current",
+            group_label=CURSOR_GROUP_LABELS["current"],
+        )
+        for k, lab in current
     ]
     choices.extend(
-        ModelChoice(key=k, value=k, label=lab, group="third_party") for k, lab in third
+        ModelChoice(
+            key=k,
+            value=k,
+            label=lab,
+            group="third_party",
+            group_label=CURSOR_GROUP_LABELS["third_party"],
+        )
+        for k, lab in third
     )
     return choices
+
+
+def default_cursor_model(catalog: Sequence[ModelChoice]) -> str:
+    """DocFlow default for Cursor: composer-2.5, else first composer-*, else auto."""
+    keys = [c.key for c in catalog]
+    if DEFAULT_CURSOR_MODEL in keys:
+        return DEFAULT_CURSOR_MODEL
+    for key in keys:
+        if key.startswith("composer-"):
+            return key
+    if "auto" in keys:
+        return "auto"
+    return keys[0] if keys else ""
 
 
 def catalog_agy_models(rows: Sequence[Tuple[str, str]]) -> List[ModelChoice]:
@@ -426,13 +474,33 @@ def catalog_agy_models(rows: Sequence[Tuple[str, str]]) -> List[ModelChoice]:
     current = [(k, lab) for k, lab in rows if k.startswith("gemini-")]
     third = [(k, lab) for k, lab in rows if not k.startswith("gemini-")]
     choices = [
-        ModelChoice(key="default", value="", label="Default (agy default)", group="current")
+        ModelChoice(
+            key="default",
+            value="",
+            label="Default (agy default)",
+            group="current",
+            group_label=AGY_GROUP_LABELS["current"],
+        )
     ]
     choices.extend(
-        ModelChoice(key=k, value=k, label=lab, group="current") for k, lab in current
+        ModelChoice(
+            key=k,
+            value=k,
+            label=lab,
+            group="current",
+            group_label=AGY_GROUP_LABELS["current"],
+        )
+        for k, lab in current
     )
     choices.extend(
-        ModelChoice(key=k, value=k, label=lab, group="third_party") for k, lab in third
+        ModelChoice(
+            key=k,
+            value=k,
+            label=lab,
+            group="third_party",
+            group_label=AGY_GROUP_LABELS["third_party"],
+        )
+        for k, lab in third
     )
     return choices
 
@@ -537,28 +605,45 @@ def resolve_paths(
     docs: Optional[str] = None,
     require: bool = True,
 ) -> ResolvedPaths:
-    config = DocFlowConfig.load(repo or None)
+    docs_repo_path = ""
+    if docs:
+        docs_repo_path = os.path.abspath(docs)
+    elif is_initialized(os.getcwd()):
+        docs_repo_path = os.path.abspath(os.getcwd())
+    elif repo:
+        entry = find_by_app(repo)
+        if entry:
+            docs_repo_path = entry.docs_path
+    else:
+        entry = last_project()
+        if entry:
+            docs_repo_path = entry.docs_path
+
+    if not docs_repo_path:
+        if require:
+            raise ConfigError(
+                "No DocFlow project is selected. Run `docflow init` or "
+                "`docflow projects`, or pass --docs / --repo."
+            )
+        return ResolvedPaths(app_repo_path="", docs_repo_path="", config=DocFlowConfig())
+
+    config = DocFlowConfig.load(docs_repo_path=docs_repo_path)
     app_repo_path = ""
     if repo:
         app_repo_path = os.path.abspath(repo)
     elif config.app.repo_path:
         app_repo_path = os.path.abspath(config.app.repo_path)
 
-    if app_repo_path:
-        reloaded = DocFlowConfig.load(app_repo_path)
-        if reloaded.source_path:
-            config = reloaded
-
-    docs_repo_path = ""
-    if docs:
-        docs_repo_path = os.path.abspath(docs)
-    elif config.docs.repo_path:
-        docs_repo_path = os.path.abspath(config.docs.repo_path)
-
     if require and not app_repo_path:
-        raise ConfigError("Application repo is not set. Run `docflow init` or pass --repo.")
-    if require and not docs_repo_path:
-        raise ConfigError("Docs repo is not set. Run `docflow init` or pass --docs.")
+        raise ConfigError(
+            "Application repo is not set in the docs `.docflow.yml`. "
+            "Run `docflow init` or pass --repo."
+        )
+    if require and not is_initialized(docs_repo_path):
+        raise ConfigError(
+            f"Docs folder is not a DocFlow project: {docs_repo_path}. "
+            "Run `docflow init` or `docflow projects add --docs PATH`."
+        )
 
     return ResolvedPaths(
         app_repo_path=app_repo_path,
@@ -568,12 +653,8 @@ def resolve_paths(
 
 
 def save_project_config(config: DocFlowConfig, app_repo_path: str, docs_repo_path: str) -> List[str]:
-    saved: List[str] = []
-    for path in (app_repo_path, docs_repo_path):
-        try:
-            saved.append(config.save(path))
-        except Exception:
-            pass
+    saved = [config.save(docs_repo_path)]
+    register_project(docs_repo_path, app_repo_path, config.project.name)
     return saved
 
 
@@ -922,6 +1003,83 @@ def find_existing_docs(app_repo_path: str) -> dict:
 
 
 _IMPORT_EXTS = {".md", ".mdx", ".txt", ".rst", ".json", ".yaml", ".yml"}
+_IMPORT_PROGRESS_EVERY = 10
+
+
+def _job_concurrency(config: DocFlowConfig, override: Optional[int] = None) -> int:
+    if override is not None:
+        return max(1, int(override))
+    raw = os.getenv("DOCFLOW_JOBS")
+    if raw not in (None, ""):
+        return default_concurrency()
+    try:
+        return max(1, int(config.generation.concurrency or 4))
+    except (TypeError, ValueError):
+        return 4
+
+
+def _agent_capture(concurrency: int, capture_output: bool) -> Optional[bool]:
+    if concurrency > 1:
+        return True
+    return True if capture_output else None
+
+
+def _complete_prompt(prompt_file: str, docs_repo_path: str) -> None:
+    if not os.path.exists(prompt_file):
+        return
+    completed_dir = os.path.join(docs_repo_path, "prompts", "completed")
+    os.makedirs(completed_dir, exist_ok=True)
+    shutil.move(prompt_file, os.path.join(completed_dir, os.path.basename(prompt_file)))
+
+
+def _run_shell_jobs(
+    runner: AgentRunner,
+    specs: Sequence[Tuple[str, str, str]],
+    docs_repo_path: str,
+    concurrency: int,
+    capture_output: bool,
+    on_progress: Optional[Callable[[str], None]],
+) -> List[FeatureRunResult]:
+    """Run agent jobs in parallel. specs are (result_name, prompt_file, stored_prompt_path)."""
+    capture = _agent_capture(concurrency, capture_output)
+    on_output = on_progress if concurrency <= 1 else None
+
+    def make_run(result_name: str, prompt_file: str, stored_prompt: str):
+        def run() -> FeatureRunResult:
+            res = runner.run(
+                prompt_file,
+                docs_repo_path,
+                capture=capture,
+                on_output=on_output,
+            )
+            if res.success:
+                _complete_prompt(prompt_file, docs_repo_path)
+            return FeatureRunResult(
+                feature_name=result_name,
+                prompt_file=stored_prompt,
+                success=res.success,
+                error_message=res.error_message,
+                output_log=res.output_log or "",
+            )
+
+        return run
+
+    job_objs = [Job(key=name, run=make_run(name, prompt_file, stored)) for name, prompt_file, stored in specs]
+    raw = run_jobs(job_objs, concurrency=concurrency, on_progress=on_progress)
+    results: List[FeatureRunResult] = []
+    for (name, _prompt_file, stored), result in zip(specs, raw):
+        if isinstance(result, FeatureRunResult):
+            results.append(result)
+        else:
+            results.append(
+                FeatureRunResult(
+                    feature_name=name,
+                    prompt_file=stored,
+                    success=False,
+                    error_message="job failed",
+                )
+            )
+    return results
 
 
 def import_docs(
@@ -937,23 +1095,31 @@ def import_docs(
     dest_type = slug_type_name(type_name)
     dest_root = os.path.join(os.path.abspath(docs_repo_path), dest_type)
     os.makedirs(dest_root, exist_ok=True)
+    if on_progress:
+        on_progress(f"Importing from {src}")
     copied: List[str] = []
     skipped: List[str] = []
+    considered = 0
+
+    def maybe_count_progress() -> None:
+        if on_progress and considered and considered % _IMPORT_PROGRESS_EVERY == 0:
+            on_progress(f"Importing… {len(copied)} copied, {len(skipped)} skipped")
 
     def consider(full_path: str, rel: str) -> None:
+        nonlocal considered
         if Path(full_path).suffix.lower() not in _IMPORT_EXTS and Path(full_path).name.upper() != "README":
             return
         dest = os.path.join(dest_root, rel)
         if os.path.exists(dest):
             skipped.append(rel)
-            if on_progress:
-                on_progress(f"Skip (exists): {dest_type}/{rel}")
+            considered += 1
+            maybe_count_progress()
             return
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         shutil.copy2(full_path, dest)
         copied.append(rel)
-        if on_progress:
-            on_progress(f"Imported {dest_type}/{rel}")
+        considered += 1
+        maybe_count_progress()
 
     if os.path.isfile(src):
         consider(src, os.path.basename(src))
@@ -965,6 +1131,9 @@ def import_docs(
                 rel = os.path.relpath(full, src)
                 consider(full, rel)
 
+    if on_progress and considered and considered % _IMPORT_PROGRESS_EVERY != 0:
+        on_progress(f"Importing… {len(copied)} copied, {len(skipped)} skipped")
+
     type_added = False
     cfg = DocFlowConfig.load(docs_repo_path)
     if cfg.source_path:
@@ -974,8 +1143,6 @@ def import_docs(
             cfg.docs.types = existing
             try:
                 cfg.save(docs_repo_path)
-                if cfg.app.repo_path:
-                    cfg.save(cfg.app.repo_path)
                 type_added = True
                 if on_progress:
                     on_progress(f"Added doc type '{dest_type}' to config")
@@ -1064,6 +1231,7 @@ def init_docs(
     types: Optional[List[DocTypeSettings]] = None,
     import_from: Optional[str] = None,
     import_into: Optional[str] = None,
+    concurrency: Optional[int] = None,
 ) -> InitResult:
     def progress(message: str) -> None:
         if on_progress:
@@ -1073,7 +1241,7 @@ def init_docs(
     docs_repo_path = os.path.abspath(docs_repo_path)
     assert_can_init(docs_repo_path)
 
-    config = config or DocFlowConfig.load(app_repo_path)
+    config = config or DocFlowConfig.load(docs_repo_path=docs_repo_path)
     config.app.repo_path = app_repo_path
     config.docs.repo_path = docs_repo_path
     config.agent.mode = agent.mode
@@ -1113,7 +1281,7 @@ def init_docs(
     for doc_type in config.docs.types:
         if doc_type.name == "features":
             progress("Scanning the app repo for feature modules…")
-            chunks = analyzer.scan_features(include_architecture=False)
+            chunks = analyzer.scan_features(include_architecture=False, on_progress=on_progress)
             for chunk in chunks:
                 jobs.append((doc_type.name, doc_type.description, type_output_dir("features", chunk.feature_name), chunk))
         else:
@@ -1132,6 +1300,7 @@ def init_docs(
     if imported.copied:
         imported_note = "Imported files (do not overwrite):\n" + "\n".join(f"- {p}" for p in imported.copied[:40])
 
+    prepared: List[Tuple[str, str, str]] = []
     for index, (doc_type, type_desc, output_dir, chunk) in enumerate(jobs, start=1):
         feature_name = chunk.feature_name
         rel_prompt_file = os.path.join("prompts", "pending", f"init-{doc_type}-{feature_name}.md")
@@ -1150,30 +1319,39 @@ def init_docs(
         )
         progress(f"[{index}/{total}] Writing prompt for {doc_type}/{feature_name}…")
         builder.save_prompt(context, prompt_file)
+        result_name = f"{doc_type}/{feature_name}"
         if agent.mode == "shell":
-            progress(f"[{index}/{total}] Running agent on {doc_type}/{feature_name}…")
+            prepared.append((result_name, prompt_file, rel_prompt_file))
+            continue
         res = runner.run(
             prompt_file,
             docs_repo_path,
             capture=True if capture_output else None,
             on_output=on_progress,
         )
-        if res.success and agent.mode == "shell" and os.path.exists(prompt_file):
-            completed_dir = os.path.join(docs_repo_path, "prompts", "completed")
-            os.makedirs(completed_dir, exist_ok=True)
-            shutil.move(prompt_file, os.path.join(completed_dir, os.path.basename(prompt_file)))
         if res.success:
             progress(f"[{index}/{total}] ✓ {doc_type}/{feature_name}")
         else:
             progress(f"[{index}/{total}] ✗ {doc_type}/{feature_name}: {res.error_message}")
         features.append(
             FeatureRunResult(
-                feature_name=f"{doc_type}/{feature_name}",
+                feature_name=result_name,
                 prompt_file=rel_prompt_file,
                 success=res.success,
                 error_message=res.error_message,
                 output_log=res.output_log,
             )
+        )
+
+    if agent.mode == "shell" and prepared:
+        workers = _job_concurrency(config, concurrency)
+        features = _run_shell_jobs(
+            runner,
+            prepared,
+            docs_repo_path,
+            concurrency=workers,
+            capture_output=capture_output,
+            on_progress=on_progress,
         )
 
     progress("Generating llms.txt…")
@@ -1214,10 +1392,11 @@ def generate_docs(
     on_progress: Optional[Callable[[str], None]] = None,
     commit_count: Optional[int] = None,
     sync_remote: bool = True,
+    concurrency: Optional[int] = None,
 ) -> GenerateResult:
     app_repo_path = os.path.abspath(app_repo_path)
     docs_repo_path = os.path.abspath(docs_repo_path)
-    config = config or DocFlowConfig.load(app_repo_path)
+    config = config or DocFlowConfig.load(docs_repo_path=docs_repo_path)
 
     is_full = full
     included_count = commit_count or 1
@@ -1342,8 +1521,8 @@ def generate_docs(
     feature_runs: List[FeatureRunResult] = []
     last_res: Optional[AgentRunResult] = None
     last_prompt = ""
-    all_ok = True
     total = len(section_names)
+    prepared: List[Tuple[str, str, str]] = []
 
     for index, target_feature in enumerate(section_names, start=1):
         section_files = (
@@ -1383,8 +1562,9 @@ def generate_docs(
         if on_progress:
             on_progress(f"{prefix}Writing {task_type} prompt for {target_feature}…")
         builder.save_prompt(context, prompt_file)
-        if on_progress and agent.mode == "shell":
-            on_progress(f"{prefix}Running agent on {target_feature}…")
+        if agent.mode == "shell":
+            prepared.append((target_feature, prompt_file, prompt_file))
+            continue
         res = runner.run(
             prompt_file,
             docs_repo_path,
@@ -1393,12 +1573,6 @@ def generate_docs(
         )
         last_res = res
         last_prompt = prompt_file
-        if res.success and agent.mode == "shell" and os.path.exists(prompt_file):
-            completed_dir = os.path.join(docs_repo_path, "prompts", "completed")
-            os.makedirs(completed_dir, exist_ok=True)
-            shutil.move(prompt_file, os.path.join(completed_dir, os.path.basename(prompt_file)))
-        if not res.success:
-            all_ok = False
         feature_runs.append(
             FeatureRunResult(
                 feature_name=target_feature,
@@ -1408,6 +1582,29 @@ def generate_docs(
                 output_log=res.output_log or "",
             )
         )
+
+    if agent.mode == "shell" and prepared:
+        workers = _job_concurrency(config, concurrency)
+        feature_runs = _run_shell_jobs(
+            runner,
+            prepared,
+            docs_repo_path,
+            concurrency=workers,
+            capture_output=capture_output,
+            on_progress=on_progress,
+        )
+
+    if feature_runs:
+        last = feature_runs[-1]
+        last_prompt = last.prompt_file
+        last_res = AgentRunResult(
+            success=last.success,
+            mode=agent.mode if agent.mode in ("shell", "manual") else "shell",
+            prompt_file_path=last.prompt_file,
+            output_log=last.output_log or "",
+            error_message=last.error_message,
+        )
+    all_ok = all(item.success for item in feature_runs)
 
     if all_ok:
         try:

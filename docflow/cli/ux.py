@@ -35,6 +35,11 @@ def next_step(message: str) -> None:
 
 
 def print_dashboard(dash: Dashboard) -> None:
+    if not dash.configured:
+        print_header("No DocFlow project is open")
+        console.print("  Config lives in a docs folder. Nothing is written into the app repo.")
+        next_step("`docflow init` or `docflow projects list` / `open`.")
+        return
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column("key", style="bold")
     table.add_column("value")
@@ -103,10 +108,15 @@ def print_init_result(result: InitResult) -> None:
             f"  Import:     [green]{len(result.imported_copied)} copied[/green], "
             f"[yellow]{len(result.imported_skipped)} skipped[/yellow] (existing files kept)"
         )
-    for item in result.features:
-        if item.success:
+    done = [item for item in result.features if item.success]
+    failed = [item for item in result.features if not item.success]
+    if done:
+        console.print("  [bold]Done[/bold]")
+        for item in done:
             console.print(f"  [green]✓[/green] [{item.feature_name}] {item.prompt_file}")
-        else:
+    if failed:
+        console.print("  [bold]Failed[/bold]")
+        for item in failed:
             console.print(
                 f"  [red]✗[/red] [{item.feature_name}] {item.error_message or 'failed'}"
             )
@@ -159,18 +169,23 @@ def print_generate_result(result: GenerateResult) -> None:
         print_warning("No changed files in that commit range.")
         next_step("`docflow pull` for new commits, or `--full` to regenerate existing docs.")
         return
-    if result.features and len(result.features) > 1:
-        for item in result.features:
-            if item.success:
+    if result.features:
+        done = [item for item in result.features if item.success]
+        failed = [item for item in result.features if not item.success]
+        if done:
+            console.print("  [bold]Done[/bold]")
+            for item in done:
                 console.print(f"  [green]✓[/green] [{item.feature_name}] {item.prompt_file}")
-            else:
+        if failed:
+            console.print("  [bold]Failed[/bold]")
+            for item in failed:
                 console.print(
                     f"  [red]✗[/red] [{item.feature_name}] {item.error_message or 'failed'}"
                 )
-        if all(item.success for item in result.features):
-            next_step("`docflow publish` when the docs look right.")
-        else:
+        if failed:
             print_error("One or more feature generations failed; watermark was not advanced.")
+        else:
+            next_step("`docflow publish` when the docs look right.")
         return
     run = result.run
     if run and run.success:

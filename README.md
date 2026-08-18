@@ -28,6 +28,7 @@ docflow generate
 | `docflow import --from PATH --type NAME` | Copy files into a type folder. Never overwrites. |
 | `docflow generate --full` | Rebuild docs. Init cannot be run twice. |
 | `docflow ui` | Full-screen UI. |
+| `docflow projects` | List / open / add / remove docs projects. |
 | `docflow` | Interactive menu (TTY). |
 
 ## Features
@@ -76,7 +77,9 @@ docs-repo/
 
 ## Configuration
 
-`.docflow.yml` in the app repo and/or the docs repo:
+Project config lives only in the **docs** repo (`.docflow.yml`). DocFlow does not write into the application source tree. `docflow projects` lists and switches docs projects from a user index (`$XDG_CONFIG_HOME/docflow/projects.yml`).
+
+`.docflow.yml` in the docs repo:
 
 ```yaml
 project:
@@ -97,7 +100,7 @@ docs:
 
 agent:
   mode: "shell"   # or "manual"
-  command: 'agy --dangerously-skip-permissions --add-dir {docs_repo} -p "$(cat {prompt_file})"'
+  command: 'agy --dangerously-skip-permissions --add-dir {docs_repo} -p "Follow every instruction in {prompt_file}."'
 
 platform:
   type: "github"  # github | gitlab | bitbucket | generic

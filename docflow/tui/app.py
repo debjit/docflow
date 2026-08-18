@@ -20,7 +20,9 @@ from textual.widgets.option_list import Option
 from docflow.core.agent_runner import AGENT_PRESETS
 from docflow.core.operations import (
     AGENT_CHOICES,
+    CURSOR_AGENT_KEYS,
     ConfigError,
+    DEFAULT_CURSOR_MODEL,
     DEFAULT_DOC_TYPES,
     agent_supports_models,
     default_docs_path,
@@ -37,6 +39,7 @@ from docflow.core.operations import (
     resolve_agent,
     resolve_paths,
 )
+from docflow.core.projects import load_index, open_project
 
 
 def _agent_select_options():
@@ -56,13 +59,14 @@ def _agent_key_from_dash(dash) -> str:
 
 
 class ModelPicker(Vertical):
-    """Filterable model list: Current on top, third-party underneath."""
+    """Filterable model list: included usage on top, third-party underneath."""
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self._choices = []
         self._selected_value = ""
         self._id_to_value: dict[str, str] = {}
+        self._suppress_highlight = False
 
     def compose(self) -> ComposeResult:
         yield Label("Model")
@@ -73,6 +77,7 @@ class ModelPicker(Vertical):
         return self._selected_value
 
     def set_loading(self) -> None:
+        self._selected_value = ""
         listing = self.query_one("#model-list", OptionList)
         listing.clear_options()
         listing.add_option(Option("Loading models…", disabled=True))
@@ -82,7 +87,12 @@ class ModelPicker(Vertical):
         if selected:
             self._selected_value = selected
         elif not self._selected_value and choices:
-            self._selected_value = choices[0].value
+            keys = {c.key: c.value for c in choices}
+            if DEFAULT_CURSOR_MODEL in keys:
+                self._selected_value = keys[DEFAULT_CURSOR_MODEL]
+            else:
+                current = [c for c in choices if c.group == "current"]
+                self._selected_value = (current[0] if current else choices[0]).value
         query = ""
         try:
             query = self.query_one("#model-filter", Input).value
@@ -101,6 +111,8 @@ class ModelPicker(Vertical):
 
     def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
         event.stop()
+        if self._suppress_highlight:
+            return
         self._remember(event.option)
 
     def _remember(self, option: Optional[Option]) -> None:
@@ -108,6 +120,9 @@ class ModelPicker(Vertical):
             return
         if option.id in self._id_to_value:
             self._selected_value = self._id_to_value[option.id]
+
+    def _end_suppress_highlight(self) -> None:
+        self._suppress_highlight = False
 
     def _match(self, choice, query: str) -> bool:
         if not query:
@@ -138,12 +153,20 @@ class ModelPicker(Vertical):
                 marker = "▸ " if choice.value == self._selected_value else "  "
                 options.append(Option(f"{marker}{choice.label}", id=oid))
 
-        add_group("Current", current)
-        add_group("Third-party", third)
+        add_group(
+            (current[0].group_label if current else "") or "Cursor included usage",
+            current,
+        )
+        add_group(
+            (third[0].group_label if third else "") or "Third-party API usage",
+            third,
+        )
         listing.clear_options()
         if not options:
             listing.add_option(Option("No models match that filter", disabled=True))
             return
+        self._suppress_highlight = True
+        wanted = self._selected_value
         listing.add_options(options)
         highlight = None
         for i in range(listing.option_count):
@@ -152,12 +175,12 @@ class ModelPicker(Vertical):
                 continue
             if highlight is None:
                 highlight = i
-            if self._id_to_value.get(option.id) == self._selected_value:
+            if self._id_to_value.get(option.id) == wanted:
                 highlight = i
                 break
         if highlight is not None:
             listing.highlighted = highlight
-            self._remember(listing.get_option_at_index(highlight))
+        self.call_after_refresh(self._end_suppress_highlight)
 
 
 def _sync_model_select(screen, agent_key: str) -> None:
@@ -186,8 +209,78 @@ def _selected_model(screen) -> str:
     return picker.selected_value()
 
 
+def _resolve_screen_model(agent_key: str, model: Optional[str]) -> str:
+    chosen = (model or "").strip()
+    if agent_key in CURSOR_AGENT_KEYS and not chosen:
+        return DEFAULT_CURSOR_MODEL
+    return chosen
+
+
 def _default_types_text() -> str:
     return "\n".join(f"{t.name}: {t.description}" for t in DEFAULT_DOC_TYPES)
+
+
+class ProjectPickerScreen(ModalScreen[Optional[dict]]):
+    """Open or switch a registered docs project. Never writes into the app repo."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def compose(self) -> ComposeResult:
+        self._id_to_entry = {}
+        with Vertical(id="dialog"):
+            yield Label("Open a docs project", classes="title")
+            yield OptionList(id="project-list")
+            with Horizontal(classes="buttons"):
+                yield Button("Open", variant="primary", id="ok")
+                yield Button("New", id="new")
+                yield Button("Cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        listing = self.query_one("#project-list", OptionList)
+        listing.clear_options()
+        entries = load_index()
+        if not entries:
+            listing.add_option(Option("No projects yet — choose New", disabled=True))
+            return
+        for i, entry in enumerate(entries):
+            oid = f"p{i}"
+            self._id_to_entry[oid] = entry
+            listing.add_option(Option(f"{entry.name}  {entry.docs_path}", id=oid))
+        listing.highlighted = 0
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def _selected_entry(self):
+        listing = self.query_one("#project-list", OptionList)
+        if listing.highlighted is None:
+            return None
+        option = listing.get_option_at_index(listing.highlighted)
+        if option is None or option.disabled or not option.id:
+            return None
+        return self._id_to_entry.get(option.id)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == "cancel":
+            self.dismiss(None)
+            return
+        if event.button.id == "new":
+            self.dismiss({"new": True})
+            return
+        entry = self._selected_entry()
+        if entry is None:
+            self.dismiss(None)
+            return
+        open_project(entry.docs_path)
+        self.dismiss({"docs": entry.docs_path, "repo": entry.app_path, "new": False})
+
+
+def _screen_dashboard(widget):
+    app = getattr(widget, "app", None)
+    repo = getattr(app, "_repo", "") or None
+    docs = getattr(app, "_docs", "") or None
+    return get_dashboard(repo, docs)
 
 
 class SetupScreen(ModalScreen[Optional[dict]]):
@@ -196,7 +289,7 @@ class SetupScreen(ModalScreen[Optional[dict]]):
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
     def compose(self) -> ComposeResult:
-        dash = get_dashboard()
+        dash = _screen_dashboard(self)
         app_default = dash.app_repo_path or os.getcwd()
         docs_default = dash.docs_repo_path or default_docs_path(app_default)
         agent_default = _agent_key_from_dash(dash)
@@ -260,7 +353,7 @@ class ImportScreen(ModalScreen[Optional[dict]]):
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
     def compose(self) -> ComposeResult:
-        dash = get_dashboard()
+        dash = _screen_dashboard(self)
         default_type = ""
         if dash.doc_types:
             default_type = dash.doc_types[0].split(":")[0].strip()
@@ -296,7 +389,7 @@ class GenerateScreen(ModalScreen[Optional[dict]]):
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
     def compose(self) -> ComposeResult:
-        dash = get_dashboard()
+        dash = _screen_dashboard(self)
         self._repo = dash.app_repo_path if dash.app_exists else ""
         self._docs = dash.docs_repo_path or ""
         branches = []
@@ -364,7 +457,7 @@ class GenerateScreen(ModalScreen[Optional[dict]]):
         if not self._repo:
             return "No app repo configured."
         if source == "new":
-            dash = get_dashboard()
+            dash = _screen_dashboard(self)
             lines = []
             if dash.last_documented:
                 lines.append(
@@ -444,7 +537,7 @@ class RegenLastScreen(ModalScreen[Optional[dict]]):
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
     def compose(self) -> ComposeResult:
-        dash = get_dashboard()
+        dash = _screen_dashboard(self)
         with Vertical(id="dialog"):
             yield Label("Already documented", classes="title")
             yield Static(
@@ -495,7 +588,7 @@ class PublishScreen(ModalScreen[Optional[dict]]):
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
     def compose(self) -> ComposeResult:
-        dash = get_dashboard()
+        dash = _screen_dashboard(self)
         with Vertical(id="dialog"):
             yield Label("Publish documentation", classes="title")
             yield Label("Commit message")
@@ -611,10 +704,21 @@ class DocFlowApp(App[None]):
         Binding("u", "pull", "Pull"),
         Binding("p", "publish", "Publish"),
         Binding("i", "setup", "Setup"),
-        Binding("r", "refresh", "Refresh"),
+        Binding("s", "switch", "Switch"),
         Binding("m", "mcp", "MCP"),
         Binding("q", "quit", "Quit"),
     ]
+
+    def __init__(self, repo: str = "", docs: str = "", **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._repo = repo or ""
+        self._docs = docs or ""
+
+    def _dashboard(self):
+        return get_dashboard(self._repo or None, self._docs or None)
+
+    def _resolve(self, require: bool = True):
+        return resolve_paths(self._repo or None, self._docs or None, require=require)
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -629,6 +733,7 @@ class DocFlowApp(App[None]):
             yield Button("Publish", id="btn-publish")
             yield Button("MCP (SSE)", id="btn-mcp")
             yield Button("Refresh", id="btn-refresh")
+            yield Button("Switch", id="btn-switch")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -670,11 +775,11 @@ class DocFlowApp(App[None]):
 
     def _set_busy(self, busy: bool) -> None:
         self.query_one("#busy", LoadingIndicator).display = busy
-        for button_id in ("btn-setup", "btn-pull", "btn-generate", "btn-publish", "btn-mcp", "btn-refresh"):
+        for button_id in ("btn-setup", "btn-pull", "btn-generate", "btn-publish", "btn-mcp", "btn-refresh", "btn-switch"):
             self.query_one(f"#{button_id}", Button).disabled = busy
 
     def refresh_summary(self) -> None:
-        dash = get_dashboard()
+        dash = self._dashboard()
         lines = [
             f"[bold]{dash.project_name}[/bold]",
             f"App   {dash.app_repo_path or 'not set'}  ({'ok' if dash.app_exists else 'missing'})",
@@ -710,6 +815,7 @@ class DocFlowApp(App[None]):
             "btn-publish": self.action_publish,
             "btn-mcp": self.action_mcp,
             "btn-refresh": self.action_refresh,
+            "btn-switch": self.action_switch,
         }
         action = mapping.get(event.button.id or "")
         if action:
@@ -718,7 +824,7 @@ class DocFlowApp(App[None]):
 
     def action_refresh(self) -> None:
         self.refresh_summary()
-        dash = get_dashboard()
+        dash = self._dashboard()
         if dash.new_commits:
             self.sub_title = f"{len(dash.new_commits)} new commit(s) waiting"
         elif dash.last_documented:
@@ -730,7 +836,7 @@ class DocFlowApp(App[None]):
         self._run_dialog(self._do_pull())
 
     def action_setup(self) -> None:
-        dash = get_dashboard()
+        dash = self._dashboard()
         if dash.configured:
             self._run_dialog(self._do_import())
         else:
@@ -750,7 +856,7 @@ class DocFlowApp(App[None]):
 
     async def _do_pull(self) -> None:
         try:
-            paths = resolve_paths(require=True)
+            paths = self._resolve(require=True)
         except ConfigError:
             self._log("Not configured yet. Run Setup first (press i).")
             return
@@ -782,7 +888,10 @@ class DocFlowApp(App[None]):
         data = await self.push_screen_wait(SetupScreen())
         if not data:
             return
-        spec = resolve_agent(agent=data["agent"], model=data.get("model"))
+        spec = resolve_agent(
+            agent=data["agent"],
+            model=_resolve_screen_model(data["agent"], data.get("model")),
+        )
         if spec is None:
             spec = resolve_agent(agent="manual")
         self._begin_run("Setup running…")
@@ -813,7 +922,7 @@ class DocFlowApp(App[None]):
         if not data or not data.get("import_from"):
             return
         try:
-            paths = resolve_paths(require=False)
+            paths = self._resolve(require=False)
         except ConfigError:
             paths = None
         docs = paths.docs_repo_path if paths else ""
@@ -838,19 +947,42 @@ class DocFlowApp(App[None]):
         )
         self.refresh_summary()
 
+    def action_switch(self) -> None:
+        self._run_dialog(self._do_switch())
+
+    async def _do_switch(self) -> Optional[dict]:
+        picked = await self.push_screen_wait(ProjectPickerScreen())
+        if not picked:
+            return None
+        if picked.get("new"):
+            await self._do_setup()
+            return picked
+        self._docs = picked.get("docs") or ""
+        self._repo = picked.get("repo") or ""
+        self.refresh_summary()
+        self._log(f"Opened {self._docs}")
+        return picked
+
     async def _do_generate(self) -> None:
         try:
-            paths = resolve_paths(require=True)
+            paths = self._resolve(require=True)
         except ConfigError:
-            self.sub_title = "Not configured — run Setup"
-            self._log("Not configured yet. Run Setup first (press i).")
-            await self._do_setup()
-            return
+            self._log("No docs project is open. Pick one from Switch, or create one with Setup.")
+            picked = await self._do_switch()
+            if not picked or picked.get("new"):
+                return
+            try:
+                paths = self._resolve(require=True)
+            except ConfigError:
+                self._finish_run("Still no project selected. Use Switch or Setup.")
+                return
         data = await self.push_screen_wait(GenerateScreen())
         if not data:
             return
         spec = resolve_agent(
-            agent=data.get("agent"), model=data.get("model"), config=paths.config
+            agent=data.get("agent"),
+            model=_resolve_screen_model(data.get("agent") or "", data.get("model")),
+            config=paths.config,
         ) or resolve_agent(config=paths.config) or resolve_agent(agent="manual")
         branch = data.get("branch") or ""
         if data["full"]:
@@ -891,7 +1023,9 @@ class DocFlowApp(App[None]):
                 self._finish_run("Already documented. Exited without regenerating.")
                 return
             spec = resolve_agent(
-                agent=regen.get("agent"), model=regen.get("model"), config=paths.config
+                agent=regen.get("agent"),
+                model=_resolve_screen_model(regen.get("agent") or "", regen.get("model")),
+                config=paths.config,
             ) or spec
             self._begin_run("Regenerating last documented commit…")
             try:
@@ -938,7 +1072,7 @@ class DocFlowApp(App[None]):
 
     async def _do_publish(self) -> None:
         try:
-            paths = resolve_paths(require=False)
+            paths = self._resolve(require=False)
         except ConfigError:
             paths = None
         docs = paths.docs_repo_path if paths else ""
@@ -970,7 +1104,7 @@ class DocFlowApp(App[None]):
 
     async def _do_mcp(self) -> None:
         try:
-            paths = resolve_paths(require=True)
+            paths = self._resolve(require=True)
         except ConfigError as exc:
             self.sub_title = "Not configured"
             self._log(str(exc))
@@ -990,5 +1124,5 @@ class DocFlowApp(App[None]):
         self._finish_run(f"MCP SSE running for {docs} on port {port}")
 
 
-def run_tui() -> None:
-    DocFlowApp().run()
+def run_tui(repo: str = "", docs: str = "") -> None:
+    DocFlowApp(repo=repo, docs=docs).run()

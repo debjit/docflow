@@ -17,6 +17,8 @@ from docflow.core.agent_runner import AGENT_PRESETS
 from docflow.core.operations import (
     AGENT_CHOICES,
     ConfigError,
+    CURSOR_AGENT_KEYS,
+    DEFAULT_CURSOR_MODEL,
     DEFAULT_DOC_TYPES,
     AlreadyInitialized,
     agent_supports_models,
@@ -66,9 +68,29 @@ def pick_model(spec, model: str = ""):
     ):
         return spec
     choices = list_agent_models(spec.name)
-    ux.console.print("\n[bold]Which LLM model?[/bold]")
     current = [c for c in choices if c.group == "current"]
     third = [c for c in choices if c.group == "third_party"]
+    is_cursor = spec.name in CURSOR_AGENT_KEYS or (spec.command or "").lstrip().startswith(
+        "agent "
+    )
+    if is_cursor:
+        ux.console.print("\n[bold]Usage pool[/bold]")
+        ux.console.print("  [cyan]1[/cyan]. Cursor included usage")
+        ux.console.print("  [cyan]2[/cyan]. Third-party API usage")
+        pool = Prompt.ask("Usage pool", choices=["1", "2"], default="1")
+        group = current if pool == "1" else third
+        ux.console.print("\n[bold]Which LLM model?[/bold]")
+        for choice in group:
+            ux.console.print(f"  [cyan]{choice.value or choice.key}[/cyan]  {choice.label}")
+        ids = {c.value or c.key for c in group}
+        default = DEFAULT_CURSOR_MODEL if DEFAULT_CURSOR_MODEL in ids else (
+            (group[0].value or group[0].key) if group else DEFAULT_CURSOR_MODEL
+        )
+        chosen = Prompt.ask("Model", default=default)
+        if chosen in ("default", "auto"):
+            chosen = ""
+        return apply_agent_model(spec, chosen)
+    ux.console.print("\n[bold]Which LLM model?[/bold]")
     if current:
         ux.console.print("[dim]Current[/dim]")
         for choice in current:
@@ -77,9 +99,7 @@ def pick_model(spec, model: str = ""):
         ux.console.print("[dim]Third-party[/dim]")
         for choice in third:
             ux.console.print(f"  [cyan]{choice.value or choice.key}[/cyan]  {choice.label}")
-    default = "auto" if spec.name.startswith("cursor") or spec.name == "cursor" else "default"
-    if spec.name in ("agy", "agy-interactive"):
-        default = ""
+    default = ""
     chosen = Prompt.ask("Model", default=default or "default")
     if chosen in ("default", "auto"):
         chosen = ""
@@ -154,6 +174,43 @@ def collect_import(
     return "", ""
 
 
+def _cli_progress(message: str) -> None:
+    ux.console.print(f"  [dim]{message}[/dim]")
+
+
+def pick_open_project(repo: str = "", docs: str = "", force_list: bool = False) -> tuple[str, str]:
+    """Last project → open, or pick from the list. Does not write into the app repo."""
+    from docflow.core.projects import last_project, load_index, open_project
+
+    if docs:
+        return repo, docs
+    last = last_project()
+    entries = load_index()
+    if not sys.stdout.isatty():
+        if last:
+            return last.app_path or repo, last.docs_path
+        return repo, docs
+    if last and not force_list:
+        ux.console.print(
+            f"\nLast project: [cyan]{last.name}[/cyan]  {last.docs_path}"
+        )
+        if Confirm.ask("Open this project?", default=True):
+            open_project(last.docs_path)
+            return last.app_path or repo, last.docs_path
+    if entries:
+        ux.console.print("\n[bold]Open a docs project[/bold]")
+        for i, entry in enumerate(entries, start=1):
+            ux.console.print(f"  [cyan]{i}[/cyan]. {entry.name}  {entry.docs_path}")
+        ux.console.print("  [cyan]n[/cyan]. New project (init)")
+        choices = [str(i) for i in range(1, len(entries) + 1)] + ["n"]
+        choice = Prompt.ask("Project", choices=choices, default="n" if not last else "1")
+        if choice != "n":
+            entry = entries[int(choice) - 1]
+            open_project(entry.docs_path)
+            return entry.app_path or repo, entry.docs_path
+    return repo, docs
+
+
 def run_init(repo: str = "", docs: str = "", agent: Optional[str] = None,
              mode: Optional[str] = None, command: Optional[str] = None,
              model: str = "",
@@ -184,6 +241,7 @@ def run_init(repo: str = "", docs: str = "", agent: Optional[str] = None,
             types=types,
             import_from=source or None,
             import_into=into or None,
+            on_progress=_cli_progress,
         )
     except ConfigError as exc:
         ux.print_error(str(exc))
@@ -227,7 +285,8 @@ def run_generate(repo: str = "", docs: str = "", agent: Optional[str] = None,
                  model: str = "",
                  branch: str = "", from_ref: str = "", to_ref: str = "",
                  feature: str = "", full: bool = False, interactive_mode: bool = False,
-                 commit_count: Optional[int] = None) -> None:
+                 commit_count: Optional[int] = None,
+                 concurrency: Optional[int] = None) -> None:
     paths = ensure_paths(repo, docs)
     spec = ensure_agent(paths, agent, mode, command)
     spec = apply_agent_model(spec, model) if model else spec
@@ -280,6 +339,8 @@ def run_generate(repo: str = "", docs: str = "", agent: Optional[str] = None,
             feature=feature,
             full=is_full,
             commit_count=commit_count,
+            concurrency=concurrency,
+            on_progress=_cli_progress,
         )
     except Exception as exc:
         ux.print_error(str(exc))
@@ -381,7 +442,7 @@ def run_serve(docs: str = "", transport: str = "stdio", port: int = 8080) -> Non
         server.run(transport="sse", port=port)
 
 
-def run_ui() -> None:
+def run_ui(repo: str = "", docs: str = "") -> None:
     try:
         from docflow.tui.app import run_tui
     except ImportError as exc:
@@ -390,10 +451,11 @@ def run_ui() -> None:
         )
         ux.print_error(str(exc))
         raise click.Abort()
-    run_tui()
+    run_tui(repo=repo, docs=docs)
 
 
 def run_menu(repo: str = "", docs: str = "") -> None:
+    repo, docs = pick_open_project(repo, docs)
     dash = get_dashboard(repo or None, docs or None)
     ux.print_dashboard(dash)
     ux.console.print("\n[bold]What do you want to do?[/bold]")
@@ -405,7 +467,7 @@ def run_menu(repo: str = "", docs: str = "") -> None:
         if choice == "1":
             run_init(repo, docs)
         elif choice == "2":
-            run_ui()
+            run_ui(repo, docs)
         return
 
     ux.console.print("  [cyan]1[/cyan]. Update docs from git changes")
@@ -415,8 +477,9 @@ def run_menu(repo: str = "", docs: str = "") -> None:
     ux.console.print("  [cyan]5[/cyan]. Start MCP server")
     ux.console.print("  [cyan]6[/cyan]. Open visual UI")
     ux.console.print("  [cyan]7[/cyan]. Import existing files (never overwrites)")
+    ux.console.print("  [cyan]8[/cyan]. Switch docs project")
     ux.console.print("  [cyan]q[/cyan]. Quit")
-    choice = Prompt.ask("Choice", choices=["1", "2", "3", "4", "5", "6", "7", "q"], default="1")
+    choice = Prompt.ask("Choice", choices=["1", "2", "3", "4", "5", "6", "7", "8", "q"], default="1")
     if choice == "1":
         run_generate(repo, docs, interactive_mode=True)
     elif choice == "2":
@@ -432,6 +495,9 @@ def run_menu(repo: str = "", docs: str = "") -> None:
             port = int(Prompt.ask("Port", default="8080"))
         run_serve(docs, transport=transport, port=port)
     elif choice == "6":
-        run_ui()
+        run_ui(repo, docs)
     elif choice == "7":
         run_import(docs)
+    elif choice == "8":
+        repo, docs = pick_open_project(repo, "", force_list=True)
+        run_menu(repo, docs)

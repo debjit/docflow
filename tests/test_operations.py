@@ -11,6 +11,7 @@ from docflow.core.operations import (
     assert_can_init,
     catalog_agy_models,
     catalog_cursor_models,
+    default_cursor_model,
     generate_docs,
     generate_section_names,
     import_docs,
@@ -75,9 +76,25 @@ def test_catalog_cursor_models_groups_and_labels_normal():
     current = [c for c in catalog if c.group == "current"]
     third = [c for c in catalog if c.group == "third_party"]
     assert [c.key for c in current][:3] == ["auto", "composer-2.5", "composer-2.5-fast"]
+    assert default_cursor_model(catalog) == "composer-2.5"
+    assert {c.group_label for c in current} == {"Cursor included usage"}
+    assert {c.group_label for c in third} == {"Third-party API usage"}
     assert "Composer 2.5 (normal)" in {c.label for c in current}
     assert {c.key for c in third} == {"gpt-5.2", "claude-opus-5-high"}
     assert all(c.group == "third_party" for c in third)
+
+
+def test_default_cursor_model_without_composer_25():
+    catalog = catalog_cursor_models(
+        [
+            ("auto", "Auto"),
+            ("composer-2", "Composer 2"),
+            ("gpt-5.2", "GPT-5.2"),
+        ]
+    )
+    assert default_cursor_model(catalog) == "composer-2"
+    no_composer = catalog_cursor_models([("auto", "Auto"), ("gpt-5.2", "GPT-5.2")])
+    assert default_cursor_model(no_composer) == "auto"
 
 
 def test_parse_and_catalog_agy_models():
@@ -198,10 +215,16 @@ def test_import_docs_never_overwrites(tmp_path):
     assert written.read_text() == "first\n"
 
 
-def test_init_docs_custom_type_and_refuses_rerun(tmp_path):
+def test_init_docs_custom_type_and_refuses_rerun(tmp_path, monkeypatch):
     from git import Repo
 
     from docflow.core.operations import AgentSpec
+
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
 
     app = tmp_path / "app"
     docs = tmp_path / "docs"
@@ -220,6 +243,7 @@ def test_init_docs_custom_type_and_refuses_rerun(tmp_path):
     assert "front-end" in result.types
     assert (docs / "front-end").is_dir()
     assert (docs / ".docflow.yml").exists()
+    assert not (app / ".docflow.yml").exists()
     try:
         init_docs(str(app), str(docs), spec)
         assert False, "expected AlreadyInitialized"

@@ -5,7 +5,7 @@ Git repository analyzer for extracting change manifests and feature chunks.
 import fnmatch
 import os
 from pathlib import Path
-from typing import List, Dict, Optional, Set
+from typing import Callable, List, Dict, Optional, Set
 from git import Repo
 from unidiff import PatchSet
 
@@ -254,12 +254,16 @@ class GitAnalyzer:
         self,
         ignore_patterns: Optional[Set[str]] = None,
         include_architecture: bool = True,
+        on_progress: Optional[Callable[[str], None]] = None,
+        progress_every: int = 50,
     ) -> List[FeatureChunk]:
         """
         Scans the repository structure and groups source files into logical feature chunks for init.
         """
         ignore = ignore_patterns or DEFAULT_IGNORE
         feature_map: Dict[str, List[str]] = {}
+        scanned = 0
+        every = max(1, int(progress_every) if progress_every else 50)
 
         for root, dirs, files in os.walk(self.repo_path):
             rel_root = os.path.relpath(root, self.repo_path)
@@ -273,8 +277,15 @@ class GitAnalyzer:
                 if path_is_ignored(rel_file_path, ignore):
                     continue
 
+                scanned += 1
+                if on_progress and scanned % every == 0:
+                    on_progress(f"Scanning app repo… {scanned} files")
+
                 feature_name = feature_bucket_for_path(rel_file_path)
                 feature_map.setdefault(feature_name, []).append(rel_file_path)
+
+        if on_progress and scanned and scanned % every != 0:
+            on_progress(f"Scanning app repo… {scanned} files")
 
         # Convert feature map to FeatureChunk models
         chunks = []
