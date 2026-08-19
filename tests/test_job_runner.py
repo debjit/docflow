@@ -88,6 +88,10 @@ def test_run_jobs_pause_blocks_next_job():
 
 def test_default_concurrency_reads_env(monkeypatch):
     monkeypatch.delenv("DOCFLOW_JOBS", raising=False)
-    assert default_concurrency() == 4
+    assert default_concurrency() == 1
     monkeypatch.setenv("DOCFLOW_JOBS", "8")
     assert default_concurrency() == 8
+    from docflow.core.job_runner import clamp_concurrency
+
+    assert clamp_concurrency("0") == 1
+    assert clamp_concurrency("99") == 16

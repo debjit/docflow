@@ -126,7 +126,7 @@ def import_cmd(ctx, docs: str, import_from: str, type_name: str):
 @click.option("--full", is_flag=True, help="Full feature doc regeneration.")
 @click.option("--mode", type=click.Choice(["shell", "manual"]), help="Agent execution mode (advanced).")
 @click.option("--command", help="Custom shell command template (advanced).")
-@click.option("--jobs", "job_count", type=int, default=None, help="Parallel agent jobs (default: config generation.concurrency or DOCFLOW_JOBS).")
+@click.option("--jobs", "job_count", type=int, default=None, help="Parallel agent jobs (default: 1, or generation.concurrency / DOCFLOW_JOBS).")
 def generate(
     ctx,
     repo: str,
@@ -343,16 +343,23 @@ def projects_open(docs_path: str):
 
 @projects.command("remove")
 @click.argument("docs_path")
-def projects_remove(docs_path: str):
-    """Unregister a project. Does not delete files."""
-    from docflow.core.projects import unregister_project
+@click.option(
+    "--delete-docs",
+    is_flag=True,
+    help="Also delete the docs folder on disk (DocFlow docs projects only).",
+)
+def projects_remove(docs_path: str, delete_docs: bool):
+    """Unregister a project. Use --delete-docs to remove the docs folder too."""
+    from docflow.core.projects import remove_project
 
     entry = _lookup_project(docs_path)
     target = entry.docs_path if entry else docs_path
-    if not unregister_project(target):
+    removed, note = remove_project(target, delete_docs=delete_docs)
+    if not removed:
         ux.print_error(f"No registered project for {docs_path}")
         raise click.Abort()
-    click.echo(f"Removed {target} from the project list")
+    extra = f" ({note})" if note else ""
+    click.echo(f"Removed {target} from the project list{extra}")
 
 
 @projects.command("add")

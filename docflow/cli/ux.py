@@ -38,8 +38,9 @@ def print_dashboard(dash: Dashboard) -> None:
     if not dash.configured:
         print_header("No DocFlow project is open")
         console.print("  Config lives in a docs folder. Nothing is written into the app repo.")
-        next_step("`docflow init` or `docflow projects list` / `open`.")
-        return
+        if not dash.app_repo_path and not dash.docs_repo_path:
+            next_step("`docflow init` or `docflow projects list` / `open`.")
+            return
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column("key", style="bold")
     table.add_column("value")
@@ -55,6 +56,10 @@ def print_dashboard(dash: Dashboard) -> None:
         f"({'exists' if dash.docs_exists else 'missing'})",
     )
     table.add_row("Agent", f"[yellow]{dash.agent_mode}[/yellow]  {dash.agent_command or 'manual'}")
+    table.add_row(
+        "Parallel agents",
+        f"[cyan]{getattr(dash, 'concurrency', 1)}[/cyan]  (1 is safest)",
+    )
     table.add_row("Platform", dash.platform)
     if dash.doc_types:
         table.add_row("Doc types", ", ".join(dash.doc_types))

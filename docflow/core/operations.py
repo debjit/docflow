@@ -19,7 +19,8 @@ from docflow.config.settings import DocFlowConfig, DocTypeSettings, ExtraFeature
 from docflow.core.agent_runner import AGENT_PRESETS, AgentRunner
 from docflow.core.projects import (
     find_by_app,
-    last_project,
+    find_by_docs,
+    last_usable_project,
     register_project,
 )
 from docflow.core.git_analyzer import GitAnalyzer, feature_bucket_for_path, posix_rel
@@ -54,7 +55,7 @@ from docflow.core.workspace import (
     write_state_path,
     find_state_path,
 )
-from docflow.core.job_runner import Job, RunControl, default_concurrency, run_jobs
+from docflow.core.job_runner import Job, RunControl, clamp_concurrency, default_concurrency, run_jobs
 from docflow.core.llms_txt_generator import LLMSTxtGenerator
 from docflow.core.models import AgentRunResult, FeatureChunk, PromptContext
 from docflow.core.prompt_builder import PromptBuilder
@@ -738,6 +739,7 @@ class Dashboard:
     doc_types: List[str] = field(default_factory=list)
     last_documented: Optional[CommitInfo] = None
     new_commits: List[CommitInfo] = field(default_factory=list)
+    concurrency: int = 1
 
 
 @dataclass
@@ -818,14 +820,38 @@ def default_docs_path(app_repo_path: str) -> str:
     )
 
 
+def docs_dir_from_config(config: DocFlowConfig) -> str:
+    """Docs repo root for a loaded config (`.docflow/config.yml` or legacy `.docflow.yml`)."""
+    if config.source_path:
+        return docs_root_from_config_path(config.source_path)
+    if config.docs.repo_path:
+        return os.path.abspath(config.docs.repo_path)
+    return ""
+
+
+def docs_repo_from_cwd(cwd: Optional[str] = None) -> str:
+    """If this folder is a docs project, return it.
+
+    A leftover config in an app/tool repo often still points at the real docs
+    folder (`docs.repo_path`). Prefer that when it is a DocFlow project.
+    """
+    folder = os.path.abspath(cwd or os.getcwd())
+    if not is_initialized(folder):
+        return ""
+    config = DocFlowConfig.load(docs_repo_path=folder)
+    pointed = (config.docs.repo_path or "").strip()
+    if pointed:
+        pointed = os.path.abspath(pointed)
+        if pointed != folder and is_initialized(pointed):
+            return pointed
+    return folder
+
+
 def is_configured(config: Optional[DocFlowConfig] = None) -> bool:
     cfg = config or DocFlowConfig.load()
-    docs_dir = ""
-    if cfg.source_path:
-        docs_dir = docs_root_from_config_path(cfg.source_path)
-    elif cfg.docs.repo_path:
-        docs_dir = os.path.abspath(cfg.docs.repo_path)
-    return bool(docs_dir and is_initialized(docs_dir) and cfg.app.repo_path)
+    docs_dir = docs_dir_from_config(cfg)
+    app_path = (cfg.app.repo_path or "").strip()
+    return bool(docs_dir and is_initialized(docs_dir) and app_path)
 
 
 def agent_supports_models(agent_key: str) -> bool:
@@ -1090,16 +1116,18 @@ def resolve_paths(
     docs_repo_path = ""
     if docs:
         docs_repo_path = os.path.abspath(docs)
-    elif is_initialized(os.getcwd()):
-        docs_repo_path = os.path.abspath(os.getcwd())
     elif repo:
         entry = find_by_app(repo)
         if entry:
             docs_repo_path = entry.docs_path
+        else:
+            docs_repo_path = docs_repo_from_cwd()
     else:
-        entry = last_project()
-        if entry:
-            docs_repo_path = entry.docs_path
+        docs_repo_path = docs_repo_from_cwd()
+        if not docs_repo_path:
+            entry = last_usable_project()
+            if entry:
+                docs_repo_path = entry.docs_path
 
     if not docs_repo_path:
         if require:
@@ -1115,6 +1143,10 @@ def resolve_paths(
         app_repo_path = os.path.abspath(repo)
     elif config.app.repo_path:
         app_repo_path = os.path.abspath(config.app.repo_path)
+    else:
+        indexed = find_by_docs(docs_repo_path)
+        if indexed and indexed.app_path:
+            app_repo_path = indexed.app_path
 
     if require and not app_repo_path:
         raise ConfigError(
@@ -1490,14 +1522,11 @@ _IMPORT_PROGRESS_EVERY = 10
 
 def _job_concurrency(config: DocFlowConfig, override: Optional[int] = None) -> int:
     if override is not None:
-        return max(1, int(override))
+        return clamp_concurrency(override, 1)
     raw = os.getenv("DOCFLOW_JOBS")
     if raw not in (None, ""):
         return default_concurrency()
-    try:
-        return max(1, int(config.generation.concurrency or 4))
-    except (TypeError, ValueError):
-        return 4
+    return clamp_concurrency(config.generation.concurrency, 1)
 
 
 def _agent_capture(concurrency: int, capture_output: bool) -> Optional[bool]:
@@ -1681,8 +1710,17 @@ def get_dashboard(repo: Optional[str] = None, docs: Optional[str] = None) -> Das
         except Exception:
             last_documented = None
             new_commits = []
+    project_name = (cfg.project.name or "").strip()
+    if not project_name or project_name == "Project":
+        indexed = find_by_docs(docs_path) if docs_path else None
+        if indexed and indexed.name:
+            project_name = indexed.name
+        elif app_path:
+            project_name = os.path.basename(app_path.rstrip(os.sep)) or project_name
+        elif docs_path:
+            project_name = os.path.basename(docs_path.rstrip(os.sep)) or project_name
     return Dashboard(
-        project_name=cfg.project.name,
+        project_name=project_name or "Project",
         app_repo_path=app_path,
         docs_repo_path=docs_path,
         app_exists=bool(app_path and os.path.exists(app_path)),
@@ -1692,11 +1730,12 @@ def get_dashboard(repo: Optional[str] = None, docs: Optional[str] = None) -> Das
         platform=cfg.platform.type,
         features=features,
         pending=pending,
-        configured=is_configured(cfg),
+        configured=is_configured(cfg) or bool(app_path and docs_path and is_initialized(docs_path)),
         source_path=cfg.source_path,
         doc_types=[f"{t.name}: {t.description}" if t.description else t.name for t in types],
         last_documented=last_documented,
         new_commits=new_commits,
+        concurrency=clamp_concurrency(cfg.generation.concurrency, 1),
     )
 
 
@@ -1744,6 +1783,8 @@ def init_docs(
     ]
     if not config.project.name or config.project.name == "Project":
         config.project.name = os.path.basename(app_repo_path)
+    if concurrency is not None:
+        config.generation.concurrency = clamp_concurrency(concurrency, 1)
 
     analyzer = GitAnalyzer(app_repo_path)
     framework_name, ignore_patterns, skip_dirs = _generation_context(app_repo_path, config)
@@ -2001,6 +2042,9 @@ def generate_docs(
     app_repo_path = os.path.abspath(app_repo_path)
     docs_repo_path = os.path.abspath(docs_repo_path)
     config = config or DocFlowConfig.load(docs_repo_path=docs_repo_path)
+    if concurrency is not None:
+        config.generation.concurrency = clamp_concurrency(concurrency, 1)
+        save_project_config(config, app_repo_path, docs_repo_path)
 
     is_full = full
     included_count = commit_count or 1

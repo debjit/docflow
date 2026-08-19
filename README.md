@@ -114,6 +114,7 @@ platform:
   auto_mr: true
 
 generation:
+  concurrency: 1   # parallel agent jobs; use 1 unless the machine can run several LLMs
   full_diff_threshold: 200
   framework: auto   # auto | none | laravel
   ignore:
@@ -123,7 +124,7 @@ generation:
     - "__pycache__/"
 ```
 
-- **`generation.framework`**: `auto` detects Laravel and applies framework-aware ignore rules; `laravel` forces the Laravel profile; `none` skips detection (still ignores `vendor/`).
+- **`generation.concurrency`**: how many agent jobs run at once. Default is **1**. Raise it only if the PC can run several coding agents together. `--jobs N` or `DOCFLOW_JOBS` overrides for one run.
 - **`generation.ignore`**: merged with DocFlow defaults and framework profiles during scan and diff.
 - **`generation.features`**: units selected during init. Later `generate` only updates those sections.
 - **Section picker**: after the agent inspects composer/packages and app structure, init lists application units (models, routes, pages, …). CLI glue such as `main`/`menu` is not listed. `--yes` skips the picker (CI).

@@ -285,7 +285,7 @@ def _cli_progress(message: str) -> None:
 
 def pick_open_project(repo: str = "", docs: str = "", force_list: bool = False) -> tuple[str, str]:
     """Last project → open, or pick from the list. Does not write into the app repo."""
-    from docflow.core.projects import last_project, load_index, open_project
+    from docflow.core.projects import last_project, load_index, open_project, remove_project
 
     if docs:
         return repo, docs
@@ -307,8 +307,25 @@ def pick_open_project(repo: str = "", docs: str = "", force_list: bool = False) 
         for i, entry in enumerate(entries, start=1):
             ux.console.print(f"  [cyan]{i}[/cyan]. {entry.name}  {entry.docs_path}")
         ux.console.print("  [cyan]n[/cyan]. New project (init)")
-        choices = [str(i) for i in range(1, len(entries) + 1)] + ["n"]
+        ux.console.print("  [cyan]d[/cyan]. Delete a project")
+        choices = [str(i) for i in range(1, len(entries) + 1)] + ["n", "d"]
         choice = Prompt.ask("Project", choices=choices, default="n" if not last else "1")
+        if choice == "d":
+            which = Prompt.ask(
+                "Number to delete",
+                choices=[str(i) for i in range(1, len(entries) + 1)],
+            )
+            entry = entries[int(which) - 1]
+            purge = Confirm.ask(
+                f"Also delete the docs folder on disk?  ({entry.docs_path})",
+                default=False,
+            )
+            removed, note = remove_project(entry.docs_path, delete_docs=purge)
+            if removed:
+                ux.console.print(f"  Removed [cyan]{entry.name}[/cyan]. {note}".rstrip())
+            else:
+                ux.print_warning("Could not remove that project.")
+            return pick_open_project(repo, docs, force_list=True)
         if choice != "n":
             entry = entries[int(choice) - 1]
             open_project(entry.docs_path)
@@ -364,6 +381,7 @@ def run_init(repo: str = "", docs: str = "", agent: Optional[str] = None,
         ux.print_error(str(exc))
         raise click.Abort()
     ux.print_init_result(result)
+    ux.print_dashboard(get_dashboard(result.app_repo_path, result.docs_repo_path))
 
 
 def run_import(docs: str = "", source: str = "", type_name: str = "") -> None:
@@ -444,6 +462,14 @@ def run_generate(repo: str = "", docs: str = "", agent: Optional[str] = None,
             branch = Prompt.ask("Branch name", default=branches[0] if branches else "HEAD")
             commit_count = int(Prompt.ask("How many commits on that branch", default="1"))
             commit_count = max(1, commit_count)
+    if concurrency is None and interactive_mode:
+        from docflow.core.job_runner import clamp_concurrency
+
+        default_jobs = str(clamp_concurrency(paths.config.generation.concurrency, 1))
+        concurrency = clamp_concurrency(
+            Prompt.ask("Parallel agents (1 is safest)", default=default_jobs),
+            1,
+        )
     try:
         result = generate_docs(
             app_repo_path=paths.app_repo_path,

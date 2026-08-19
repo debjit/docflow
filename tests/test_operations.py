@@ -2,6 +2,9 @@
 Tests for shared operations helpers.
 """
 
+import os
+from pathlib import Path
+
 from docflow.config.settings import DocFlowConfig, DocTypeSettings
 from docflow.core.agent_runner import AGENT_PRESETS
 from docflow.core.operations import (
@@ -14,6 +17,7 @@ from docflow.core.operations import (
     default_cursor_model,
     generate_docs,
     generate_section_names,
+    get_dashboard,
     import_docs,
     init_docs,
     load_generate_cursor,
@@ -348,6 +352,12 @@ def test_init_docs_review_keeps_selection_and_extra(tmp_path, monkeypatch):
     extra_names = {item.name: item.paths for item in saved.generation.extra_features}
     assert extra_names["login"] == ["src/auth/login.py"]
     assert extra_names["charge"] == ["payments/charge.py"]
+    dash = get_dashboard(str(app), str(docs))
+    assert dash.project_name == "app"
+    assert dash.app_repo_path == str(app)
+    assert dash.docs_repo_path == str(docs)
+    assert dash.configured is True
+    assert dash.source_path.endswith("config.yml")
 
 
 def test_init_docs_cancel_writes_nothing(tmp_path, monkeypatch):
@@ -570,3 +580,77 @@ def test_picker_group_labels_and_toggle():
     toggle_group_included(migrations, "database")
     assert migrations[0].included is True
     assert migrations[1].included is True
+
+
+def test_dashboard_reads_nested_config_and_shows_app(tmp_path, monkeypatch):
+    from docflow.core.operations import get_dashboard, is_configured, resolve_paths
+    from docflow.core.projects import register_project
+    from docflow.core.workspace import write_config_path
+
+    home = tmp_path / "home"
+    xdg = tmp_path / "xdg"
+    home.mkdir()
+    xdg.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+
+    app = tmp_path / "shop"
+    docs = tmp_path / "shop-docs"
+    app.mkdir()
+    docs.mkdir()
+    config_path = write_config_path(str(docs))
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    Path(config_path).write_text(
+        "project:\n  name: Shop\n"
+        f"app:\n  repo_path: {app}\n"
+        f"docs:\n  repo_path: {docs}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    register_project(str(docs), str(app), "Shop")
+    paths = resolve_paths(require=False)
+    assert paths.docs_repo_path == str(docs.resolve())
+    assert paths.app_repo_path == str(app.resolve())
+    dash = get_dashboard()
+    assert dash.project_name == "Shop"
+    assert dash.app_repo_path == str(app.resolve())
+    assert dash.docs_repo_path == str(docs.resolve())
+    assert is_configured(paths.config) is True
+
+
+def test_cwd_pointer_config_uses_real_docs_repo(tmp_path, monkeypatch):
+    from docflow.core.operations import resolve_paths
+    from docflow.core.workspace import write_config_path
+
+    home = tmp_path / "home"
+    xdg = tmp_path / "xdg"
+    home.mkdir()
+    xdg.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+
+    app = tmp_path / "app"
+    docs = tmp_path / "docs"
+    tool = tmp_path / "tool"
+    app.mkdir()
+    docs.mkdir()
+    tool.mkdir()
+    config_path = write_config_path(str(docs))
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    Path(config_path).write_text(
+        "project:\n  name: RealApp\n"
+        f"app:\n  repo_path: {app}\n"
+        f"docs:\n  repo_path: {docs}\n",
+        encoding="utf-8",
+    )
+    (tool / ".docflow.yml").write_text(
+        "project:\n  name: Project\n"
+        f"app:\n  repo_path: {app}\n"
+        f"docs:\n  repo_path: {docs}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tool)
+    paths = resolve_paths(require=False)
+    assert paths.docs_repo_path == str(docs.resolve())
+    assert paths.app_repo_path == str(app.resolve())
+    assert paths.config.project.name == "RealApp"

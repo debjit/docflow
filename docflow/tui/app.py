@@ -19,7 +19,7 @@ from textual.widgets.option_list import Option
 from textual.widgets.selection_list import Selection
 
 from docflow.core.agent_runner import AGENT_PRESETS
-from docflow.core.job_runner import RunControl
+from docflow.core.job_runner import RunControl, clamp_concurrency
 from docflow.core.operations import (
     AGENT_CHOICES,
     CURSOR_AGENT_KEYS,
@@ -47,7 +47,7 @@ from docflow.core.operations import (
     resolve_paths,
     selected_sections,
 )
-from docflow.core.projects import load_index, open_project
+from docflow.core.projects import load_index, open_project, remove_project
 
 _STATUS_RE = re.compile(
     r"^(?:"
@@ -249,8 +249,49 @@ def _resolve_screen_model(agent_key: str, model: Optional[str]) -> str:
     return chosen
 
 
+def _jobs_from_input(screen, default: int = 1) -> int:
+    try:
+        raw = screen.query_one("#jobs", Input).value.strip()
+    except Exception:
+        return clamp_concurrency(default, 1)
+    return clamp_concurrency(raw or default, default)
+
+
 def _default_types_text() -> str:
     return "\n".join(f"{t.name}: {t.description}" for t in DEFAULT_DOC_TYPES)
+
+
+class DeleteProjectScreen(ModalScreen[Optional[str]]):
+    """Confirm removing a project from the list, optionally deleting its docs folder."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, entry, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._entry = entry
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label("Delete this project?", classes="title")
+            yield Static(
+                f"{self._entry.name}\n{self._entry.docs_path}\n\n"
+                "Remove from list keeps the docs folder. "
+                "Remove and delete docs folder erases that docs repo."
+            )
+            with Horizontal(classes="buttons"):
+                yield Button("Remove from list", variant="primary", id="list")
+                yield Button("Remove and delete docs folder", id="purge")
+                yield Button("Cancel", id="cancel")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == "cancel":
+            self.dismiss(None)
+            return
+        self.dismiss(event.button.id)
 
 
 class ProjectPickerScreen(ModalScreen[Optional[dict]]):
@@ -262,15 +303,21 @@ class ProjectPickerScreen(ModalScreen[Optional[dict]]):
         self._id_to_entry = {}
         with Vertical(id="dialog"):
             yield Label("Open a docs project", classes="title")
+            yield Static("Select a project, then Open or Delete.", id="project-help")
             yield OptionList(id="project-list")
             with Horizontal(classes="buttons"):
                 yield Button("Open", variant="primary", id="ok")
+                yield Button("Delete", id="delete")
                 yield Button("New", id="new")
                 yield Button("Cancel", id="cancel")
 
     def on_mount(self) -> None:
+        self._rebuild()
+
+    def _rebuild(self) -> None:
         listing = self.query_one("#project-list", OptionList)
         listing.clear_options()
+        self._id_to_entry = {}
         entries = load_index()
         if not entries:
             listing.add_option(Option("No projects yet — choose New", disabled=True))
@@ -293,6 +340,33 @@ class ProjectPickerScreen(ModalScreen[Optional[dict]]):
             return None
         return self._id_to_entry.get(option.id)
 
+    def _delete_selected(self) -> None:
+        entry = self._selected_entry()
+        if entry is None:
+            return
+
+        def finish(action: Optional[str]) -> None:
+            if not action:
+                return
+            removed, note = remove_project(entry.docs_path, delete_docs=action == "purge")
+            if not removed:
+                self.query_one("#project-help", Static).update("Could not remove that project.")
+                return
+            app = self.app
+            current = os.path.abspath(getattr(app, "_docs", "") or "")
+            if current and current == os.path.abspath(entry.docs_path):
+                app._docs = ""
+                app._repo = ""
+                if hasattr(app, "refresh_summary"):
+                    app.refresh_summary()
+            message = f"Removed {entry.name}"
+            if note:
+                message = f"{message} ({note})"
+            self.query_one("#project-help", Static).update(message)
+            self._rebuild()
+
+        self.app.push_screen(DeleteProjectScreen(entry), finish)
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         event.stop()
         if event.button.id == "cancel":
@@ -300,6 +374,9 @@ class ProjectPickerScreen(ModalScreen[Optional[dict]]):
             return
         if event.button.id == "new":
             self.dismiss({"new": True})
+            return
+        if event.button.id == "delete":
+            self._delete_selected()
             return
         entry = self._selected_entry()
         if entry is None:
@@ -340,6 +417,8 @@ class SetupScreen(ModalScreen[Optional[dict]]):
                 allow_blank=False,
             )
             yield ModelPicker(id="model-picker")
+            yield Label("Parallel agents (1 is safest on most PCs)")
+            yield Input(value="1", id="jobs")
             yield Label("Doc types (one per line: name: description)")
             yield TextArea(_default_types_text(), id="types")
             yield Label("Import from path/folder (optional, never overwrites)")
@@ -376,6 +455,7 @@ class SetupScreen(ModalScreen[Optional[dict]]):
                 "types": types or list(DEFAULT_DOC_TYPES),
                 "import_from": self.query_one("#import-from", Input).value.strip(),
                 "import_into": self.query_one("#import-into", Input).value.strip(),
+                "jobs": _jobs_from_input(self, 1),
             }
         )
 
@@ -593,6 +673,8 @@ class GenerateScreen(ModalScreen[Optional[dict]]):
                 allow_blank=False,
             )
             yield ModelPicker(id="model-picker")
+            yield Label("Parallel agents (1 is safest on most PCs)")
+            yield Input(value=str(dash.concurrency or 1), id="jobs")
             with Horizontal(classes="buttons"):
                 yield Button("Generate", variant="primary", id="ok")
                 yield Button("Cancel", id="cancel")
@@ -689,6 +771,7 @@ class GenerateScreen(ModalScreen[Optional[dict]]):
                 "feature": self.query_one("#feature", Input).value.strip(),
                 "agent": str(self.query_one("#agent", Select).value),
                 "model": _selected_model(self),
+                "jobs": _jobs_from_input(self, 1),
             }
         )
 
@@ -872,11 +955,15 @@ class DocFlowApp(App[None]):
     #dialog Input, #dialog Select, #dialog TextArea, #preview, #model-picker, #section-list {
         margin-bottom: 1;
     }
-    #section-list {
-        height: 16;
+    #project-list, #section-list {
+        height: 12;
         border: tall $border-blurred;
         background: $surface;
         padding: 0 1;
+        margin-bottom: 1;
+    }
+    #section-list {
+        height: 16;
     }
     #section-help {
         color: $text-muted;
@@ -1095,10 +1182,12 @@ class DocFlowApp(App[None]):
 
     def refresh_summary(self) -> None:
         dash = self._dashboard()
+        self.title = dash.project_name or "DocFlow"
         lines = [
-            f"[bold]{dash.project_name}[/bold]",
-            f"App   {dash.app_repo_path or 'not set'}  ({'ok' if dash.app_exists else 'missing'})",
-            f"Docs  {dash.docs_repo_path or 'not set'}  ({'ok' if dash.docs_exists else 'missing'})",
+            f"Project  [bold]{dash.project_name or 'not set'}[/bold]",
+            f"App      {dash.app_repo_path or 'not set'}  ({'ok' if dash.app_exists else 'missing'})",
+            f"Docs     {dash.docs_repo_path or 'not set'}  ({'ok' if dash.docs_exists else 'missing'})",
+            f"Jobs     {dash.concurrency} agent(s) at a time",
             f"Agent {dash.agent_mode}  {dash.agent_command or 'manual'}",
             f"Types: {', '.join(dash.doc_types) or 'none'}",
             f"Documented: {dash.last_documented.short_sha}  {dash.last_documented.message}"
@@ -1231,6 +1320,7 @@ class DocFlowApp(App[None]):
                 types=data["types"],
                 import_from=data.get("import_from") or None,
                 import_into=data.get("import_into") or None,
+                concurrency=data.get("jobs"),
                 on_review_sections=review,
                 run_control=self._run_control,
             )
@@ -1242,6 +1332,9 @@ class DocFlowApp(App[None]):
             return
         ok = sum(1 for f in result.features if f.success)
         imported = f", imported {len(result.imported_copied)}" if result.imported_copied else ""
+        self._docs = result.docs_repo_path
+        self._repo = result.app_repo_path
+        open_project(result.docs_repo_path)
         self._finish_run(
             f"Setup complete: {ok}/{len(result.features)} sections{imported} → {result.docs_repo_path}"
         )
@@ -1341,6 +1434,7 @@ class DocFlowApp(App[None]):
                 capture_output=True,
                 on_progress=self._thread_progress,
                 commit_count=data.get("commit_count"),
+                concurrency=data.get("jobs"),
                 run_control=self._run_control,
             )
         except Exception as exc:

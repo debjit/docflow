@@ -8,6 +8,7 @@ This is not a project config file and is never written into an application repo.
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -139,6 +140,30 @@ def last_project() -> Optional[ProjectEntry]:
     return max(enumerate(entries), key=lambda item: (item[1].last_opened or "", item[0]))[1]
 
 
+def last_usable_project() -> Optional[ProjectEntry]:
+    """Last opened project whose docs folder still exists and has DocFlow config."""
+    entries, current = _read_index()
+    ordered: List[ProjectEntry] = []
+    if current:
+        for entry in entries:
+            if entry.docs_path == current:
+                ordered.append(entry)
+                break
+    rest = sorted(
+        entries,
+        key=lambda item: (item.last_opened or "", item.docs_path),
+        reverse=True,
+    )
+    seen = set()
+    for entry in ordered + rest:
+        if entry.docs_path in seen:
+            continue
+        seen.add(entry.docs_path)
+        if os.path.isdir(entry.docs_path) and is_docs_project(entry.docs_path):
+            return entry
+    return None
+
+
 def _default_name(docs_path: str, name: str) -> str:
     cleaned = (name or "").strip()
     if cleaned and cleaned != "Project":
@@ -177,6 +202,30 @@ def unregister_project(docs_path: str) -> bool:
         return False
     save_index(kept)
     return True
+
+
+def _safe_to_delete_docs(docs_path: str) -> bool:
+    path = _abs(docs_path)
+    if not path or not os.path.isdir(path):
+        return False
+    home = os.path.abspath(os.path.expanduser("~"))
+    if path in {"/", home, os.path.dirname(home)}:
+        return False
+    if len(path) < 8:
+        return False
+    return is_docs_project(path)
+
+
+def remove_project(docs_path: str, delete_docs: bool = False) -> tuple[bool, str]:
+    """Drop a project from the list. Optionally delete its docs folder."""
+    docs_abs = _abs(docs_path)
+    removed = unregister_project(docs_abs)
+    if not delete_docs:
+        return removed, ""
+    if not _safe_to_delete_docs(docs_abs):
+        return removed, "docs folder was not a DocFlow project; left on disk"
+    shutil.rmtree(docs_abs)
+    return removed, "docs folder deleted"
 
 
 def open_project(docs_path: str) -> ProjectEntry:

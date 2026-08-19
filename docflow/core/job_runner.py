@@ -52,15 +52,23 @@ class RunControl:
         self._gate.wait()
 
 
+MAX_CONCURRENCY = 16
+
+
+def clamp_concurrency(value: object, fallback: int = 1) -> int:
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError, AttributeError):
+        parsed = fallback
+    return max(1, min(parsed, MAX_CONCURRENCY))
+
+
 def default_concurrency() -> int:
-    """Read DOCFLOW_JOBS as a positive int, otherwise 4."""
+    """Read DOCFLOW_JOBS as a positive int, otherwise 1 (one agent at a time)."""
     raw = os.getenv("DOCFLOW_JOBS")
     if raw is None or str(raw).strip() == "":
-        return 4
-    try:
-        return max(1, int(raw))
-    except (TypeError, ValueError):
-        return 4
+        return 1
+    return clamp_concurrency(raw, 1)
 
 
 def _failure_message(result: Any, exc: Optional[BaseException]) -> Optional[str]:
@@ -73,7 +81,7 @@ def _failure_message(result: Any, exc: Optional[BaseException]) -> Optional[str]
 
 def run_jobs(
     jobs: Sequence[Job],
-    concurrency: int = 4,
+    concurrency: int = 1,
     on_progress: Optional[Callable[[str], None]] = None,
     auto_retry: bool = True,
     run_control: Optional[RunControl] = None,

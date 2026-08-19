@@ -38,6 +38,7 @@ async def test_update_docs_modal_has_agent_select():
         assert generate.query_one("#agent")
         assert generate.query_one("#model-picker")
         assert generate.query_one("#model-list")
+        assert generate.query_one("#jobs")
 
 
 @pytest.mark.asyncio
@@ -101,6 +102,23 @@ async def test_setup_and_publish_open_modals():
         await pilot.press("p")
         await pilot.pause()
         assert any(screen.__class__.__name__ == "PublishScreen" for screen in app.screen_stack)
+
+
+@pytest.mark.asyncio
+async def test_switch_modal_has_delete():
+    from docflow.tui.app import ProjectPickerScreen
+
+    app = DocFlowApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.push_screen(ProjectPickerScreen())
+        await pilot.pause()
+        picker = next(
+            screen for screen in app.screen_stack if screen.__class__.__name__ == "ProjectPickerScreen"
+        )
+        assert picker.query_one("#delete")
+        assert picker.query_one("#ok")
+        assert picker.query_one("#project-list")
 
 
 @pytest.mark.asyncio
