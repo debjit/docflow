@@ -32,8 +32,10 @@ from docflow.core.operations import (
     default_docs_path,
     generate_docs,
     get_dashboard,
+    group_candidates,
     import_docs,
     init_docs,
+    kind_heading,
     list_agent_models,
     list_app_branches,
     list_recent_commits,
@@ -378,7 +380,7 @@ class SetupScreen(ModalScreen[Optional[dict]]):
 
 
 class SectionPickerScreen(ModalScreen[Optional[list]]):
-    """After scan: choose which discovered sections to document, and add extras."""
+    """After inventory: choose individual units to document, and add extras."""
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
@@ -388,15 +390,16 @@ class SectionPickerScreen(ModalScreen[Optional[list]]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
-            yield Label("What should DocFlow document?", classes="title")
+            yield Label("Review the agent's documentation list", classes="title")
             yield Static(
-                "Space toggles a section. Uncheck git/CI/tooling. "
-                "Add a module name or path if the scan missed something.",
+                "These are the units the agent recommended from composer/packages. "
+                "Uncheck anything to skip. Add a file path if something important is missing. "
+                "Git, GitLab, and CI are never listed.",
                 id="section-help",
             )
             yield SelectionList(id="section-list")
-            yield Label("Add a module name or path")
-            yield Input(placeholder="app/Services or payments", id="add-path")
+            yield Label("Add a file path")
+            yield Input(placeholder="app/Models/Order.php", id="add-path")
             with Horizontal(classes="buttons"):
                 yield Button("Add", id="add")
                 yield Button("Continue", variant="primary", id="ok")
@@ -408,8 +411,13 @@ class SectionPickerScreen(ModalScreen[Optional[list]]):
     def _rebuild(self) -> None:
         listing = self.query_one("#section-list", SelectionList)
         listing.clear_options()
-        for i, item in enumerate(self._items):
-            listing.add_option(Selection(item.label, f"s{i}", item.included))
+        for kind, indices in group_candidates(self._items):
+            listing.add_option(
+                Selection(f"── {kind_heading(kind)} ──", f"h-{kind}", False, disabled=True)
+            )
+            for i in indices:
+                item = self._items[i]
+                listing.add_option(Selection(item.label, f"s{i}", item.included))
 
     def _sync_included(self) -> None:
         listing = self.query_one("#section-list", SelectionList)
@@ -422,11 +430,14 @@ class SectionPickerScreen(ModalScreen[Optional[list]]):
         if not raw:
             return
         self._sync_included()
+        stem = os.path.splitext(os.path.basename(raw.replace("\\", "/")))[0] or raw
         self._items.append(
             SectionCandidate(
                 doc_type="features",
                 name=raw,
-                description=f"Extra section '{raw}'",
+                title=stem,
+                kind="module",
+                description=f"Extra unit '{raw}'",
                 included=True,
                 extra=True,
             )
@@ -454,7 +465,7 @@ class SectionPickerScreen(ModalScreen[Optional[list]]):
         picked = selected_sections(self._items)
         if not picked:
             self.query_one("#section-help", Static).update(
-                "Select at least one section, or add a module/path."
+                "Select at least one item, or add a file path."
             )
             return
         self.dismiss(self._items)
@@ -1161,7 +1172,7 @@ class DocFlowApp(App[None]):
         )
         if spec is None:
             spec = resolve_agent(agent="manual")
-        self._begin_run("Scanning the app repo…")
+        self._begin_run("Asking the agent what belongs in the docs…")
         loop = asyncio.get_running_loop()
 
         def review(candidates):

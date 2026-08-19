@@ -5,14 +5,39 @@ Project: **{{ project_name }}**
 Application repository: `{{ app_repo_path }}`
 Documentation repository: `{{ docs_repo_path }}`
 
+## Documentation sections the user chose
+
+Assign every recommended unit to **one** of these sections:
+
+{% if available_sections %}
+{% for section in available_sections %}
+- `{{ section.name }}`{% if section.description %}: {{ section.description }}{% endif %}
+{% endfor %}
+{% else %}
+- `architecture`: System layout, hosting, and shared packages
+- `features`: Application domain units (models, resources, pages, jobs)
+{% endif %}
+
 ## Task
 
-Inspect the application repository and identify the technology stack. Focus on **this application's** stack, not generic framework tutorials.
+Inspect **this** repository. Produce a documentation inventory — not git/CI noise, not library tutorials.
 
-1. Read `composer.json`, `composer.lock` (package names only), `package.json`, and obvious entry files (`artisan`, `bootstrap/app.php`, `routes/web.php`, etc.).
-2. Detect the platform (expect Laravel for PHP apps) and libraries in this ecosystem: Filament, Inertia, Vue, React, Livewire, etc.
-3. List paths that should **never** be documented (vendor, generated caches, framework scaffolding).
-4. List paths that **should** be documented (application code layered on the framework).
+Use these files as evidence of what the app is (do not document the tools themselves):
+
+1. `composer.json` / `composer.lock` (package **names** only)
+2. `package.json` / lockfile (package **names** only)
+3. `docker-compose.yml` / `compose.yaml` if present (how **this** app is hosted)
+4. Entry files: `artisan`, `bootstrap/app.php`, `routes/web.php`, `README.md`
+
+Then:
+
+1. Detect the platform (Laravel for PHP apps) and in-repo libraries (Filament, Inertia, Vue, React, Livewire, Horizon, …).
+2. List paths that must **never** be documented: `vendor/`, caches, framework scaffolding, `.github/`, `.gitlab/`, CI.
+3. List **individual application units** to document — one class, page, resource, controller, or job each — and assign `section`.
+4. If you find something **important for this repo** that is not a usual category (not a model/resource/page/controller), put it in `other_items` with `kind` `"other"` and the best `section`. Examples: a custom billing gateway, a deploy layout unique to this app. Not git, GitLab, GitHub CLI, CI, artisan, or vendor packages.
+
+Do **not** list directories (`app/`, `Models/`, `github/`).
+Do **not** list GitHub CLI, GitLab, git, CI workflows, artisan, Illuminate, or vendor packages.
 
 ## Output
 
@@ -26,17 +51,28 @@ Use this schema:
 {
   "platform": "laravel",
   "libraries": ["filament", "inertia", "vue"],
-  "skip_paths": ["vendor/", "storage/", "bootstrap/cache/"],
-  "document": ["app/", "routes/", "database/", "resources/js/", "resources/views/", "config/"],
-  "guidance": "Do not document Laravel/Filament/Inertia/Vue internals. Document this app's models, Filament resources, Inertia pages, and Vue components."
+  "skip_paths": ["vendor/", "storage/", "bootstrap/cache/", ".github/", ".gitlab-ci.yml"],
+  "document": ["app/Models/User.php", "app/Filament/Resources/InvoiceResource.php"],
+  "guidance": "Do not document Laravel/Filament/Inertia/Vue internals. Document this app's models, Filament resources, Inertia pages, and Vue components.",
+  "items": [
+    {"id": "architecture", "kind": "overview", "title": "Architecture", "path": "composer.json", "section": "architecture", "include": true},
+    {"id": "user", "kind": "model", "title": "User", "path": "app/Models/User.php", "section": "features", "include": true},
+    {"id": "invoice-resource", "kind": "filament-resource", "title": "InvoiceResource", "path": "app/Filament/Resources/InvoiceResource.php", "section": "features", "include": true}
+  ],
+  "other_items": [
+    {"id": "acme-gateway", "kind": "other", "title": "Acme payment gateway", "path": "app/Billing/AcmeGateway.php", "section": "features", "include": true, "why": "Custom integration unique to this repo"}
+  ]
 }
 ```
 
 Rules:
 - `platform`: primary framework (e.g. `laravel`).
-- `libraries`: npm/composer libraries detected in **this** project (lowercase names).
-- `skip_paths`: directories or globs to exclude from documentation (always include `vendor/`).
-- `document`: application directories/files worth documenting.
-- `guidance`: one paragraph telling future doc agents what to skip vs what to cover.
+- `libraries`: composer/npm packages in **this** project. Tooling CLIs are not libraries to document.
+- `skip_paths`: always include `vendor/` plus git/CI paths.
+- `items`: one row per usual unit. `path` must be a single file. `section` must be one of the user-chosen section names above.
+- `kind` for `items` is one of: overview, model, filament-resource, filament-page, controller, policy, job, service, page, route, module.
+- `other_items`: important units that do not fit those kinds. Still application code — never git/GitLab/CI.
+- `include`: true for application domain code the user should document.
+- Cap `items` + `other_items` at about 80. Prefer models, Filament resources/pages, Inertia/Vue pages, controllers, jobs.
 
 Do **not** create any other files. Do **not** write human documentation yet — only `.docflow-stack.json`.

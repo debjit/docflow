@@ -72,6 +72,7 @@ class PromptContext(BaseModel):
     doc_type: str = "features"
     doc_type_description: str = ""
     output_dir: str = ""
+    available_sections: List[Dict[str, str]] = Field(default_factory=list)
 
 
 class AgentRunResult(BaseModel):

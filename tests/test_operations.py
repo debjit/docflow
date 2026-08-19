@@ -279,9 +279,10 @@ def test_discover_skips_noisy_defaults(tmp_path):
     names = {item.name for item in candidates if item.doc_type == "features"}
     assert "github" not in names
     assert "gitlab" not in names
-    assert "auth" in names
+    assert "auth" not in names
+    assert "login" in names
     assert suggested_section_included("git") is False
-    assert suggested_section_included("auth") is True
+    assert suggested_section_included("login") is True
 
 
 def test_init_docs_review_keeps_selection_and_extra(tmp_path, monkeypatch):
@@ -313,11 +314,11 @@ def test_init_docs_review_keeps_selection_and_extra(tmp_path, monkeypatch):
 
     def review(candidates):
         for item in candidates:
-            item.included = item.name in {"architecture", "auth"}
+            item.included = item.name in {"architecture", "login"}
         candidates.append(
             SectionCandidate(
                 doc_type="features",
-                name="payments",
+                name="payments/charge.py",
                 included=True,
                 extra=True,
             )
@@ -333,13 +334,17 @@ def test_init_docs_review_keeps_selection_and_extra(tmp_path, monkeypatch):
     assert "architecture" in result.types
     assert "features" in result.types
     pending = docs / "prompts" / "pending"
-    assert (pending / "init-features-auth.md").exists()
-    assert (pending / "init-features-payments.md").exists()
+    assert (pending / "init-features-login.md").exists()
+    assert (pending / "init-features-charge.md").exists()
     assert not (pending / "init-features-core.md").exists()
+    assert not (pending / "init-features-auth.md").exists()
     saved = DocFlowConfig.load(docs_repo_path=str(docs))
-    assert "auth" in (saved.generation.features or [])
-    assert "payments" in (saved.generation.features or [])
+    assert "login" in (saved.generation.features or [])
+    assert "charge" in (saved.generation.features or [])
     assert "core" not in (saved.generation.features or [])
+    extra_names = {item.name: item.paths for item in saved.generation.extra_features}
+    assert extra_names["login"] == ["src/auth/login.py"]
+    assert extra_names["charge"] == ["payments/charge.py"]
 
 
 def test_init_docs_cancel_writes_nothing(tmp_path, monkeypatch):
@@ -418,6 +423,26 @@ def test_generate_section_names_groups_wrappers_and_features():
     ]
     skip = {"bootstrap", "vendor", "public"}
     assert generate_section_names(scaffold, skip_as_feature=skip) == ["auth", "billing", "ui"]
+
+
+def test_generate_section_names_maps_selected_units():
+    from docflow.config.settings import DocFlowConfig, ExtraFeatureSettings, GenerationSettings
+    from docflow.core.models import FileChange
+    from docflow.core.operations import generate_section_names
+
+    files = [
+        FileChange(path="app/Models/User.php", change_type="modified"),
+        FileChange(path="app/Models/Invoice.php", change_type="modified"),
+    ]
+    config = DocFlowConfig(
+        generation=GenerationSettings(
+            extra_features=[
+                ExtraFeatureSettings(name="user", paths=["app/Models/User.php"]),
+                ExtraFeatureSettings(name="invoice", paths=["app/Models/Invoice.php"]),
+            ]
+        )
+    )
+    assert generate_section_names(files, config=config) == ["user", "invoice"]
 
 
 def test_generate_docs_writes_prompts_for_each_feature(tmp_path):

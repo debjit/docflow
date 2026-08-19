@@ -47,6 +47,30 @@ def test_prompt_builder_stack_survey():
     assert "Application Stack Survey" in rendered
     assert ".docflow-stack.json" in rendered
     assert "/tmp/app" in rendered
+    assert "composer.json" in rendered
+    assert "other_items" in rendered
+    assert "GitHub CLI" in rendered
+    assert "individual application units" in rendered
+
+
+def test_prompt_builder_stack_survey_includes_user_sections():
+    builder = PromptBuilder()
+    context = PromptContext(
+        task_type="stack-survey",
+        project_name="TestProject",
+        feature_name="stack-survey",
+        app_repo_path="/tmp/app",
+        docs_repo_path="/tmp/docs",
+        conventions_text="",
+        available_sections=[
+            {"name": "architecture", "description": "System layout"},
+            {"name": "features", "description": "Domain units"},
+        ],
+    )
+    rendered = builder.render(context)
+    assert "`architecture`" in rendered
+    assert "`features`" in rendered
+    assert "System layout" in rendered
 
 
 def test_prompt_builder_save():

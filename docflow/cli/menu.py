@@ -29,8 +29,10 @@ from docflow.core.operations import (
     default_docs_path,
     generate_docs,
     get_dashboard,
+    group_candidates,
     import_docs,
     init_docs,
+    kind_heading,
     list_app_branches,
     list_agent_models,
     parse_doc_type,
@@ -177,35 +179,44 @@ def collect_import(
     return "", ""
 
 
-def _print_section_candidates(candidates: Sequence[SectionCandidate]) -> None:
-    ux.console.print("\n[bold]What should DocFlow document?[/bold]")
-    ux.console.print("[dim]Uncheck git/CI/tooling. Add a module name or path if the scan missed something.[/dim]")
-    for i, item in enumerate(candidates, start=1):
-        mark = "[green]Y[/green]" if item.included else "[red]N[/red]"
-        ux.console.print(f"  [cyan]{i}[/cyan]. [{mark}] {item.label}")
+def _print_section_candidates(candidates: Sequence[SectionCandidate]) -> List[int]:
+    ux.console.print("\n[bold]Agent recommendations — remove or add before writing docs[/bold]")
+    ux.console.print(
+        "[dim]Number toggles one item off/on. Git, GitLab, and CI are not listed. "
+        "Add a file path if something important is missing.[/dim]"
+    )
+    order: List[int] = []
+    for kind, indices in group_candidates(candidates):
+        ux.console.print(f"\n[bold]{kind_heading(kind)}[/bold]")
+        for i in indices:
+            order.append(i)
+            item = candidates[i]
+            mark = "[green]Y[/green]" if item.included else "[red]N[/red]"
+            ux.console.print(f"  [cyan]{len(order)}[/cyan]. [{mark}] {item.label}")
     included = len(selected_sections(candidates))
-    ux.console.print(f"[dim]{included}/{len(candidates)} selected[/dim]")
+    ux.console.print(f"\n[dim]{included}/{len(candidates)} selected[/dim]")
+    return order
 
 
 def review_init_sections(
     candidates: List[SectionCandidate],
     add_extra=None,
 ) -> Optional[List[SectionCandidate]]:
-    """TTY picker: toggle discovered sections and optionally add more."""
+    """TTY picker: toggle individual units and optionally add more."""
     if not candidates:
         return []
     items = list(candidates)
     while True:
-        _print_section_candidates(items)
+        order = _print_section_candidates(items)
         ux.console.print(
-            "  [cyan]number[/cyan] toggle   [cyan]a[/cyan] add   "
+            "  [cyan]number[/cyan] toggle one item   [cyan]a[/cyan] add   "
             "[cyan]all[/cyan]/[cyan]none[/cyan]   [cyan]done[/cyan] continue   [cyan]q[/cyan] cancel"
         )
-        choice = Prompt.ask("Section", default="done").strip().lower()
+        choice = Prompt.ask("Item", default="done").strip().lower()
         if choice in ("", "done", "y", "yes"):
             picked = selected_sections(items)
             if not picked:
-                ux.print_warning("Select at least one section, or add a module/path.")
+                ux.print_warning("Select at least one item, or add a file path.")
                 continue
             return picked
         if choice in ("q", "quit", "cancel"):
@@ -219,7 +230,7 @@ def review_init_sections(
                 item.included = False
             continue
         if choice in ("a", "add"):
-            raw = Prompt.ask("Module name or path to add (blank to skip)", default="").strip()
+            raw = Prompt.ask("File path to add (blank to skip)", default="").strip()
             if not raw:
                 continue
             if add_extra:
@@ -228,17 +239,19 @@ def review_init_sections(
                 extra = SectionCandidate(
                     doc_type="features",
                     name=raw,
-                    description=f"Extra section '{raw}'",
+                    title=os.path.splitext(os.path.basename(raw.replace("\\", "/")))[0] or raw,
+                    kind="module",
+                    description=f"Extra unit '{raw}'",
                     included=True,
                     extra=True,
                 )
             items.append(extra)
-            ux.console.print(f"  Added [cyan]{extra.name}[/cyan] ({len(extra.file_paths)} file(s)).")
+            ux.console.print(f"  Added [cyan]{extra.display_name}[/cyan].")
             continue
         if choice.isdigit():
             index = int(choice) - 1
-            if 0 <= index < len(items):
-                items[index].included = not items[index].included
+            if 0 <= index < len(order):
+                items[order[index]].included = not items[order[index]].included
             continue
         ux.print_warning("Use a number, a, all, none, done, or q.")
 

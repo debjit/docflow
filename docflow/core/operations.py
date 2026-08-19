@@ -22,14 +22,21 @@ from docflow.core.projects import (
     last_project,
     register_project,
 )
-from docflow.core.git_analyzer import GitAnalyzer, feature_bucket_for_path
+from docflow.core.git_analyzer import GitAnalyzer, feature_bucket_for_path, posix_rel
 from docflow.core.frameworks import (
     architecture_seed_paths,
     effective_ignore,
+    load_stack_file,
     resolve_framework_name,
     skip_as_feature_dirs,
     stack_file_path,
     stack_guidance,
+)
+from docflow.core.inventory import (
+    APP_KIND_ORDER,
+    inventory_app_items,
+    is_tooling_item,
+    stack_items_from_payload,
 )
 from docflow.core.job_runner import Job, RunControl, default_concurrency, run_jobs
 from docflow.core.llms_txt_generator import LLMSTxtGenerator
@@ -136,6 +143,7 @@ def generate_section_names(
     changed_files: Sequence,
     feature: str = "",
     skip_as_feature: Optional[set] = None,
+    config: Optional[DocFlowConfig] = None,
 ) -> List[str]:
     """Unique feature/section buckets for a generate run, preserving first-seen order."""
     if feature:
@@ -145,12 +153,32 @@ def generate_section_names(
     skip = skip_as_feature or set()
     for item in changed_files:
         path = item.path if hasattr(item, "path") else str(item)
-        bucket = feature_bucket_for_path(path, skip_as_feature=skip)
+        bucket = documented_name_for_path(path, config, skip)
         if not bucket or bucket in seen:
             continue
         seen.add(bucket)
         names.append(bucket)
     return names or ["architecture"]
+
+
+def documented_name_for_path(
+    path: str,
+    config: Optional[DocFlowConfig] = None,
+    skip_as_feature: Optional[set] = None,
+) -> Optional[str]:
+    """Map a changed file to a selected documentation unit, else a folder bucket."""
+    posix = posix_rel(path)
+    extras = []
+    if config is not None:
+        extras = list(config.generation.extra_features or [])
+    for extra in extras:
+        for raw in extra.paths or []:
+            mapped = posix_rel(raw)
+            if not mapped:
+                continue
+            if posix == mapped or posix.startswith(mapped.rstrip("/") + "/") or mapped.startswith(posix.rstrip("/") + "/"):
+                return extra.name
+    return feature_bucket_for_path(posix, skip_as_feature=skip_as_feature)
 
 
 def allowed_feature_names(config: Optional[DocFlowConfig]) -> Optional[set]:
@@ -168,7 +196,7 @@ def allowed_feature_names(config: Optional[DocFlowConfig]) -> Optional[set]:
 
 @dataclass
 class SectionCandidate:
-    """One discovered doc type or feature module the user can include or skip."""
+    """One discovered application unit (class, page, resource) the user can include or skip."""
 
     doc_type: str
     name: str
@@ -177,6 +205,8 @@ class SectionCandidate:
     included: bool = True
     extra: bool = False
     sample_snippets: dict = field(default_factory=dict)
+    kind: str = ""
+    title: str = ""
 
     @property
     def key(self) -> str:
@@ -185,28 +215,76 @@ class SectionCandidate:
         return self.doc_type
 
     @property
+    def display_name(self) -> str:
+        return self.title or self.name
+
+    @property
     def label(self) -> str:
-        count = len(self.file_paths)
-        samples = ", ".join(self.file_paths[:3])
-        extra = " extra" if self.extra else ""
-        sample_bit = f"  {samples}" if samples else ""
-        return f"{self.name} [{self.doc_type}{extra}]  {count} file(s){sample_bit}"
+        kind = self.kind or self.doc_type
+        if self.doc_type != "features":
+            return f"{self.display_name}  ({kind})"
+        return f"{self.display_name}  ({kind})"
 
     def to_chunk(self) -> FeatureChunk:
+        desc = self.description or f"{self.kind or 'feature'}: {self.display_name}"
         return FeatureChunk(
             feature_name=self.name,
-            description=self.description,
+            description=desc,
             file_paths=self.file_paths,
             sample_snippets=self.sample_snippets,
         )
 
 
-def suggested_section_included(name: str, has_architecture: bool = False) -> bool:
+def suggested_section_included(name: str, has_architecture: bool = False, kind: str = "") -> bool:
+    if is_tooling_item(name, kind):
+        return False
     if name in NOISY_SECTION_NAMES:
         return False
     if has_architecture and name == "core":
         return False
     return True
+
+
+def _candidate_from_item(
+    item: dict,
+    analyzer: GitAnalyzer,
+    known_types: Optional[set] = None,
+    fallback_type: str = "features",
+) -> Optional[SectionCandidate]:
+    title = str(item.get("title") or item.get("id") or "").strip()
+    kind = str(item.get("kind") or "module").strip()
+    rel = str(item.get("path") or "").strip()
+    name = slug_type_name(str(item.get("id") or title))
+    if not name or is_tooling_item(title or name, kind, rel):
+        return None
+    paths = [rel.replace("\\", "/")] if rel else []
+    snippets = analyzer._snippets_for(paths[:1]) if paths else {}
+    included = bool(item.get("include", True))
+    if not suggested_section_included(name, kind=kind):
+        included = False
+    doc_type = _section_for_item(item, known_types or set(), fallback_type)
+    return SectionCandidate(
+        doc_type=doc_type,
+        name=name,
+        title=title or name,
+        kind=kind,
+        description=f"{kind}: {title or name}",
+        file_paths=paths,
+        included=included,
+        sample_snippets=snippets,
+    )
+
+
+def _section_for_item(item: dict, known_types: set, fallback_type: str) -> str:
+    kind = str(item.get("kind") or "").strip().lower()
+    section = slug_type_name(str(item.get("section") or ""))
+    if kind in ("architecture", "overview") and "architecture" in known_types:
+        return "architecture"
+    if section in known_types:
+        return section
+    if "features" in known_types:
+        return "features"
+    return fallback_type or "features"
 
 
 def discover_init_sections(
@@ -216,43 +294,47 @@ def discover_init_sections(
     skip_dirs: set,
     arch_seeds: Optional[List[str]] = None,
     on_progress: Optional[Callable[[str], None]] = None,
+    stack_payload: Optional[dict] = None,
 ) -> List[SectionCandidate]:
-    """Scan the app repo and return toggleable sections before any docs are written."""
-    has_architecture = any(t.name == "architecture" for t in types)
+    """Return individual application units (not folders) for the init picker."""
+    del skip_dirs
+    known = [t.name for t in types]
+    known_set = set(known)
+    fallback = known[0] if known else "features"
+    has_architecture = "architecture" in known_set
+    if on_progress:
+        on_progress("Finding application units to document…")
+    agent_items = stack_items_from_payload(stack_payload, analyzer.repo_path)
+    raw_items = agent_items or inventory_app_items(analyzer.repo_path, ignore_patterns)
     candidates: List[SectionCandidate] = []
+    seen = set()
+    covered: set = set()
+    for raw in raw_items:
+        candidate = _candidate_from_item(raw, analyzer, known_set, fallback)
+        if candidate is None or candidate.name in seen:
+            continue
+        if has_architecture and candidate.name == "core":
+            candidate.included = False
+        seen.add(candidate.name)
+        covered.add(candidate.doc_type)
+        candidates.append(candidate)
+    prefix: List[SectionCandidate] = []
     for doc_type in types:
-        if doc_type.name == "features":
-            if on_progress:
-                on_progress("Scanning the app repo for feature modules…")
-            chunks = analyzer.scan_features(
-                ignore_patterns=ignore_patterns,
-                include_architecture=False,
-                skip_as_feature=skip_dirs,
-                on_progress=on_progress,
-            )
-            for chunk in chunks:
-                candidates.append(
-                    SectionCandidate(
-                        doc_type="features",
-                        name=chunk.feature_name,
-                        description=chunk.description,
-                        file_paths=list(chunk.file_paths),
-                        included=suggested_section_included(chunk.feature_name, has_architecture),
-                        sample_snippets=dict(chunk.sample_snippets),
-                    )
-                )
+        if doc_type.name == "features" or doc_type.name in covered:
             continue
         seed_paths = list(arch_seeds or []) if doc_type.name == "architecture" else []
-        candidates.append(
+        prefix.append(
             SectionCandidate(
                 doc_type=doc_type.name,
                 name=doc_type.name,
+                title=doc_type.name,
+                kind="overview" if doc_type.name == "architecture" else doc_type.name,
                 description=doc_type.description,
                 file_paths=seed_paths,
                 included=True,
             )
         )
-    return candidates
+    return prefix + candidates
 
 
 def apply_section_filters(
@@ -285,6 +367,7 @@ def _candidate_matches(candidate: SectionCandidate, keys: set) -> bool:
         candidate.key.lower(),
         candidate.name.lower(),
         candidate.doc_type.lower(),
+        (candidate.title or "").lower(),
         f"features/{candidate.name}".lower(),
     }
     return bool(names & keys)
@@ -298,9 +381,24 @@ def extra_section_from_entry(
     doc_type: str = "features",
 ) -> SectionCandidate:
     chunk = analyzer.chunk_from_entry(raw, ignore_patterns, skip_dirs)
+    requested = posix_rel(raw)
+    requested_full = os.path.join(analyzer.repo_path, requested) if requested else ""
+    posix = posix_rel(chunk.file_paths[0] if chunk.file_paths else raw)
+    stem = Path(posix).stem if posix else chunk.feature_name
+    if requested_full and os.path.isdir(requested_full):
+        name = slug_type_name(Path(requested).name or chunk.feature_name)
+        title = Path(requested).name or chunk.feature_name
+    elif requested_full and os.path.isfile(requested_full):
+        name = slug_type_name(stem)
+        title = stem
+    else:
+        name = slug_type_name(chunk.feature_name)
+        title = chunk.feature_name
     return SectionCandidate(
         doc_type=doc_type if doc_type != "features" else "features",
-        name=chunk.feature_name,
+        name=name,
+        title=title,
+        kind="module",
         description=chunk.description,
         file_paths=list(chunk.file_paths),
         included=True,
@@ -311,6 +409,58 @@ def extra_section_from_entry(
 
 def selected_sections(candidates: Sequence[SectionCandidate]) -> List[SectionCandidate]:
     return [item for item in candidates if item.included]
+
+
+KIND_HEADINGS = {
+    "architecture": "Architecture",
+    "overview": "Architecture",
+    "features": "Features",
+    "other": "Also important",
+    "model": "Models",
+    "filament-resource": "Filament resources",
+    "filament-page": "Filament pages",
+    "controller": "Controllers",
+    "policy": "Policies",
+    "job": "Jobs",
+    "service": "Services",
+    "action": "Actions",
+    "page": "Pages",
+    "component": "Components",
+    "route": "Routes",
+    "module": "Modules",
+}
+
+
+def kind_heading(kind: str) -> str:
+    key = (kind or "").strip().lower()
+    if key in KIND_HEADINGS:
+        return KIND_HEADINGS[key]
+    return (kind or "other").replace("-", " ").title() or "Other"
+
+
+def picker_group(item: SectionCandidate) -> str:
+    if (item.kind or "").strip().lower() == "other":
+        return "other"
+    if item.doc_type and item.doc_type != "features":
+        return item.doc_type
+    return (item.kind or item.doc_type or "module").strip().lower() or "module"
+
+
+def group_candidates(candidates: Sequence[SectionCandidate]) -> List[Tuple[str, List[int]]]:
+    """Group picker rows; values are indexes into `candidates`."""
+    buckets: dict[str, List[int]] = {}
+    for index, item in enumerate(candidates):
+        buckets.setdefault(picker_group(item), []).append(index)
+    grouped: List[Tuple[str, List[int]]] = []
+    order = ["architecture", "overview", *APP_KIND_ORDER, "other", "features"]
+    seen_keys = set()
+    for kind in order:
+        if kind in buckets and kind not in seen_keys:
+            grouped.append((kind, buckets.pop(kind)))
+            seen_keys.add(kind)
+    for kind in sorted(buckets):
+        grouped.append((kind, buckets[kind]))
+    return grouped
 
 
 def _generation_context(app_repo_path: str, config: DocFlowConfig) -> Tuple[Optional[str], set, set]:
@@ -1474,6 +1624,54 @@ def init_docs(
     analyzer = GitAnalyzer(app_repo_path)
     framework_name, ignore_patterns, skip_dirs = _generation_context(app_repo_path, config)
     arch_seeds = architecture_seed_paths(app_repo_path, framework_name)
+    builder = PromptBuilder()
+    runner = AgentRunner(mode=agent.mode, command_template=agent.command)
+    features: List[FeatureRunResult] = []
+
+    created_docs = not os.path.isdir(docs_repo_path)
+    os.makedirs(docs_repo_path, exist_ok=True)
+    conventions_text = _conventions_text(docs_repo_path, copy_from_package=True)
+
+    stack_payload = load_stack_file(docs_repo_path)
+    if agent.mode == "shell" and not stack_payload:
+        progress("Asking the agent what to document from composer/packages…")
+        survey_prompt = os.path.join(docs_repo_path, "prompts", "pending", "init-stack-survey.md")
+        survey_context = PromptContext(
+            task_type="stack-survey",
+            project_name=config.project.name,
+            feature_name="stack-survey",
+            app_repo_path=app_repo_path,
+            docs_repo_path=docs_repo_path,
+            conventions_text=conventions_text,
+            doc_type="stack",
+            doc_type_description="Identify application units and sections to document vs skip.",
+            output_dir=".",
+            available_sections=[
+                {"name": t.name, "description": t.description} for t in config.docs.types
+            ],
+        )
+        builder.save_prompt(survey_context, survey_prompt)
+        survey_res = runner.run(
+            survey_prompt,
+            docs_repo_path,
+            capture=True if capture_output else None,
+            on_output=on_progress,
+        )
+        features.append(
+            FeatureRunResult(
+                feature_name="stack-survey",
+                prompt_file="prompts/pending/init-stack-survey.md",
+                success=survey_res.success,
+                error_message=survey_res.error_message,
+                output_log=survey_res.output_log,
+            )
+        )
+        if survey_res.success:
+            progress("Stack survey complete.")
+        else:
+            progress(f"Stack survey failed: {survey_res.error_message or 'unknown error'}")
+        stack_payload = load_stack_file(docs_repo_path)
+
     candidates = discover_init_sections(
         analyzer,
         config.docs.types,
@@ -1481,6 +1679,7 @@ def init_docs(
         skip_dirs,
         arch_seeds=arch_seeds,
         on_progress=on_progress,
+        stack_payload=stack_payload,
     )
     apply_section_filters(candidates, include_sections or (), exclude_sections or ())
     for raw in extra_sections or ():
@@ -1488,9 +1687,11 @@ def init_docs(
             candidates.append(extra_section_from_entry(analyzer, raw, ignore_patterns, skip_dirs))
 
     if on_review_sections:
-        progress("Waiting for section selection…")
+        progress("Waiting for you to confirm the agent's list…")
         reviewed = on_review_sections(candidates)
         if reviewed is None:
+            if created_docs:
+                shutil.rmtree(docs_repo_path, ignore_errors=True)
             raise InitCancelled("Init cancelled — no docs were written.")
         candidates = list(reviewed)
 
@@ -1506,7 +1707,9 @@ def init_docs(
 
     chosen = selected_sections(candidates)
     if not chosen:
-        raise ConfigError("No sections selected to document.")
+        if created_docs:
+            shutil.rmtree(docs_repo_path, ignore_errors=True)
+        raise ConfigError("No items selected to document.")
 
     type_by_name = {t.name: t for t in config.docs.types}
     kept_types: List[DocTypeSettings] = []
@@ -1524,17 +1727,15 @@ def init_docs(
     config.generation.extra_features = [
         ExtraFeatureSettings(name=item.name, paths=list(item.file_paths[:40]))
         for item in chosen
-        if item.extra
+        if item.file_paths
     ]
 
     progress("Creating blank docs skeleton…")
-    os.makedirs(docs_repo_path, exist_ok=True)
     for doc_type in config.docs.types:
         os.makedirs(os.path.join(docs_repo_path, doc_type.name), exist_ok=True)
     config_paths = save_project_config(config, app_repo_path, docs_repo_path)
     if framework_name:
         _persist_detected_framework(config, framework_name, app_repo_path, docs_repo_path)
-    conventions_text = _conventions_text(docs_repo_path, copy_from_package=True)
 
     imported = ImportResult(dest_type=slug_type_name(import_into or (config.docs.types[0].name)))
     if import_from:
@@ -1547,47 +1748,6 @@ def init_docs(
         imported = import_docs(import_from, docs_repo_path, into, on_progress=on_progress)
     elif import_existing:
         progress("No --import-from path given; skipping copy. Use a path/folder to import files.")
-
-    builder = PromptBuilder()
-    runner = AgentRunner(mode=agent.mode, command_template=agent.command)
-
-    features: List[FeatureRunResult] = []
-    if framework_name and not os.path.isfile(stack_file_path(docs_repo_path)):
-        progress("Writing stack survey prompt…")
-        survey_prompt = os.path.join(docs_repo_path, "prompts", "pending", "init-stack-survey.md")
-        survey_context = PromptContext(
-            task_type="stack-survey",
-            project_name=config.project.name,
-            feature_name="stack-survey",
-            app_repo_path=app_repo_path,
-            docs_repo_path=docs_repo_path,
-            conventions_text=conventions_text,
-            doc_type="stack",
-            doc_type_description="Identify application stack and paths to document vs skip.",
-            output_dir=".",
-        )
-        builder.save_prompt(survey_context, survey_prompt)
-        if agent.mode == "shell":
-            progress("Running stack survey agent job…")
-            survey_res = runner.run(
-                survey_prompt,
-                docs_repo_path,
-                capture=True if capture_output else None,
-                on_output=on_progress,
-            )
-            features.append(
-                FeatureRunResult(
-                    feature_name="stack-survey",
-                    prompt_file="prompts/pending/init-stack-survey.md",
-                    success=survey_res.success,
-                    error_message=survey_res.error_message,
-                    output_log=survey_res.output_log,
-                )
-            )
-            if survey_res.success:
-                progress("Stack survey complete.")
-            else:
-                progress(f"Stack survey failed: {survey_res.error_message or 'unknown error'}")
 
     doc_guidance = _documentation_guidance(docs_repo_path, framework_name)
 
@@ -1657,7 +1817,7 @@ def init_docs(
 
     if agent.mode == "shell" and prepared:
         workers = _job_concurrency(config, concurrency)
-        features = _run_shell_jobs(
+        features = features + _run_shell_jobs(
             runner,
             prepared,
             docs_repo_path,
@@ -1834,7 +1994,9 @@ def generate_docs(
             synced_remote=synced_remote,
         )
 
-    section_names = generate_section_names(manifest.changed_files, feature, skip_as_feature=skip_dirs)
+    section_names = generate_section_names(
+        manifest.changed_files, feature, skip_as_feature=skip_dirs, config=config
+    )
     allowed = allowed_feature_names(config)
     if allowed and not feature:
         filtered = [name for name in section_names if name in allowed]
@@ -1880,7 +2042,7 @@ def generate_docs(
             if feature
             else [
                 f for f in manifest.changed_files
-                if feature_bucket_for_path(f.path, skip_as_feature=skip_dirs) == target_feature
+                if documented_name_for_path(f.path, config, skip_dirs) == target_feature
             ]
         )
         section_manifest = manifest.model_copy(update={"changed_files": section_files or list(manifest.changed_files)})
