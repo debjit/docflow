@@ -21,13 +21,32 @@ def test_prompt_builder_init_render():
         project_name="TestProject",
         feature_name="authentication",
         feature_chunk=chunk,
-        conventions_text="Follow CONVENTIONS.md"
+        conventions_text="Follow CONVENTIONS.md",
+        extra_instructions="Document application code only; skip Laravel internals.",
     )
 
     rendered = builder.render(context)
     assert '# Documentation Task: Initialize "authentication" (features)' in rendered
     assert "src/auth/login.py" in rendered
     assert "Follow CONVENTIONS.md" in rendered
+    assert "Application Documentation Scope" in rendered
+    assert "skip Laravel internals" in rendered
+
+
+def test_prompt_builder_stack_survey():
+    builder = PromptBuilder()
+    context = PromptContext(
+        task_type="stack-survey",
+        project_name="TestProject",
+        feature_name="stack-survey",
+        app_repo_path="/tmp/app",
+        docs_repo_path="/tmp/docs",
+        conventions_text="",
+    )
+    rendered = builder.render(context)
+    assert "Application Stack Survey" in rendered
+    assert ".docflow-stack.json" in rendered
+    assert "/tmp/app" in rendered
 
 
 def test_prompt_builder_save():

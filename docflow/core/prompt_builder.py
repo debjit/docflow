@@ -32,6 +32,8 @@ class PromptBuilder:
             template = self.env.get_template("prompt_update.md.j2")
         elif context.task_type == "full-regen":
             template = self.env.get_template("prompt_full_regen.md.j2")
+        elif context.task_type == "stack-survey":
+            template = self.env.get_template("prompt_stack_survey.md.j2")
         else:
             raise ValueError(f"Unknown task type: {context.task_type}")
 

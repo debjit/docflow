@@ -58,9 +58,10 @@ class FeatureChunk(BaseModel):
 
 class PromptContext(BaseModel):
     """Data payload passed into prompt templates."""
-    task_type: Literal["init", "update", "full-regen"]
+    task_type: Literal["init", "update", "full-regen", "stack-survey"]
     project_name: str
     feature_name: str
+    app_repo_path: Optional[str] = None
     docs_repo_path: Optional[str] = None
     change_manifest: Optional[ChangeManifest] = None
     feature_chunk: Optional[FeatureChunk] = None

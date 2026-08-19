@@ -288,6 +288,12 @@ def test_generate_section_names_groups_wrappers_and_features():
     ]
     assert generate_section_names(files) == ["auth", "billing", "ui"]
     assert generate_section_names(files, feature="billing") == ["billing"]
+    scaffold = files + [
+        FileChange(path="bootstrap/app.php", change_type="modified"),
+        FileChange(path="vendor/laravel/framework/src/Application.php", change_type="modified"),
+    ]
+    skip = {"bootstrap", "vendor", "public"}
+    assert generate_section_names(scaffold, skip_as_feature=skip) == ["auth", "billing", "ui"]
 
 
 def test_generate_docs_writes_prompts_for_each_feature(tmp_path):

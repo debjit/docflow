@@ -108,12 +108,17 @@ platform:
 
 generation:
   full_diff_threshold: 200
+  framework: auto   # auto | none | laravel
   ignore:
     - "*.lock"
     - "node_modules/"
     - "dist/"
     - "__pycache__/"
 ```
+
+- **`generation.framework`**: `auto` detects Laravel and applies framework-aware ignore rules; `laravel` forces the Laravel profile; `none` skips detection (still ignores `vendor/`).
+- **`generation.ignore`**: merged with DocFlow defaults and framework profiles during scan and diff.
+- **`.docflow-stack.json`**: written during init (Laravel apps) by a stack survey agent job; later prompts use its `guidance` to focus on application code, not framework internals.
 
 - **shell**: DocFlow runs your CLI agent; prompts move from `prompts/pending/` to `prompts/completed/`.
 - **manual**: Prompts stay in `prompts/pending/` with exact output paths.

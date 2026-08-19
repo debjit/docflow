@@ -43,6 +43,14 @@ Output directory: `{{ output_dir }}/`
 ```
 {% endif %}
 
+{% if extra_instructions %}
+## Application Documentation Scope
+
+{{ extra_instructions }}
+
+If `.docflow-stack.json` exists in the docs repository, follow its `guidance`, `skip_paths`, and `document` fields.
+{% endif %}
+
 ## Task Instructions
 
 Update the **{{ doc_type }}** documentation for `{{ feature_name }}` under `{{ output_dir }}/` based on the code changes. Stay within this type's purpose.

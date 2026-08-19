@@ -123,3 +123,15 @@ tags: ["tag1", "tag2"]
 DocFlow records the last documented application commit in `.docflow-state.json` in the docs repo. That file is machine state, not human documentation. Agents must not treat it as a content target. Subsequent updates cover only commits after that SHA unless the user requests last-N or a full regeneration.
 
 Imported files must not be overwritten on import. Updates to existing `index.md` / `context.json` happen through generate, which receives the current files and applies the new git range.
+
+---
+
+## 5. Framework-aware documentation
+
+When DocFlow detects a framework (Laravel first), it skips dependency and generated directories (`vendor/`, `storage/`, framework caches) and avoids creating feature modules for framework scaffolding (`bootstrap/`, `public/`).
+
+Agents must **document the application layered on the framework**, not the framework itself:
+- Do not write Laravel/Filament/Inertia/Vue/React tutorials or explain bootstrap, the container, or vendor packages.
+- Do document this project's models, controllers, policies, jobs, routes, migrations, Filament resources, Inertia pages, and Vue/React components.
+
+During init, DocFlow may write `.docflow-stack.json` in the docs repo. When present, all documentation agents must follow its `guidance`, `skip_paths`, and `document` fields.

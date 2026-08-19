@@ -34,6 +34,8 @@ LANGUAGE_MAP = {
     ".sql": "sql",
     ".html": "html",
     ".css": "css",
+    ".php": "php",
+    ".vue": "vue",
 }
 
 DEFAULT_IGNORE = {
@@ -57,6 +59,9 @@ def path_is_ignored(rel_path: str, ignore_patterns: Set[str]) -> bool:
         if not pattern:
             continue
         dir_pat = pattern.rstrip("/")
+        if "/" in dir_pat:
+            if posix == dir_pat or posix.startswith(f"{dir_pat}/"):
+                return True
         if any(fnmatch.fnmatch(part, dir_pat) for part in parts):
             return True
         if fnmatch.fnmatch(posix, pattern) or fnmatch.fnmatch(posix, dir_pat):
@@ -66,7 +71,7 @@ def path_is_ignored(rel_path: str, ignore_patterns: Set[str]) -> bool:
     return False
 
 
-def feature_bucket_for_path(path: str) -> str:
+def feature_bucket_for_path(path: str, skip_as_feature: Optional[Set[str]] = None) -> Optional[str]:
     """Map a source path to a feature/section name (same rules as scan_features)."""
     posix = Path(str(path).replace("\\", "/")).as_posix().lstrip("./")
     parts = Path(posix).parts
@@ -82,6 +87,9 @@ def feature_bucket_for_path(path: str) -> str:
         name = first
     if name.startswith("."):
         return "config"
+    skip = skip_as_feature or set()
+    if name in skip or first in skip:
+        return None
     return name
 
 
@@ -254,6 +262,8 @@ class GitAnalyzer:
         self,
         ignore_patterns: Optional[Set[str]] = None,
         include_architecture: bool = True,
+        skip_as_feature: Optional[Set[str]] = None,
+        architecture_seed_paths: Optional[List[str]] = None,
         on_progress: Optional[Callable[[str], None]] = None,
         progress_every: int = 50,
     ) -> List[FeatureChunk]:
@@ -261,6 +271,7 @@ class GitAnalyzer:
         Scans the repository structure and groups source files into logical feature chunks for init.
         """
         ignore = ignore_patterns or DEFAULT_IGNORE
+        skip = skip_as_feature or set()
         feature_map: Dict[str, List[str]] = {}
         scanned = 0
         every = max(1, int(progress_every) if progress_every else 50)
@@ -281,7 +292,9 @@ class GitAnalyzer:
                 if on_progress and scanned % every == 0:
                     on_progress(f"Scanning app repo… {scanned} files")
 
-                feature_name = feature_bucket_for_path(rel_file_path)
+                feature_name = feature_bucket_for_path(rel_file_path, skip_as_feature=skip)
+                if not feature_name:
+                    continue
                 feature_map.setdefault(feature_name, []).append(rel_file_path)
 
         if on_progress and scanned and scanned % every != 0:
@@ -296,11 +309,14 @@ class GitAnalyzer:
             infra_files = feature_map.get("core", [])[:5]
 
         if include_architecture:
+            seed_paths = list(architecture_seed_paths or [])
+            if not seed_paths:
+                seed_paths = infra_files or ["pyproject.toml", "Dockerfile", "docker-compose.yml"]
             chunks.append(
                 FeatureChunk(
                     feature_name="architecture",
                     description="System architecture, hosting environment (Dev/Staging/Prod), frameworks, and core dependencies.",
-                    file_paths=infra_files or ["pyproject.toml", "Dockerfile", "docker-compose.yml"],
+                    file_paths=seed_paths,
                     sample_snippets={}
                 )
             )

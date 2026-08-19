@@ -1,0 +1,42 @@
+# Documentation Task: Application Stack Survey
+
+## Context
+Project: **{{ project_name }}**
+Application repository: `{{ app_repo_path }}`
+Documentation repository: `{{ docs_repo_path }}`
+
+## Task
+
+Inspect the application repository and identify the technology stack. Focus on **this application's** stack, not generic framework tutorials.
+
+1. Read `composer.json`, `composer.lock` (package names only), `package.json`, and obvious entry files (`artisan`, `bootstrap/app.php`, `routes/web.php`, etc.).
+2. Detect the platform (expect Laravel for PHP apps) and libraries in this ecosystem: Filament, Inertia, Vue, React, Livewire, etc.
+3. List paths that should **never** be documented (vendor, generated caches, framework scaffolding).
+4. List paths that **should** be documented (application code layered on the framework).
+
+## Output
+
+Write exactly one JSON file to:
+
+`{{ docs_repo_path }}/.docflow-stack.json`
+
+Use this schema:
+
+```json
+{
+  "platform": "laravel",
+  "libraries": ["filament", "inertia", "vue"],
+  "skip_paths": ["vendor/", "storage/", "bootstrap/cache/"],
+  "document": ["app/", "routes/", "database/", "resources/js/", "resources/views/", "config/"],
+  "guidance": "Do not document Laravel/Filament/Inertia/Vue internals. Document this app's models, Filament resources, Inertia pages, and Vue components."
+}
+```
+
+Rules:
+- `platform`: primary framework (e.g. `laravel`).
+- `libraries`: npm/composer libraries detected in **this** project (lowercase names).
+- `skip_paths`: directories or globs to exclude from documentation (always include `vendor/`).
+- `document`: application directories/files worth documenting.
+- `guidance`: one paragraph telling future doc agents what to skip vs what to cover.
+
+Do **not** create any other files. Do **not** write human documentation yet — only `.docflow-stack.json`.

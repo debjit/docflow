@@ -23,6 +23,14 @@ from docflow.core.projects import (
     register_project,
 )
 from docflow.core.git_analyzer import GitAnalyzer, feature_bucket_for_path
+from docflow.core.frameworks import (
+    architecture_seed_paths,
+    effective_ignore,
+    resolve_framework_name,
+    skip_as_feature_dirs,
+    stack_file_path,
+    stack_guidance,
+)
 from docflow.core.job_runner import Job, default_concurrency, run_jobs
 from docflow.core.llms_txt_generator import LLMSTxtGenerator
 from docflow.core.models import AgentRunResult, FeatureChunk, PromptContext
@@ -114,19 +122,51 @@ def resolve_doc_section(config: Optional[DocFlowConfig], feature: str) -> Tuple[
     return "features", "", type_output_dir("features", wanted or "core")
 
 
-def generate_section_names(changed_files: Sequence, feature: str = "") -> List[str]:
+def generate_section_names(
+    changed_files: Sequence,
+    feature: str = "",
+    skip_as_feature: Optional[set] = None,
+) -> List[str]:
     """Unique feature/section buckets for a generate run, preserving first-seen order."""
     if feature:
         return [feature]
     names: List[str] = []
     seen = set()
+    skip = skip_as_feature or set()
     for item in changed_files:
         path = item.path if hasattr(item, "path") else str(item)
-        bucket = feature_bucket_for_path(path)
-        if bucket not in seen:
-            seen.add(bucket)
-            names.append(bucket)
+        bucket = feature_bucket_for_path(path, skip_as_feature=skip)
+        if not bucket or bucket in seen:
+            continue
+        seen.add(bucket)
+        names.append(bucket)
     return names or ["architecture"]
+
+
+def _generation_context(app_repo_path: str, config: DocFlowConfig) -> Tuple[Optional[str], set, set]:
+    """Resolve framework profile, merged ignore patterns, and skip-as-feature dirs."""
+    framework_name = resolve_framework_name(app_repo_path, config.generation.framework)
+    ignore = effective_ignore(app_repo_path, config.generation.ignore, framework_name)
+    skip = skip_as_feature_dirs(framework_name)
+    return framework_name, ignore, skip
+
+
+def _documentation_guidance(
+    docs_repo_path: str,
+    framework_name: Optional[str],
+) -> Optional[str]:
+    return stack_guidance(docs_repo_path, framework_name)
+
+
+def _persist_detected_framework(
+    config: DocFlowConfig,
+    framework_name: Optional[str],
+    app_repo_path: str,
+    docs_repo_path: str,
+) -> None:
+    if config.generation.framework == "auto" and framework_name:
+        config.generation.framework = framework_name
+        save_project_config(config, app_repo_path, docs_repo_path)
 
 
 def is_initialized(docs_repo_path: str) -> bool:
@@ -1277,25 +1317,74 @@ def init_docs(
     analyzer = GitAnalyzer(app_repo_path)
     builder = PromptBuilder()
     runner = AgentRunner(mode=agent.mode, command_template=agent.command)
+    framework_name, ignore_patterns, skip_dirs = _generation_context(app_repo_path, config)
+    _persist_detected_framework(config, framework_name, app_repo_path, docs_repo_path)
+    arch_seeds = architecture_seed_paths(app_repo_path, framework_name)
+
+    features: List[FeatureRunResult] = []
+    if framework_name and not os.path.isfile(stack_file_path(docs_repo_path)):
+        progress("Writing stack survey prompt…")
+        survey_prompt = os.path.join(docs_repo_path, "prompts", "pending", "init-stack-survey.md")
+        survey_context = PromptContext(
+            task_type="stack-survey",
+            project_name=config.project.name,
+            feature_name="stack-survey",
+            app_repo_path=app_repo_path,
+            docs_repo_path=docs_repo_path,
+            conventions_text=conventions_text,
+            doc_type="stack",
+            doc_type_description="Identify application stack and paths to document vs skip.",
+            output_dir=".",
+        )
+        builder.save_prompt(survey_context, survey_prompt)
+        if agent.mode == "shell":
+            progress("Running stack survey agent job…")
+            survey_res = runner.run(
+                survey_prompt,
+                docs_repo_path,
+                capture=True if capture_output else None,
+                on_output=on_progress,
+            )
+            features.append(
+                FeatureRunResult(
+                    feature_name="stack-survey",
+                    prompt_file="prompts/pending/init-stack-survey.md",
+                    success=survey_res.success,
+                    error_message=survey_res.error_message,
+                    output_log=survey_res.output_log,
+                )
+            )
+            if survey_res.success:
+                progress("Stack survey complete.")
+            else:
+                progress(f"Stack survey failed: {survey_res.error_message or 'unknown error'}")
+
+    doc_guidance = _documentation_guidance(docs_repo_path, framework_name)
+
     jobs: List[Tuple[str, str, str, FeatureChunk]] = []
     for doc_type in config.docs.types:
         if doc_type.name == "features":
             progress("Scanning the app repo for feature modules…")
-            chunks = analyzer.scan_features(include_architecture=False, on_progress=on_progress)
+            chunks = analyzer.scan_features(
+                ignore_patterns=ignore_patterns,
+                include_architecture=False,
+                skip_as_feature=skip_dirs,
+                on_progress=on_progress,
+            )
             for chunk in chunks:
                 jobs.append((doc_type.name, doc_type.description, type_output_dir("features", chunk.feature_name), chunk))
         else:
+            seed_paths = arch_seeds if doc_type.name == "architecture" else []
             chunk = FeatureChunk(
                 feature_name=doc_type.name,
                 description=doc_type.description,
-                file_paths=[],
+                file_paths=seed_paths,
                 sample_snippets={},
             )
             jobs.append((doc_type.name, doc_type.description, type_output_dir(doc_type.name, doc_type.name), chunk))
 
     total = len(jobs)
     progress(f"Writing init prompts for {total} section(s).")
-    features: List[FeatureRunResult] = []
     imported_note = None
     if imported.copied:
         imported_note = "Imported files (do not overwrite):\n" + "\n".join(f"- {p}" for p in imported.copied[:40])
@@ -1309,6 +1398,7 @@ def init_docs(
             task_type="init",
             project_name=config.project.name,
             feature_name=feature_name,
+            app_repo_path=app_repo_path,
             docs_repo_path=docs_repo_path,
             feature_chunk=chunk,
             existing_index_md=imported_note if doc_type == imported.dest_type else None,
@@ -1316,6 +1406,7 @@ def init_docs(
             doc_type=doc_type,
             doc_type_description=type_desc,
             output_dir=output_dir,
+            extra_instructions=doc_guidance,
         )
         progress(f"[{index}/{total}] Writing prompt for {doc_type}/{feature_name}…")
         builder.save_prompt(context, prompt_file)
@@ -1413,6 +1504,7 @@ def generate_docs(
             on_progress(f"Could not update from remote: {sync.output or 'unknown error'}. Using local commits.")
 
     analyzer = GitAnalyzer(app_repo_path)
+    framework_name, ignore_patterns, skip_dirs = _generation_context(app_repo_path, config)
     used_cursor = False
     watermark_stale = False
     explicit_range = bool(from_ref or to_ref or is_full or commit_count is not None or branch)
@@ -1475,7 +1567,12 @@ def generate_docs(
     head_ref = to_ref or branch or "HEAD"
     conventions_text = _conventions_text(docs_repo_path)
 
-    manifest = analyzer.extract_diff(base_ref=base_ref, head_ref=head_ref)
+    manifest = analyzer.extract_diff(
+        base_ref=base_ref,
+        head_ref=head_ref,
+        full_diff_threshold=config.generation.full_diff_threshold,
+        ignore_patterns=ignore_patterns,
+    )
     included_commits: List[CommitInfo] = []
     if not is_full:
         try:
@@ -1514,10 +1611,11 @@ def generate_docs(
             synced_remote=synced_remote,
         )
 
-    section_names = generate_section_names(manifest.changed_files, feature)
+    section_names = generate_section_names(manifest.changed_files, feature, skip_as_feature=skip_dirs)
     task_type = "full-regen" if is_full else "update"
     builder = PromptBuilder()
     runner = AgentRunner(mode=agent.mode, command_template=agent.command)
+    doc_guidance = _documentation_guidance(docs_repo_path, framework_name)
     feature_runs: List[FeatureRunResult] = []
     last_res: Optional[AgentRunResult] = None
     last_prompt = ""
@@ -1528,7 +1626,10 @@ def generate_docs(
         section_files = (
             list(manifest.changed_files)
             if feature
-            else [f for f in manifest.changed_files if feature_bucket_for_path(f.path) == target_feature]
+            else [
+                f for f in manifest.changed_files
+                if feature_bucket_for_path(f.path, skip_as_feature=skip_dirs) == target_feature
+            ]
         )
         section_manifest = manifest.model_copy(update={"changed_files": section_files or list(manifest.changed_files)})
         doc_type, type_desc, output_dir = resolve_doc_section(config, target_feature)
@@ -1548,6 +1649,7 @@ def generate_docs(
             task_type=task_type,
             project_name=config.project.name,
             feature_name=target_feature,
+            app_repo_path=app_repo_path,
             docs_repo_path=docs_repo_path,
             change_manifest=section_manifest,
             existing_index_md=existing_index,
@@ -1556,6 +1658,7 @@ def generate_docs(
             doc_type=doc_type,
             doc_type_description=type_desc,
             output_dir=output_dir,
+            extra_instructions=doc_guidance,
         )
         prompt_file = os.path.join(docs_repo_path, "prompts", "pending", f"{task_type}-{target_feature}.md")
         prefix = f"[{index}/{total}] " if total > 1 else ""

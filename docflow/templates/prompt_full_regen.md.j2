@@ -25,6 +25,14 @@ Full regeneration requested.
 ```
 {% endif %}
 
+{% if extra_instructions %}
+## Application Documentation Scope
+
+{{ extra_instructions }}
+
+If `.docflow-stack.json` exists in the docs repository, follow its `guidance`, `skip_paths`, and `document` fields.
+{% endif %}
+
 ## Task Instructions
 
 Completely regenerate **{{ doc_type }}** documentation for `{{ feature_name }}` under `{{ output_dir }}/`.

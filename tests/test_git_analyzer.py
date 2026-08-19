@@ -81,6 +81,10 @@ def test_feature_bucket_and_ignore_globs():
     assert feature_bucket_for_path("src/auth/login.py") == "auth"
     assert feature_bucket_for_path("auth/login.py") == "auth"
     assert feature_bucket_for_path("README.md") == "core"
+    skip = {"bootstrap", "public", "vendor"}
+    assert feature_bucket_for_path("bootstrap/app.php", skip_as_feature=skip) is None
+    assert feature_bucket_for_path("public/index.php", skip_as_feature=skip) is None
+    assert feature_bucket_for_path("app/Models/User.php", skip_as_feature=skip) == "Models"
     ignore = {"node_modules/", "*.lock", "dist"}
     assert path_is_ignored("node_modules/pkg/index.js", ignore)
     assert path_is_ignored("app/package.lock", ignore)
