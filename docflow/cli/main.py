@@ -34,7 +34,7 @@ def cli(ctx: click.Context, repo: str, docs: str):
     """DocFlow — generate and serve dual-audience docs from git activity.
 
     Run with no command for an interactive menu. After `docflow init`, everyday
-    commands read paths and the agent from the docs repo `.docflow.yml`.
+    commands read paths and the agent from the docs repo `.docflow/config.yml`.
     """
     ctx.ensure_object(dict)
     ctx.obj["repo"] = repo

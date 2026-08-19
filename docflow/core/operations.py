@@ -34,9 +34,25 @@ from docflow.core.frameworks import (
 )
 from docflow.core.inventory import (
     APP_KIND_ORDER,
+    KIND_TO_SECTION,
     inventory_app_items,
+    is_bootstrap_item,
     is_tooling_item,
     stack_items_from_payload,
+)
+from docflow.core.workspace import (
+    SPLIT_DOC_TYPES,
+    completed_prompts_dir,
+    docs_root_from_config_path,
+    find_conventions_path,
+    is_docs_project,
+    pending_prompt_path,
+    pending_prompts_dir,
+    prompt_search_dirs,
+    rel_pending_prompt,
+    write_conventions_path,
+    write_state_path,
+    find_state_path,
 )
 from docflow.core.job_runner import Job, RunControl, default_concurrency, run_jobs
 from docflow.core.llms_txt_generator import LLMSTxtGenerator
@@ -68,11 +84,27 @@ NOISY_SECTION_NAMES = {
 DEFAULT_DOC_TYPES: List[DocTypeSettings] = [
     DocTypeSettings(
         name="architecture",
-        description="System layout, hosting, and shared packages",
+        description="System layout, hosting, and packages this app uses",
     ),
     DocTypeSettings(
-        name="features",
-        description="Feature and module documentation scanned from the codebase",
+        name="database",
+        description="Schema and migrations",
+    ),
+    DocTypeSettings(
+        name="models",
+        description="Domain models",
+    ),
+    DocTypeSettings(
+        name="functions",
+        description="Application services, jobs, actions, and controllers",
+    ),
+    DocTypeSettings(
+        name="routes",
+        description="HTTP routes",
+    ),
+    DocTypeSettings(
+        name="pages",
+        description="UI pages and indexes (Inertia, Filament, views)",
     ),
 ]
 
@@ -115,8 +147,8 @@ def configured_types(config: Optional[DocFlowConfig]) -> List[DocTypeSettings]:
 def type_output_dir(doc_type: str, section: str) -> str:
     kind = slug_type_name(doc_type)
     section_slug = slug_type_name(section) if section else kind
-    if kind == "features" and section_slug not in ("", "features"):
-        return f"features/{section_slug}"
+    if kind in SPLIT_DOC_TYPES and section_slug not in ("", kind):
+        return f"{kind}/{section_slug}"
     return kind
 
 
@@ -124,6 +156,17 @@ def resolve_doc_section(config: Optional[DocFlowConfig], feature: str) -> Tuple[
     types = configured_types(config)
     wanted = slug_type_name(feature) if feature else ""
     by_name = {t.name: t for t in types}
+    extras = list(config.generation.extra_features or []) if config else []
+    for extra in extras:
+        if extra.name == wanted:
+            dtype = slug_type_name(extra.doc_type) if extra.doc_type else ""
+            if dtype in by_name:
+                t = by_name[dtype]
+                return t.name, t.description, type_output_dir(t.name, wanted)
+            mapped = KIND_TO_SECTION.get(dtype)
+            if mapped and mapped in by_name:
+                t = by_name[mapped]
+                return t.name, t.description, type_output_dir(t.name, wanted)
     if wanted and wanted in by_name:
         t = by_name[wanted]
         return t.name, t.description, type_output_dir(t.name, t.name)
@@ -132,11 +175,11 @@ def resolve_doc_section(config: Optional[DocFlowConfig], feature: str) -> Tuple[
         return features.name, features.description, type_output_dir("features", wanted)
     if wanted and by_name:
         t = next(iter(types))
-        return t.name, t.description, type_output_dir(t.name, t.name)
+        return t.name, t.description, type_output_dir(t.name, wanted)
     if types:
         t = types[0]
         return t.name, t.description, type_output_dir(t.name, t.name)
-    return "features", "", type_output_dir("features", wanted or "core")
+    return "architecture", "", type_output_dir("architecture", wanted or "architecture")
 
 
 def generate_section_names(
@@ -236,7 +279,7 @@ class SectionCandidate:
 
 
 def suggested_section_included(name: str, has_architecture: bool = False, kind: str = "") -> bool:
-    if is_tooling_item(name, kind):
+    if is_tooling_item(name, kind) or is_bootstrap_item(name, kind):
         return False
     if name in NOISY_SECTION_NAMES:
         return False
@@ -255,7 +298,7 @@ def _candidate_from_item(
     kind = str(item.get("kind") or "module").strip()
     rel = str(item.get("path") or "").strip()
     name = slug_type_name(str(item.get("id") or title))
-    if not name or is_tooling_item(title or name, kind, rel):
+    if not name or is_tooling_item(title or name, kind, rel) or is_bootstrap_item(title or name, kind, rel):
         return None
     paths = [rel.replace("\\", "/")] if rel else []
     snippets = analyzer._snippets_for(paths[:1]) if paths else {}
@@ -282,9 +325,12 @@ def _section_for_item(item: dict, known_types: set, fallback_type: str) -> str:
         return "architecture"
     if section in known_types:
         return section
+    mapped = KIND_TO_SECTION.get(kind)
+    if mapped and mapped in known_types:
+        return mapped
     if "features" in known_types:
         return "features"
-    return fallback_type or "features"
+    return fallback_type or "architecture"
 
 
 def discover_init_sections(
@@ -320,15 +366,15 @@ def discover_init_sections(
         candidates.append(candidate)
     prefix: List[SectionCandidate] = []
     for doc_type in types:
-        if doc_type.name == "features" or doc_type.name in covered:
+        if doc_type.name in covered or doc_type.name in SPLIT_DOC_TYPES:
             continue
         seed_paths = list(arch_seeds or []) if doc_type.name == "architecture" else []
         prefix.append(
             SectionCandidate(
                 doc_type=doc_type.name,
                 name=doc_type.name,
-                title=doc_type.name,
-                kind="overview" if doc_type.name == "architecture" else doc_type.name,
+                title=doc_type.name.replace("-", " ").title(),
+                kind="overview",
                 description=doc_type.description,
                 file_paths=seed_paths,
                 included=True,
@@ -378,7 +424,7 @@ def extra_section_from_entry(
     raw: str,
     ignore_patterns: set,
     skip_dirs: set,
-    doc_type: str = "features",
+    doc_type: str = "functions",
 ) -> SectionCandidate:
     chunk = analyzer.chunk_from_entry(raw, ignore_patterns, skip_dirs)
     requested = posix_rel(raw)
@@ -394,11 +440,13 @@ def extra_section_from_entry(
     else:
         name = slug_type_name(chunk.feature_name)
         title = chunk.feature_name
+    mapped = KIND_TO_SECTION.get("function", "functions")
+    chosen_type = doc_type if doc_type != "features" else mapped
     return SectionCandidate(
-        doc_type=doc_type if doc_type != "features" else "features",
+        doc_type=chosen_type,
         name=name,
         title=title,
-        kind="module",
+        kind="function",
         description=chunk.description,
         file_paths=list(chunk.file_paths),
         included=True,
@@ -414,20 +462,27 @@ def selected_sections(candidates: Sequence[SectionCandidate]) -> List[SectionCan
 KIND_HEADINGS = {
     "architecture": "Architecture",
     "overview": "Architecture",
+    "database": "Database",
+    "models": "Models",
+    "functions": "Functions",
+    "routes": "Routes",
+    "pages": "Pages",
     "features": "Features",
     "other": "Also important",
     "model": "Models",
-    "filament-resource": "Filament resources",
-    "filament-page": "Filament pages",
-    "controller": "Controllers",
+    "migration": "Database",
+    "filament-resource": "Pages",
+    "filament-page": "Pages",
+    "controller": "Functions",
     "policy": "Policies",
     "job": "Jobs",
     "service": "Services",
     "action": "Actions",
+    "function": "Functions",
     "page": "Pages",
     "component": "Components",
     "route": "Routes",
-    "module": "Modules",
+    "module": "Functions",
 }
 
 
@@ -452,7 +507,11 @@ def group_candidates(candidates: Sequence[SectionCandidate]) -> List[Tuple[str, 
     for index, item in enumerate(candidates):
         buckets.setdefault(picker_group(item), []).append(index)
     grouped: List[Tuple[str, List[int]]] = []
-    order = ["architecture", "overview", *APP_KIND_ORDER, "other", "features"]
+    order = [
+        "architecture", "overview",
+        "models", "database", "functions", "routes", "pages", "features",
+        *APP_KIND_ORDER, "other",
+    ]
     seen_keys = set()
     for kind in order:
         if kind in buckets and kind not in seen_keys:
@@ -492,7 +551,7 @@ def _persist_detected_framework(
 def is_initialized(docs_repo_path: str) -> bool:
     if not docs_repo_path:
         return False
-    return os.path.isfile(os.path.join(os.path.abspath(docs_repo_path), ".docflow.yml"))
+    return is_docs_project(docs_repo_path)
 
 
 def assert_can_init(docs_repo_path: str) -> None:
@@ -700,7 +759,7 @@ def is_configured(config: Optional[DocFlowConfig] = None) -> bool:
     cfg = config or DocFlowConfig.load()
     docs_dir = ""
     if cfg.source_path:
-        docs_dir = os.path.dirname(os.path.abspath(cfg.source_path))
+        docs_dir = docs_root_from_config_path(cfg.source_path)
     elif cfg.docs.repo_path:
         docs_dir = os.path.abspath(cfg.docs.repo_path)
     return bool(docs_dir and is_initialized(docs_dir) and cfg.app.repo_path)
@@ -996,7 +1055,7 @@ def resolve_paths(
 
     if require and not app_repo_path:
         raise ConfigError(
-            "Application repo is not set in the docs `.docflow.yml`. "
+            "Application repo is not set in the docs `.docflow/config.yml`. "
             "Run `docflow init` or pass --repo."
         )
     if require and not is_initialized(docs_repo_path):
@@ -1019,15 +1078,16 @@ def save_project_config(config: DocFlowConfig, app_repo_path: str, docs_repo_pat
 
 
 def _conventions_text(docs_repo_path: str, copy_from_package: bool = False) -> str:
-    dest = os.path.join(docs_repo_path, "CONVENTIONS.md")
+    dest = write_conventions_path(docs_repo_path) if copy_from_package else find_conventions_path(docs_repo_path)
     src = os.path.join(project_root(), "CONVENTIONS.md")
     if copy_from_package and os.path.exists(src):
-        os.makedirs(docs_repo_path, exist_ok=True)
-        shutil.copy(src, dest)
+        os.makedirs(os.path.dirname(write_conventions_path(docs_repo_path)), exist_ok=True)
+        shutil.copy(src, write_conventions_path(docs_repo_path))
         with open(src, "r", encoding="utf-8") as f:
             return f.read()
-    if os.path.exists(dest):
-        with open(dest, "r", encoding="utf-8") as f:
+    existing = dest if dest and os.path.exists(dest) else find_conventions_path(docs_repo_path)
+    if existing and os.path.exists(existing):
+        with open(existing, "r", encoding="utf-8") as f:
             return f.read()
     return ""
 
@@ -1052,16 +1112,15 @@ def list_commits_in_range(app_repo_path: str, base_ref: str, head_ref: str) -> L
     return [CommitInfo(**row) for row in analyzer.commits_between(base_ref, head_ref)]
 
 
-STATE_FILENAME = ".docflow-state.json"
-
-
 def _state_path(docs_repo_path: str) -> str:
-    return os.path.join(os.path.abspath(docs_repo_path), STATE_FILENAME)
+    path = write_state_path(docs_repo_path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return path
 
 
 def load_generate_cursor(docs_repo_path: str) -> Optional[GenerateCursor]:
-    path = _state_path(docs_repo_path)
-    if not os.path.isfile(path):
+    path = find_state_path(docs_repo_path)
+    if not path or not os.path.isfile(path):
         return None
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -1387,7 +1446,7 @@ def _agent_capture(concurrency: int, capture_output: bool) -> Optional[bool]:
 def _complete_prompt(prompt_file: str, docs_repo_path: str) -> None:
     if not os.path.exists(prompt_file):
         return
-    completed_dir = os.path.join(docs_repo_path, "prompts", "completed")
+    completed_dir = completed_prompts_dir(docs_repo_path)
     os.makedirs(completed_dir, exist_ok=True)
     shutil.move(prompt_file, os.path.join(completed_dir, os.path.basename(prompt_file)))
 
@@ -1529,10 +1588,12 @@ def list_features(docs_repo_path: str) -> List[str]:
 
 
 def list_pending_prompts(docs_repo_path: str) -> List[str]:
-    prompts_dir = os.path.join(docs_repo_path, "prompts", "pending")
-    if not os.path.isdir(prompts_dir):
-        return []
-    return sorted(f for f in os.listdir(prompts_dir) if f.endswith(".md"))
+    names: List[str] = []
+    for prompts_dir in prompt_search_dirs(docs_repo_path):
+        if not os.path.isdir(prompts_dir):
+            continue
+        names.extend(f for f in os.listdir(prompts_dir) if f.endswith(".md"))
+    return sorted(set(names))
 
 
 def get_dashboard(repo: Optional[str] = None, docs: Optional[str] = None) -> Dashboard:
@@ -1635,7 +1696,7 @@ def init_docs(
     stack_payload = load_stack_file(docs_repo_path)
     if agent.mode == "shell" and not stack_payload:
         progress("Asking the agent what to document from composer/packages…")
-        survey_prompt = os.path.join(docs_repo_path, "prompts", "pending", "init-stack-survey.md")
+        survey_prompt = pending_prompt_path(docs_repo_path, "init-stack-survey.md")
         survey_context = PromptContext(
             task_type="stack-survey",
             project_name=config.project.name,
@@ -1660,7 +1721,7 @@ def init_docs(
         features.append(
             FeatureRunResult(
                 feature_name="stack-survey",
-                prompt_file="prompts/pending/init-stack-survey.md",
+                prompt_file=rel_pending_prompt("init-stack-survey.md"),
                 success=survey_res.success,
                 error_message=survey_res.error_message,
                 output_log=survey_res.output_log,
@@ -1723,9 +1784,15 @@ def init_docs(
             or DocTypeSettings(name=item.doc_type, description=item.description)
         )
     config.docs.types = kept_types or list(config.docs.types)
-    config.generation.features = [item.name for item in chosen if item.doc_type == "features"]
+    config.generation.features = [
+        item.name for item in chosen if item.doc_type != "architecture"
+    ]
     config.generation.extra_features = [
-        ExtraFeatureSettings(name=item.name, paths=list(item.file_paths[:40]))
+        ExtraFeatureSettings(
+            name=item.name,
+            paths=list(item.file_paths[:40]),
+            doc_type=item.doc_type,
+        )
         for item in chosen
         if item.file_paths
     ]
@@ -1773,8 +1840,8 @@ def init_docs(
     prepared: List[Tuple[str, str, str]] = []
     for index, (doc_type, type_desc, output_dir, chunk) in enumerate(jobs, start=1):
         feature_name = chunk.feature_name
-        rel_prompt_file = os.path.join("prompts", "pending", f"init-{doc_type}-{feature_name}.md")
-        prompt_file = os.path.join(docs_repo_path, rel_prompt_file)
+        rel_prompt_file = rel_pending_prompt(f"init-{doc_type}-{feature_name}.md")
+        prompt_file = pending_prompt_path(docs_repo_path, f"init-{doc_type}-{feature_name}.md")
         context = PromptContext(
             task_type="init",
             project_name=config.project.name,
@@ -1843,7 +1910,7 @@ def init_docs(
         imported=bool(imported.copied),
         features=features,
         docs_inside_app=docs_repo_path.startswith(app_repo_path),
-        pending_dir=os.path.join(docs_repo_path, "prompts", "pending"),
+        pending_dir=pending_prompts_dir(docs_repo_path),
         config_paths=config_paths,
         imported_copied=imported.copied,
         imported_skipped=imported.skipped,
@@ -2074,7 +2141,7 @@ def generate_docs(
             output_dir=output_dir,
             extra_instructions=doc_guidance,
         )
-        prompt_file = os.path.join(docs_repo_path, "prompts", "pending", f"{task_type}-{target_feature}.md")
+        prompt_file = pending_prompt_path(docs_repo_path, f"{task_type}-{target_feature}.md")
         prefix = f"[{index}/{total}] " if total > 1 else ""
         if on_progress:
             on_progress(f"{prefix}Writing {task_type} prompt for {target_feature}…")

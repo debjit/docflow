@@ -102,4 +102,4 @@ def test_stack_guidance_falls_back_to_profile(laravel_repo):
 
 
 def test_stack_filename_constant():
-    assert STACK_FILENAME == ".docflow-stack.json"
+    assert STACK_FILENAME == "stack.json"

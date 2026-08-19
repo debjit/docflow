@@ -5,6 +5,8 @@ Generator for llms.txt and llms-full.txt files adhering to the standard specific
 import os
 from typing import Dict, List
 
+from docflow.core.workspace import SPLIT_DOC_TYPES
+
 
 SKIP_DIRS = {
     ".git",
@@ -12,6 +14,7 @@ SKIP_DIRS = {
     "venv",
     "prompts",
     "status",
+    ".docflow",
     "node_modules",
     "__pycache__",
     ".pytest_cache",
@@ -47,10 +50,12 @@ class LLMSTxtGenerator:
             fpath = os.path.join(root, entry)
             if not os.path.isdir(fpath):
                 continue
-            if entry == "features":
+            if entry in SPLIT_DOC_TYPES:
                 for child in sorted(os.listdir(fpath)):
+                    if child.startswith("."):
+                        continue
                     child_path = os.path.join(fpath, child)
-                    add_dir(child_path, child, f"features/{child}/index.md", "features")
+                    add_dir(child_path, child, f"{entry}/{child}/index.md", entry)
                 continue
             add_dir(fpath, entry, f"{entry}/index.md", entry)
         return items
@@ -106,7 +111,7 @@ class LLMSTxtGenerator:
             "- [Work in Progress](status/wip.md): Active development branches and tasks.",
             "",
             "## Conventions",
-            "- [Conventions](CONVENTIONS.md): Documentation format standards.",
+            "- [Conventions](.docflow/CONVENTIONS.md): Documentation format standards.",
         ])
 
         llms_txt_path = os.path.join(self.docs_repo_path, "llms.txt")

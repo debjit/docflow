@@ -30,7 +30,7 @@ async def test_update_docs_modal_has_agent_select():
     app = DocFlowApp()
     async with app.run_test() as pilot:
         await pilot.pause()
-        await pilot.click("#btn-generate")
+        await pilot.press("g")
         await pilot.pause()
         generate = next(
             screen for screen in app.screen_stack if screen.__class__.__name__ == "GenerateScreen"
@@ -86,7 +86,7 @@ async def test_setup_and_publish_open_modals():
     app = DocFlowApp()
     async with app.run_test() as pilot:
         await pilot.pause()
-        await pilot.click("#btn-setup")
+        await pilot.press("i")
         await pilot.pause()
         assert any(
             screen.__class__.__name__ in ("SetupScreen", "ImportScreen")
@@ -94,7 +94,7 @@ async def test_setup_and_publish_open_modals():
         )
         await pilot.press("escape")
         await pilot.pause()
-        await pilot.click("#btn-publish")
+        await pilot.press("p")
         await pilot.pause()
         assert any(screen.__class__.__name__ == "PublishScreen" for screen in app.screen_stack)
 

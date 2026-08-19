@@ -242,8 +242,9 @@ def test_init_docs_custom_type_and_refuses_rerun(tmp_path, monkeypatch):
     )
     assert "front-end" in result.types
     assert (docs / "front-end").is_dir()
-    assert (docs / ".docflow.yml").exists()
+    assert (docs / ".docflow" / "config.yml").exists()
     assert not (app / ".docflow.yml").exists()
+    assert not (app / ".docflow" / "config.yml").exists()
     try:
         init_docs(str(app), str(docs), spec)
         assert False, "expected AlreadyInitialized"
@@ -276,11 +277,13 @@ def test_discover_skips_noisy_defaults(tmp_path):
         ignore_patterns=DEFAULT_IGNORE,
         skip_dirs=set(),
     )
-    names = {item.name for item in candidates if item.doc_type == "features"}
-    assert "github" not in names
-    assert "gitlab" not in names
+    names = {item.name for item in candidates if item.doc_type == "functions"}
+    all_names = {item.name for item in candidates}
+    assert "github" not in all_names
+    assert "gitlab" not in all_names
     assert "auth" not in names
     assert "login" in names
+    assert "main" not in all_names
     assert suggested_section_included("git") is False
     assert suggested_section_included("login") is True
 
@@ -317,7 +320,7 @@ def test_init_docs_review_keeps_selection_and_extra(tmp_path, monkeypatch):
             item.included = item.name in {"architecture", "login"}
         candidates.append(
             SectionCandidate(
-                doc_type="features",
+                doc_type="functions",
                 name="payments/charge.py",
                 included=True,
                 extra=True,
@@ -332,12 +335,12 @@ def test_init_docs_review_keeps_selection_and_extra(tmp_path, monkeypatch):
         on_review_sections=review,
     )
     assert "architecture" in result.types
-    assert "features" in result.types
-    pending = docs / "prompts" / "pending"
-    assert (pending / "init-features-login.md").exists()
-    assert (pending / "init-features-charge.md").exists()
-    assert not (pending / "init-features-core.md").exists()
-    assert not (pending / "init-features-auth.md").exists()
+    assert "functions" in result.types
+    pending = docs / ".docflow" / "prompts" / "pending"
+    assert (pending / "init-functions-login.md").exists()
+    assert (pending / "init-functions-charge.md").exists()
+    assert not (pending / "init-functions-core.md").exists()
+    assert not (pending / "init-functions-auth.md").exists()
     saved = DocFlowConfig.load(docs_repo_path=str(docs))
     assert "login" in (saved.generation.features or [])
     assert "charge" in (saved.generation.features or [])
@@ -378,6 +381,7 @@ def test_init_docs_cancel_writes_nothing(tmp_path, monkeypatch):
     except InitCancelled:
         pass
     assert not (docs / ".docflow.yml").exists()
+    assert not (docs / ".docflow" / "config.yml").exists()
 
 
 def test_generate_cursor_tracks_new_commits_only(tmp_path):
@@ -475,8 +479,8 @@ def test_generate_docs_writes_prompts_for_each_feature(tmp_path):
     )
     names = [item.feature_name for item in result.features]
     assert names == ["auth", "billing"]
-    assert (docs / "prompts" / "pending" / "update-auth.md").exists()
-    assert (docs / "prompts" / "pending" / "update-billing.md").exists()
+    assert (docs / ".docflow" / "prompts" / "pending" / "update-auth.md").exists()
+    assert (docs / ".docflow" / "prompts" / "pending" / "update-billing.md").exists()
     cursor = load_generate_cursor(str(docs))
     assert cursor is not None
 
@@ -520,7 +524,7 @@ def test_generate_docs_pulls_when_remote_is_ahead(tmp_path):
     assert not result.already_current
     names = [item.feature_name for item in result.features]
     assert "auth" in names
-    assert (docs / "prompts" / "pending" / "update-auth.md").exists()
+    assert (docs / ".docflow" / "prompts" / "pending" / "update-auth.md").exists()
     assert Repo(app).head.commit.hexsha != first.hexsha
 
 

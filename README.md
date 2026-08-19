@@ -22,7 +22,7 @@ docflow generate
 
 | Command | What it does |
 | --- | --- |
-| `docflow init` | Pair app + docs. You define types (`front-end: React UI docs`). Defaults: `architecture`, `features`. |
+| `docflow init` | Pair app + docs. Defaults: `architecture`, `database`, `models`, `functions`, `routes`, `pages`. |
 | `docflow pull` | `git pull` on the app repo, then list commits not yet documented. |
 | `docflow generate` | Update existing docs from **new commits only**. |
 | `docflow import --from PATH --type NAME` | Copy files into a type folder. Never overwrites. |
@@ -56,30 +56,31 @@ flowchart TD
 
 ```text
 docs-repo/
-├── CONVENTIONS.md
-├── .docflow.yml
-├── .docflow-state.json          # last documented SHA (not human docs)
+├── architecture/                # one overview
+├── database/<unit>/
+├── models/<unit>/
+├── functions/<unit>/
+├── routes/<unit>/
+├── pages/<unit>/
 ├── llms.txt
 ├── llms-full.txt
-├── architecture/                # example type
-├── features/<module>/           # only if you keep a features type
-│   ├── index.md
-│   ├── context.json
-│   ├── files.md
-│   └── changelog.md
-├── front-end/                   # example custom type
-└── prompts/
-    ├── pending/
-    └── completed/
+└── .docflow/                    # machinery, not docs
+    ├── config.yml
+    ├── state.json
+    ├── stack.json
+    ├── CONVENTIONS.md
+    └── prompts/
+        ├── pending/
+        └── completed/
 ```
 
-`features` is split per module. Other types are a single folder named after the type.
+Application docs live in type folders. Config, prompts, and generate state live in `.docflow/`.
 
 ## Configuration
 
-Project config lives only in the **docs** repo (`.docflow.yml`). DocFlow does not write into the application source tree. `docflow projects` lists and switches docs projects from a user index (`$XDG_CONFIG_HOME/docflow/projects.yml`).
+Project config lives only in the **docs** repo (`.docflow/config.yml`). DocFlow does not write into the application source tree. `docflow projects` lists and switches docs projects from a user index (`$XDG_CONFIG_HOME/docflow/projects.yml`).
 
-`.docflow.yml` in the docs repo:
+`.docflow/config.yml` in the docs repo:
 
 ```yaml
 project:
@@ -92,11 +93,17 @@ docs:
   repo_path: "/path/to/docs-repo"
   types:
     - name: architecture
-      description: System layout, hosting, and shared packages
-    - name: features
-      description: Feature and module documentation scanned from the codebase
-    - name: front-end
-      description: React UI docs
+      description: System layout, hosting, and packages this app uses
+    - name: database
+      description: Schema and migrations
+    - name: models
+      description: Domain models
+    - name: functions
+      description: Application services, jobs, actions, and controllers
+    - name: routes
+      description: HTTP routes
+    - name: pages
+      description: UI pages and indexes
 
 agent:
   mode: "shell"   # or "manual"
@@ -118,12 +125,12 @@ generation:
 
 - **`generation.framework`**: `auto` detects Laravel and applies framework-aware ignore rules; `laravel` forces the Laravel profile; `none` skips detection (still ignores `vendor/`).
 - **`generation.ignore`**: merged with DocFlow defaults and framework profiles during scan and diff.
-- **`generation.features`**: modules selected during init. Later `generate` only updates those feature sections.
-- **Section picker**: after the first scan, init lists what it found. Toggle git/CI/tooling off, keep application modules, and add extra names or paths the scan missed. `--yes` skips the picker (CI). `--include`, `--exclude`, and `--extra` pre-filter the list.
-- **`.docflow-stack.json`**: written during init (Laravel apps) by a stack survey agent job; later prompts use its `guidance` to focus on application code, not framework internals.
+- **`generation.features`**: units selected during init. Later `generate` only updates those sections.
+- **Section picker**: after the agent inspects composer/packages and app structure, init lists application units (models, routes, pages, …). CLI glue such as `main`/`menu` is not listed. `--yes` skips the picker (CI).
+- **`.docflow/stack.json`**: written during init by a stack survey agent job; later prompts use its `guidance` to focus on application code, not framework internals.
 
-- **shell**: DocFlow runs your CLI agent; prompts move from `prompts/pending/` to `prompts/completed/`.
-- **manual**: Prompts stay in `prompts/pending/` with exact output paths.
+- **shell**: DocFlow runs your CLI agent; prompts move from `.docflow/prompts/pending/` to `.docflow/prompts/completed/`.
+- **manual**: Prompts stay in `.docflow/prompts/pending/` with exact output paths.
 
 `docflow status` (alias `docflow info`) shows types, last documented commit, and new commits. It does not write `status/wip.md`.
 

@@ -43,7 +43,8 @@ DEFAULT_IGNORE = {
     ".gitlab-ci.yml", "gitlab-ci.yml",
     "node_modules", "dist", "build", "__pycache__",
     ".venv", "venv", ".idea", ".vscode", "*.lock", "package-lock.json",
-    ".pytest_cache", "test-docs-repo", "docs-repo", "*.egg-info", "docflow.egg-info"
+    ".pytest_cache", "test-docs-repo", "docs-repo", "*.egg-info", "docflow.egg-info",
+    ".docflow",
 }
 
 _WRAPPER_DIRS = {"src", "lib", "app", "pkg"}

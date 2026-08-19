@@ -7,20 +7,25 @@ Documentation repository: `{{ docs_repo_path }}`
 
 ## Documentation sections the user chose
 
-Assign every recommended unit to **one** of these sections:
+These are **application** documentation folders. Assign every unit to one of them.
+Do **not** invent a "modules" dump. Do **not** list CLI entrypoints (`main`, `menu`), git, GitLab, or DocFlow internals.
 
 {% if available_sections %}
 {% for section in available_sections %}
 - `{{ section.name }}`{% if section.description %}: {{ section.description }}{% endif %}
 {% endfor %}
 {% else %}
-- `architecture`: System layout, hosting, and shared packages
-- `features`: Application domain units (models, resources, pages, jobs)
+- `architecture`: System layout, hosting, and packages this app uses
+- `database`: Schema and migrations
+- `models`: Domain models
+- `functions`: Services, jobs, actions, controllers
+- `routes`: HTTP routes
+- `pages`: UI pages and indexes (Inertia, Filament, views)
 {% endif %}
 
 ## Task
 
-Inspect **this** repository. Produce a documentation inventory — not git/CI noise, not library tutorials.
+Inspect **this** repository. Produce a documentation inventory for the **application**, not for tools that generate docs.
 
 Use these files as evidence of what the app is (do not document the tools themselves):
 
@@ -32,18 +37,19 @@ Use these files as evidence of what the app is (do not document the tools themse
 Then:
 
 1. Detect the platform (Laravel for PHP apps) and in-repo libraries (Filament, Inertia, Vue, React, Livewire, Horizon, …).
-2. List paths that must **never** be documented: `vendor/`, caches, framework scaffolding, `.github/`, `.gitlab/`, CI.
-3. List **individual application units** to document — one class, page, resource, controller, or job each — and assign `section`.
-4. If you find something **important for this repo** that is not a usual category (not a model/resource/page/controller), put it in `other_items` with `kind` `"other"` and the best `section`. Examples: a custom billing gateway, a deploy layout unique to this app. Not git, GitLab, GitHub CLI, CI, artisan, or vendor packages.
+2. List paths that must **never** be documented: `vendor/`, caches, framework scaffolding, `.github/`, `.gitlab/`, CI, CLI glue.
+3. List **individual application units** — one model, migration, page, route, job, or controller each — and assign `section`.
+4. Architecture is **one** overview, not a list of Python/PHP files.
+5. If you find something **important for this app** that is not a usual category, put it in `other_items` with `kind` `"other"`. Still application code — never git/GitLab/CI/`main`/`menu`.
 
 Do **not** list directories (`app/`, `Models/`, `github/`).
-Do **not** list GitHub CLI, GitLab, git, CI workflows, artisan, Illuminate, or vendor packages.
+Do **not** list GitHub CLI, GitLab, git, CI, artisan, Illuminate, vendor packages, or DocFlow CLI files.
 
 ## Output
 
 Write exactly one JSON file to:
 
-`{{ docs_repo_path }}/.docflow-stack.json`
+`{{ docs_repo_path }}/.docflow/stack.json`
 
 Use this schema:
 
@@ -56,11 +62,11 @@ Use this schema:
   "guidance": "Do not document Laravel/Filament/Inertia/Vue internals. Document this app's models, Filament resources, Inertia pages, and Vue components.",
   "items": [
     {"id": "architecture", "kind": "overview", "title": "Architecture", "path": "composer.json", "section": "architecture", "include": true},
-    {"id": "user", "kind": "model", "title": "User", "path": "app/Models/User.php", "section": "features", "include": true},
-    {"id": "invoice-resource", "kind": "filament-resource", "title": "InvoiceResource", "path": "app/Filament/Resources/InvoiceResource.php", "section": "features", "include": true}
+    {"id": "user", "kind": "model", "title": "User", "path": "app/Models/User.php", "section": "models", "include": true},
+    {"id": "invoice-resource", "kind": "filament-resource", "title": "InvoiceResource", "path": "app/Filament/Resources/InvoiceResource.php", "section": "pages", "include": true}
   ],
   "other_items": [
-    {"id": "acme-gateway", "kind": "other", "title": "Acme payment gateway", "path": "app/Billing/AcmeGateway.php", "section": "features", "include": true, "why": "Custom integration unique to this repo"}
+    {"id": "acme-gateway", "kind": "other", "title": "Acme payment gateway", "path": "app/Billing/AcmeGateway.php", "section": "functions", "include": true, "why": "Custom integration unique to this app"}
   ]
 }
 ```
@@ -70,9 +76,10 @@ Rules:
 - `libraries`: composer/npm packages in **this** project. Tooling CLIs are not libraries to document.
 - `skip_paths`: always include `vendor/` plus git/CI paths.
 - `items`: one row per usual unit. `path` must be a single file. `section` must be one of the user-chosen section names above.
-- `kind` for `items` is one of: overview, model, filament-resource, filament-page, controller, policy, job, service, page, route, module.
-- `other_items`: important units that do not fit those kinds. Still application code — never git/GitLab/CI.
+- `kind` for `items` is one of: overview, model, migration, filament-resource, filament-page, controller, policy, job, service, page, route, function.
+- `other_items`: important application units that do not fit those kinds.
 - `include`: true for application domain code the user should document.
-- Cap `items` + `other_items` at about 80. Prefer models, Filament resources/pages, Inertia/Vue pages, controllers, jobs.
+- Cap `items` + `other_items` at about 80. Prefer models, Filament resources/pages, Inertia/Vue pages, controllers, jobs, routes, migrations.
 
-Do **not** create any other files. Do **not** write human documentation yet — only `.docflow-stack.json`.
+Do **not** create any other files. Do **not** write human documentation yet — only `.docflow/stack.json`.
+Do **not** write into `architecture/` or other doc folders in this step.

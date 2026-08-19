@@ -141,8 +141,11 @@ def collect_doc_types(explicit: Sequence[str] = ()) -> List[DocTypeSettings]:
     if not sys.stdout.isatty():
         return list(DEFAULT_DOC_TYPES)
     ux.console.print("\n[bold]Documentation types[/bold]")
-    ux.console.print("Each type is a folder. Example: [cyan]front-end[/cyan] — React UI docs.")
-    ux.console.print("Suggested: [cyan]architecture[/cyan], [cyan]features[/cyan]")
+    ux.console.print("Each type is a folder for application docs.")
+    ux.console.print(
+        "Suggested: [cyan]architecture[/cyan], [cyan]database[/cyan], "
+        "[cyan]models[/cyan], [cyan]functions[/cyan], [cyan]routes[/cyan], [cyan]pages[/cyan]"
+    )
     types: List[DocTypeSettings] = []
     if Confirm.ask("Use suggested types as a starting set?", default=True):
         types = list(DEFAULT_DOC_TYPES)
@@ -237,10 +240,10 @@ def review_init_sections(
                 extra = add_extra(raw)
             else:
                 extra = SectionCandidate(
-                    doc_type="features",
+                    doc_type="functions",
                     name=raw,
                     title=os.path.splitext(os.path.basename(raw.replace("\\", "/")))[0] or raw,
-                    kind="module",
+                    kind="function",
                     description=f"Extra unit '{raw}'",
                     included=True,
                     extra=True,

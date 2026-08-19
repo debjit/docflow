@@ -40,6 +40,22 @@ def test_inventory_lists_laravel_files_not_folders(tmp_path):
     assert not any(row["path"].endswith("/") for row in items)
 
 
+def test_inventory_skips_cli_main_and_menu(tmp_path):
+    src = tmp_path / "src" / "cli"
+    src.mkdir(parents=True)
+    (src / "main.py").write_text("def main():\n    pass\n")
+    (src / "menu.py").write_text("def menu():\n    pass\n")
+    (tmp_path / "src" / "auth").mkdir()
+    (tmp_path / "src" / "auth" / "login.py").write_text("def login():\n    return True\n")
+
+    items = inventory_app_items(str(tmp_path), DEFAULT_IGNORE)
+    ids = {row["id"] for row in items}
+    assert "main" not in ids
+    assert "menu" not in ids
+    assert "login" in ids
+    assert all(row["kind"] != "module" for row in items)
+
+
 def test_stack_payload_drops_folders_and_tooling(tmp_path):
     models = tmp_path / "app" / "Models"
     models.mkdir(parents=True)
@@ -172,8 +188,9 @@ def test_discover_assigns_agent_section_and_other_items(tmp_path):
     )
     by_name = {item.name: item for item in candidates}
     assert by_name["architecture"].doc_type == "architecture"
-    assert by_name["user"].doc_type == "features"
+    assert by_name["user"].doc_type == "models"
     assert by_name["acme-gateway"].kind == "other"
+    assert by_name["acme-gateway"].doc_type == "functions"
     assert by_name["acme-gateway"].included is True
     assert sum(1 for item in candidates if item.doc_type == "architecture") == 1
 
@@ -206,6 +223,6 @@ def test_discover_uses_agent_items_not_folders(tmp_path):
             ]
         },
     )
-    features = [item for item in candidates if item.doc_type == "features"]
-    assert [item.label for item in features] == ["User  (model)"]
-    assert features[0].file_paths == ["app/Models/User.php"]
+    models = [item for item in candidates if item.doc_type == "models"]
+    assert [item.label for item in models] == ["User  (model)"]
+    assert models[0].file_paths == ["app/Models/User.php"]

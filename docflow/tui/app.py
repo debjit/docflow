@@ -433,10 +433,10 @@ class SectionPickerScreen(ModalScreen[Optional[list]]):
         stem = os.path.splitext(os.path.basename(raw.replace("\\", "/")))[0] or raw
         self._items.append(
             SectionCandidate(
-                doc_type="features",
+                doc_type="functions",
                 name=raw,
                 title=stem,
-                kind="module",
+                kind="function",
                 description=f"Extra unit '{raw}'",
                 included=True,
                 extra=True,

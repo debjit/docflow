@@ -11,8 +11,9 @@ from pathlib import Path
 from typing import List, Optional, Set
 
 from docflow.core.git_analyzer import DEFAULT_IGNORE
+from docflow.core.workspace import find_stack_path, write_stack_path
 
-STACK_FILENAME = ".docflow-stack.json"
+STACK_FILENAME = "stack.json"
 
 # Applied for every repo, even when no framework is detected.
 ALWAYS_IGNORE = {
@@ -151,7 +152,12 @@ def skip_as_feature_dirs(framework_name: Optional[str]) -> Set[str]:
 
 
 def stack_file_path(docs_repo_path: str) -> str:
-    return os.path.join(os.path.abspath(docs_repo_path), STACK_FILENAME)
+    found = find_stack_path(docs_repo_path)
+    if found:
+        return found
+    path = write_stack_path(docs_repo_path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return path
 
 
 def load_stack_file(docs_repo_path: str) -> Optional[dict]:
@@ -172,20 +178,18 @@ def stack_guidance(docs_repo_path: str, framework_name: Optional[str] = None) ->
 
 
 def architecture_seed_paths(repo_path: str, framework_name: Optional[str]) -> List[str]:
-    """Seed architecture prompts with application-focused paths instead of an empty list."""
-    profile = get_profile(framework_name)
-    if not profile:
-        return []
+    """Evidence files for the architecture overview — not CLI or every app file."""
+    del framework_name
     root = Path(repo_path)
     seeds: List[str] = []
-    for rel in profile.document_dirs:
-        candidate = root / rel
-        if candidate.is_file():
+    for rel in (
+        "composer.json",
+        "package.json",
+        "README.md",
+        "docker-compose.yml",
+        "compose.yaml",
+        "docker-compose.yaml",
+    ):
+        if (root / rel).is_file():
             seeds.append(rel)
-        elif candidate.is_dir():
-            count = 0
-            for path in candidate.rglob("*"):
-                if path.is_file() and count < 8:
-                    seeds.append(str(path.relative_to(root)).replace("\\", "/"))
-                    count += 1
-    return seeds[:20]
+    return seeds

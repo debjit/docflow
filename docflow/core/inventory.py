@@ -1,6 +1,6 @@
 """
-Discover individual application units to document — classes, pages, resources —
-instead of top-level folders or tooling (git, GitHub CLI, CI).
+Discover application units to document — models, routes, pages, functions —
+not CLI glue, folders, or developer tooling (git, GitHub CLI, CI).
 """
 
 from __future__ import annotations
@@ -24,12 +24,44 @@ TOOLING_NAME_RE = re.compile(
 
 APP_KIND_ORDER = [
     "overview",
-    "model", "filament-resource", "filament-page", "controller", "policy",
-    "job", "service", "action", "page", "component", "route", "module",
+    "model", "migration",
+    "filament-resource", "filament-page",
+    "function", "controller", "policy", "job", "service", "action",
+    "route",
+    "page", "component",
     "other",
 ]
 
 APP_KINDS = set(APP_KIND_ORDER)
+
+KIND_TO_SECTION = {
+    "overview": "architecture",
+    "architecture": "architecture",
+    "model": "models",
+    "migration": "database",
+    "filament-resource": "pages",
+    "filament-page": "pages",
+    "page": "pages",
+    "component": "pages",
+    "controller": "functions",
+    "policy": "functions",
+    "job": "functions",
+    "service": "functions",
+    "action": "functions",
+    "function": "functions",
+    "route": "routes",
+    "other": "functions",
+}
+
+_KIND_ALIASES = {
+    "module": "function",
+    "index": "page",
+    "functions": "function",
+    "models": "model",
+    "routes": "route",
+    "pages": "page",
+    "database": "migration",
+}
 
 _KIND_PATTERNS = (
     ("model", "app/Models", "*.php"),
@@ -44,17 +76,30 @@ _KIND_PATTERNS = (
     ("page", "resources/js/Pages", "*.tsx"),
     ("page", "resources/js/Pages", "*.jsx"),
     ("route", "routes", "*.php"),
-    ("module", "src", "*.py"),
-    ("module", "src", "*.ts"),
-    ("module", "src", "*.tsx"),
-    ("module", "src", "*.js"),
-    ("module", "src", "*.jsx"),
+    ("migration", "database/migrations", "*.php"),
+    ("function", "src", "*.py"),
+    ("function", "src", "*.ts"),
+    ("function", "src", "*.tsx"),
+    ("function", "src", "*.js"),
+    ("function", "src", "*.jsx"),
 )
 
 _SKIP_NAME_PARTS = {
     "test", "tests", "spec", "vendor", "node_modules", "__pycache__",
-    "bootstrap", "storage", "public", "github", "gitlab",
+    "bootstrap", "storage", "public", "github", "gitlab", "cli",
 }
+
+_BOOTSTRAP_TITLES = {
+    "main", "menu", "cli", "__init__", "wsgi", "asgi", "manage",
+    "kernel", "handler", "bootstrap", "providers", "console",
+}
+
+_PAGE_KINDS = {"page", "filament-page", "filament-resource", "model", "route", "migration"}
+
+
+def normalize_kind(kind: str, is_other: bool = False) -> str:
+    raw = (kind or ("other" if is_other else "function")).strip().lower()
+    return _KIND_ALIASES.get(raw, raw) or ("other" if is_other else "function")
 
 
 def is_tooling_item(name: str, kind: str = "", path: str = "") -> bool:
@@ -67,7 +112,23 @@ def is_tooling_item(name: str, kind: str = "", path: str = "") -> bool:
         return True
     posix = posix_rel(path or "")
     parts = {p.lower() for p in Path(posix).parts} if posix else set()
-    if parts & {".github", ".gitlab", ".git", "vendor", "node_modules"}:
+    if parts & {".github", ".gitlab", ".git", "vendor", "node_modules", ".docflow"}:
+        return True
+    return False
+
+
+def is_bootstrap_item(name: str, kind: str = "", path: str = "") -> bool:
+    """CLI/entrypoint files are not application docs (main.py, menu.py, artisan)."""
+    if normalize_kind(kind) in _PAGE_KINDS:
+        return False
+    stem = (name or "").strip().lower()
+    if stem in _BOOTSTRAP_TITLES:
+        return True
+    posix = posix_rel(path or "")
+    parts = [p.lower() for p in Path(posix).parts] if posix else []
+    if "cli" in parts:
+        return True
+    if parts and parts[-1] in {"main.py", "menu.py", "cli.py", "artisan"}:
         return True
     return False
 
@@ -123,7 +184,8 @@ def inventory_app_items(
         if parts & _SKIP_NAME_PARTS:
             return
         title = _title_from_path(posix)
-        if is_tooling_item(title, kind, posix):
+        kind = normalize_kind(kind)
+        if is_tooling_item(title, kind, posix) or is_bootstrap_item(title, kind, posix):
             return
         if title.lower().endswith("test"):
             return
@@ -135,6 +197,7 @@ def inventory_app_items(
                 "kind": kind,
                 "title": title,
                 "path": posix,
+                "section": KIND_TO_SECTION.get(kind, "functions"),
                 "include": kind in APP_KINDS,
             }
         )
@@ -154,7 +217,7 @@ def inventory_app_items(
 
 
 def stack_items_from_payload(payload: Optional[dict], repo_path: str = "") -> List[dict]:
-    """Normalize agent-discovered items; drop folders and tooling."""
+    """Normalize agent-discovered items; drop folders, tooling, and CLI glue."""
     if not isinstance(payload, dict):
         return []
     rows: List[tuple[dict, bool]] = []
@@ -169,15 +232,15 @@ def stack_items_from_payload(payload: Optional[dict], repo_path: str = "") -> Li
     for entry, is_other in rows:
         title = str(entry.get("title") or entry.get("name") or entry.get("id") or "").strip()
         path = str(entry.get("path") or "").strip()
-        kind = str(entry.get("kind") or ("other" if is_other else "module")).strip().lower()
-        section = str(entry.get("section") or "").strip()
+        kind = normalize_kind(str(entry.get("kind") or ""), is_other=is_other)
+        section = str(entry.get("section") or KIND_TO_SECTION.get(kind, "")).strip()
         if not title and path:
             title = _title_from_path(path)
         if not title:
             continue
         if repo_path and path and is_folder_path(repo_path, path):
             continue
-        if is_tooling_item(title, kind, path):
+        if is_tooling_item(title, kind, path) or is_bootstrap_item(title, kind, path):
             continue
         name = _unique_name(str(entry.get("id") or title), used)
         include = entry.get("include")
@@ -200,7 +263,7 @@ def group_items(items: Sequence[dict]) -> List[tuple[str, List[dict]]]:
     """Group items by kind for compact picker display."""
     buckets: dict[str, List[dict]] = {}
     for item in items:
-        buckets.setdefault(item.get("kind") or "module", []).append(item)
+        buckets.setdefault(item.get("kind") or "function", []).append(item)
     grouped: List[tuple[str, List[dict]]] = []
     for kind in APP_KIND_ORDER:
         if kind in buckets:

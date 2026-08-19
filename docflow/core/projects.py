@@ -14,6 +14,8 @@ from typing import List, Optional
 
 import yaml
 
+from docflow.core.workspace import is_docs_project
+
 
 @dataclass(frozen=True)
 class ProjectEntry:
@@ -197,8 +199,7 @@ def open_project(docs_path: str) -> ProjectEntry:
 def prune_missing() -> List[ProjectEntry]:
     kept: List[ProjectEntry] = []
     for entry in load_index():
-        yml = os.path.join(entry.docs_path, ".docflow.yml")
-        if os.path.isdir(entry.docs_path) and os.path.isfile(yml):
+        if os.path.isdir(entry.docs_path) and is_docs_project(entry.docs_path):
             kept.append(entry)
     save_index(kept)
     return kept

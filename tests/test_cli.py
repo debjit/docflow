@@ -69,10 +69,11 @@ def test_init_does_not_write_home_config(tmp_path, monkeypatch):
     )
     assert result.exit_code == 0, result.output
     assert not (app / ".docflow.yml").exists()
-    assert (docs / ".docflow.yml").exists()
+    assert (docs / ".docflow" / "config.yml").exists()
     assert not (home / ".docflow.yml").exists()
     cwd_config = tmp_path / ".docflow.yml"
     assert not cwd_config.exists()
+    assert not (tmp_path / ".docflow" / "config.yml").exists()
     assert (xdg / "docflow" / "projects.yml").exists()
 
 
@@ -97,7 +98,7 @@ def test_generate_uses_config_without_prompting(tmp_path, monkeypatch):
     runner = CliRunner()
     result = runner.invoke(cli, ["generate", "--repo", str(app), "--agent", "manual"])
     assert result.exit_code == 0, result.output
-    pending = list((docs / "prompts" / "pending").glob("*.md"))
+    pending = list((docs / ".docflow" / "prompts" / "pending").glob("*.md"))
     assert pending, result.output
 
 
@@ -230,14 +231,14 @@ def test_generate_skips_when_already_documented(tmp_path, monkeypatch):
         ["init", "--repo", str(app), "--docs", str(docs), "--agent", "manual", "--fresh"],
     )
     assert init.exit_code == 0, init.output
-    assert (docs / ".docflow-state.json").exists()
+    assert (docs / ".docflow" / "state.json").exists()
     first = runner.invoke(cli, ["generate", "--repo", str(app), "--agent", "manual"])
     assert first.exit_code == 0, first.output
     assert "already" in first.output.lower()
-    pending_before = list((docs / "prompts" / "pending").glob("update-*.md"))
+    pending_before = list((docs / ".docflow" / "prompts" / "pending").glob("update-*.md"))
     second = runner.invoke(cli, ["generate", "--repo", str(app), "--agent", "manual"])
     assert second.exit_code == 0, second.output
-    pending_after = list((docs / "prompts" / "pending").glob("update-*.md"))
+    pending_after = list((docs / ".docflow" / "prompts" / "pending").glob("update-*.md"))
     assert pending_after == pending_before
 
 

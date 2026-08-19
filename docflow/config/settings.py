@@ -1,11 +1,13 @@
 """
-Settings model and loader for .docflow.yml and environment variable overrides.
+Settings model and loader for docs-repo `.docflow/config.yml` (legacy `.docflow.yml`).
 """
 
 import os
 from typing import Optional, List
 import yaml
 from pydantic import BaseModel, Field, ConfigDict
+
+from docflow.core.workspace import find_config_path, write_config_path
 
 
 class ProjectSettings(BaseModel):
@@ -41,6 +43,7 @@ class PlatformSettings(BaseModel):
 class ExtraFeatureSettings(BaseModel):
     name: str
     paths: List[str] = Field(default_factory=list)
+    doc_type: str = ""
 
 
 class GenerationSettings(BaseModel):
@@ -65,10 +68,9 @@ class DocFlowConfig(BaseModel):
     source_path: Optional[str] = Field(default=None, exclude=True)
 
     def save(self, config_dir: str) -> str:
-        """Saves current configuration to .docflow.yml in specified directory."""
-        target_dir = os.path.abspath(config_dir)
-        os.makedirs(target_dir, exist_ok=True)
-        target_path = os.path.join(target_dir, ".docflow.yml")
+        """Saves configuration to `.docflow/config.yml` in the docs repository."""
+        target_path = write_config_path(config_dir)
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
         with open(target_path, "w", encoding="utf-8") as f:
             yaml.safe_dump(self.model_dump(exclude={"source_path"}), f, sort_keys=False)
         return target_path
@@ -85,16 +87,16 @@ class DocFlowConfig(BaseModel):
         def add_docs_config(directory: Optional[str]) -> None:
             if not directory:
                 return
-            cpath = os.path.join(os.path.abspath(directory), ".docflow.yml")
-            if os.path.isfile(cpath):
+            cpath = find_config_path(directory)
+            if cpath:
                 candidate_paths.append(cpath)
 
         add_docs_config(docs_repo_path)
-        # First positional path may itself be a docs folder (has .docflow.yml).
+        # First positional path may itself be a docs folder.
         add_docs_config(app_repo_path)
 
-        cwd_config = os.path.join(os.getcwd(), ".docflow.yml")
-        if os.path.isfile(cwd_config):
+        cwd_config = find_config_path(os.getcwd())
+        if cwd_config:
             candidate_paths.append(cwd_config)
 
         seen = set()

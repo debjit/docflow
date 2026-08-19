@@ -45,7 +45,7 @@ def test_prompt_builder_stack_survey():
     )
     rendered = builder.render(context)
     assert "Application Stack Survey" in rendered
-    assert ".docflow-stack.json" in rendered
+    assert ".docflow/stack.json" in rendered
     assert "/tmp/app" in rendered
     assert "composer.json" in rendered
     assert "other_items" in rendered
