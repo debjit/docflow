@@ -25,6 +25,33 @@ class JobState:
     result: Any = None
 
 
+class RunControl:
+    """Pause starting new jobs. Running jobs keep going; the UI can freeze log updates separately."""
+
+    def __init__(self) -> None:
+        self._gate = threading.Event()
+        self._gate.set()
+        self._paused = False
+        self._lock = threading.Lock()
+
+    @property
+    def paused(self) -> bool:
+        return self._paused
+
+    def pause(self) -> None:
+        with self._lock:
+            self._paused = True
+            self._gate.clear()
+
+    def resume(self) -> None:
+        with self._lock:
+            self._paused = False
+            self._gate.set()
+
+    def wait(self) -> None:
+        self._gate.wait()
+
+
 def default_concurrency() -> int:
     """Read DOCFLOW_JOBS as a positive int, otherwise 4."""
     raw = os.getenv("DOCFLOW_JOBS")
@@ -49,6 +76,7 @@ def run_jobs(
     concurrency: int = 4,
     on_progress: Optional[Callable[[str], None]] = None,
     auto_retry: bool = True,
+    run_control: Optional[RunControl] = None,
 ) -> list:
     """Run jobs with a thread pool, optional one retry of failures, results in input order."""
     job_list = list(jobs)
@@ -65,6 +93,8 @@ def run_jobs(
             on_progress(message)
 
     def execute(index: int) -> None:
+        if run_control is not None:
+            run_control.wait()
         job = job_list[index]
         with lock:
             states[index].status = "running"

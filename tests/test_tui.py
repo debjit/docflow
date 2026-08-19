@@ -19,7 +19,9 @@ async def test_tui_composes():
     async with app.run_test() as pilot:
         await pilot.pause()
         assert app.query_one("#summary")
+        assert app.query_one("#progress")
         assert app.query_one("#log")
+        assert app.query_one("#btn-pause")
         assert app.query_one("#btn-generate")
 
 
@@ -53,6 +55,30 @@ async def test_regen_last_modal_has_agent_and_exit():
         assert regen.query_one("#agent")
         assert regen.query_one("#ok")
         assert regen.query_one("#cancel")
+
+
+@pytest.mark.asyncio
+async def test_section_picker_lists_candidates_and_add_input():
+    from docflow.core.operations import SectionCandidate
+    from docflow.tui.app import SectionPickerScreen
+
+    app = DocFlowApp()
+    candidates = [
+        SectionCandidate(doc_type="architecture", name="architecture", included=True),
+        SectionCandidate(doc_type="features", name="auth", file_paths=["src/auth/login.py"], included=True),
+        SectionCandidate(doc_type="features", name="git", included=False),
+    ]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.push_screen(SectionPickerScreen(candidates))
+        await pilot.pause()
+        picker = next(
+            screen for screen in app.screen_stack if screen.__class__.__name__ == "SectionPickerScreen"
+        )
+        assert picker.query_one("#section-list")
+        assert picker.query_one("#add-path")
+        assert picker.query_one("#ok")
+        assert picker.query_one("#add")
 
 
 @pytest.mark.asyncio
@@ -110,19 +136,33 @@ async def test_model_picker_cursor_headers_and_default():
 
 
 @pytest.mark.asyncio
-async def test_run_clears_log_and_shows_latest_first():
+async def test_run_splits_progress_and_logs_and_can_pause():
+    from docflow.tui.app import is_status_line
+
+    assert is_status_line("Scanning app repo… 50 files")
+    assert is_status_line("[2/4 done] features/auth")
+    assert not is_status_line("I will now inspect composer.json and package.json")
+
     app = DocFlowApp()
     async with app.run_test() as pilot:
         await pilot.pause()
         app._log("stale line from a previous run")
         app._begin_run("Updating docs…")
         assert app.sub_title == "Updating docs…"
-        assert list(app._lines) == []
-        app._progress("step one")
-        app._progress("step two")
+        assert list(app._progress_lines) == ["Updating docs…"]
+        assert list(app._log_lines) == []
+        app._progress("Writing update prompt for auth…")
+        app._progress("agent tool output that is noisy")
+        app._progress("[1/2 done] auth")
+        assert "Writing update prompt for auth…" in list(app._progress_lines)
+        assert "agent tool output that is noisy" in list(app._log_lines)
+        assert "stale line from a previous run" not in list(app._log_lines)
+        app.action_toggle_pause()
+        assert app._run_control.paused
+        app._progress("hidden while paused")
+        assert "hidden while paused" in app._paused_logs
+        app.action_toggle_pause()
+        assert not app._run_control.paused
         app._finish_run("Update finished: update / auth")
-        lines = list(app._lines)
-        assert lines[0].startswith("Update finished")
-        assert "step two" in lines[1]
-        assert "stale line from a previous run" not in lines
+        assert list(app._progress_lines)[-1].startswith("Update finished")
         assert app.sub_title.startswith("Update finished")

@@ -39,7 +39,9 @@ LANGUAGE_MAP = {
 }
 
 DEFAULT_IGNORE = {
-    ".git", ".github", "node_modules", "dist", "build", "__pycache__",
+    ".git", ".github", ".gitlab", ".gitignore", ".gitattributes",
+    ".gitlab-ci.yml", "gitlab-ci.yml",
+    "node_modules", "dist", "build", "__pycache__",
     ".venv", "venv", ".idea", ".vscode", "*.lock", "package-lock.json",
     ".pytest_cache", "test-docs-repo", "docs-repo", "*.egg-info", "docflow.egg-info"
 }
@@ -47,9 +49,17 @@ DEFAULT_IGNORE = {
 _WRAPPER_DIRS = {"src", "lib", "app", "pkg"}
 
 
+def posix_rel(rel_path: str) -> str:
+    """Normalize a relative path without stripping leading dots from names like .github."""
+    posix = Path(str(rel_path).replace("\\", "/")).as_posix()
+    while posix.startswith("./"):
+        posix = posix[2:]
+    return posix.lstrip("/")
+
+
 def path_is_ignored(rel_path: str, ignore_patterns: Set[str]) -> bool:
     """True if a relative path matches any ignore glob (files or directories)."""
-    posix = Path(str(rel_path).replace("\\", "/")).as_posix().lstrip("./")
+    posix = posix_rel(rel_path)
     if not posix or posix == ".":
         return False
     parts = Path(posix).parts
@@ -73,7 +83,7 @@ def path_is_ignored(rel_path: str, ignore_patterns: Set[str]) -> bool:
 
 def feature_bucket_for_path(path: str, skip_as_feature: Optional[Set[str]] = None) -> Optional[str]:
     """Map a source path to a feature/section name (same rules as scan_features)."""
-    posix = Path(str(path).replace("\\", "/")).as_posix().lstrip("./")
+    posix = posix_rel(path)
     parts = Path(posix).parts
     dir_parts = parts[:-1] if len(parts) > 1 else ()
     if not dir_parts:
@@ -324,27 +334,68 @@ class GitAnalyzer:
         for feature, files in feature_map.items():
             if feature == "architecture":
                 continue
-            # Grab short snippets for entry files
-            snippets = {}
-            for fpath in files[:5]:
-                full_p = os.path.join(self.repo_path, fpath)
-                try:
-                    with open(full_p, "r", encoding="utf-8", errors="ignore") as f:
-                        lines = [f.readline() for _ in range(20)]
-                        snippets[fpath] = "".join(lines)
-                except Exception:
-                    pass
-
             chunks.append(
                 FeatureChunk(
                     feature_name=feature,
                     description=f"Feature module for '{feature}' containing {len(files)} file(s).",
                     file_paths=files,
-                    sample_snippets=snippets,
+                    sample_snippets=self._snippets_for(files),
                 )
             )
 
         return chunks
+
+    def _snippets_for(self, files: List[str], limit: int = 5) -> Dict[str, str]:
+        snippets: Dict[str, str] = {}
+        for fpath in files[:limit]:
+            full_p = os.path.join(self.repo_path, fpath)
+            try:
+                with open(full_p, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = [f.readline() for _ in range(20)]
+                    snippets[fpath] = "".join(lines)
+            except Exception:
+                pass
+        return snippets
+
+    def chunk_from_entry(
+        self,
+        raw: str,
+        ignore_patterns: Optional[Set[str]] = None,
+        skip_as_feature: Optional[Set[str]] = None,
+    ) -> FeatureChunk:
+        """Build a feature chunk from a user-supplied module name or relative path."""
+        ignore = ignore_patterns or DEFAULT_IGNORE
+        skip = skip_as_feature or set()
+        rel = posix_rel(raw.strip())
+        full = os.path.join(self.repo_path, rel)
+        files: List[str] = []
+        if os.path.isdir(full):
+            for root, dirs, fnames in os.walk(full):
+                rel_root = os.path.relpath(root, self.repo_path)
+                dirs[:] = [
+                    d for d in dirs
+                    if not path_is_ignored(os.path.normpath(os.path.join(rel_root, d)), ignore)
+                ]
+                for fname in fnames:
+                    rel_file = os.path.normpath(os.path.join(rel_root, fname))
+                    if path_is_ignored(rel_file, ignore):
+                        continue
+                    files.append(rel_file.replace("\\", "/"))
+            name = feature_bucket_for_path(os.path.join(rel, "_"), skip_as_feature=skip)
+            if not name:
+                name = Path(rel).name or "extra"
+        elif os.path.isfile(full):
+            files = [rel]
+            name = feature_bucket_for_path(rel, skip_as_feature=skip) or Path(rel).stem
+        else:
+            name = rel.replace("\\", "/").strip("/").split("/")[-1] or "extra"
+        name = name or "extra"
+        return FeatureChunk(
+            feature_name=name,
+            description=f"Feature module for '{name}' containing {len(files)} file(s).",
+            file_paths=files,
+            sample_snippets=self._snippets_for(files),
+        )
 
     def find_existing_docs(self) -> Dict[str, str]:
         """Finds pre-existing documentation files in the repository (e.g. README.md, docs/, etc.)."""

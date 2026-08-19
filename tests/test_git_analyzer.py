@@ -90,3 +90,16 @@ def test_feature_bucket_and_ignore_globs():
     assert path_is_ignored("app/package.lock", ignore)
     assert path_is_ignored("dist/bundle.js", ignore)
     assert not path_is_ignored("src/auth/login.py", ignore)
+
+
+def test_dot_paths_are_ignored_and_not_stripped():
+    from docflow.core.git_analyzer import DEFAULT_IGNORE, posix_rel
+
+    assert posix_rel(".github/workflows/ci.yml") == ".github/workflows/ci.yml"
+    assert posix_rel("./src/auth/login.py") == "src/auth/login.py"
+    assert path_is_ignored(".github/workflows/ci.yml", DEFAULT_IGNORE)
+    assert path_is_ignored(".git/config", DEFAULT_IGNORE)
+    assert path_is_ignored(".gitlab-ci.yml", DEFAULT_IGNORE)
+    assert path_is_ignored(".gitlab/ci.yml", DEFAULT_IGNORE)
+    assert feature_bucket_for_path(".github/workflows/ci.yml") == "config"
+    assert feature_bucket_for_path(".gitlab-ci.yml") == "core"

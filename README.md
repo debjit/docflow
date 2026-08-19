@@ -118,6 +118,8 @@ generation:
 
 - **`generation.framework`**: `auto` detects Laravel and applies framework-aware ignore rules; `laravel` forces the Laravel profile; `none` skips detection (still ignores `vendor/`).
 - **`generation.ignore`**: merged with DocFlow defaults and framework profiles during scan and diff.
+- **`generation.features`**: modules selected during init. Later `generate` only updates those feature sections.
+- **Section picker**: after the first scan, init lists what it found. Toggle git/CI/tooling off, keep application modules, and add extra names or paths the scan missed. `--yes` skips the picker (CI). `--include`, `--exclude`, and `--extra` pre-filter the list.
 - **`.docflow-stack.json`**: written during init (Laravel apps) by a stack survey agent job; later prompts use its `guidance` to focus on application code, not framework internals.
 
 - **shell**: DocFlow runs your CLI agent; prompts move from `prompts/pending/` to `prompts/completed/`.

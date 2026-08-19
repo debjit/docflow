@@ -21,6 +21,8 @@ from docflow.core.operations import (
     DEFAULT_CURSOR_MODEL,
     DEFAULT_DOC_TYPES,
     AlreadyInitialized,
+    InitCancelled,
+    SectionCandidate,
     agent_supports_models,
     apply_agent_model,
     assert_can_init,
@@ -36,6 +38,7 @@ from docflow.core.operations import (
     pull_app_repo,
     resolve_agent,
     resolve_paths,
+    selected_sections,
 )
 
 
@@ -174,6 +177,72 @@ def collect_import(
     return "", ""
 
 
+def _print_section_candidates(candidates: Sequence[SectionCandidate]) -> None:
+    ux.console.print("\n[bold]What should DocFlow document?[/bold]")
+    ux.console.print("[dim]Uncheck git/CI/tooling. Add a module name or path if the scan missed something.[/dim]")
+    for i, item in enumerate(candidates, start=1):
+        mark = "[green]Y[/green]" if item.included else "[red]N[/red]"
+        ux.console.print(f"  [cyan]{i}[/cyan]. [{mark}] {item.label}")
+    included = len(selected_sections(candidates))
+    ux.console.print(f"[dim]{included}/{len(candidates)} selected[/dim]")
+
+
+def review_init_sections(
+    candidates: List[SectionCandidate],
+    add_extra=None,
+) -> Optional[List[SectionCandidate]]:
+    """TTY picker: toggle discovered sections and optionally add more."""
+    if not candidates:
+        return []
+    items = list(candidates)
+    while True:
+        _print_section_candidates(items)
+        ux.console.print(
+            "  [cyan]number[/cyan] toggle   [cyan]a[/cyan] add   "
+            "[cyan]all[/cyan]/[cyan]none[/cyan]   [cyan]done[/cyan] continue   [cyan]q[/cyan] cancel"
+        )
+        choice = Prompt.ask("Section", default="done").strip().lower()
+        if choice in ("", "done", "y", "yes"):
+            picked = selected_sections(items)
+            if not picked:
+                ux.print_warning("Select at least one section, or add a module/path.")
+                continue
+            return picked
+        if choice in ("q", "quit", "cancel"):
+            return None
+        if choice == "all":
+            for item in items:
+                item.included = True
+            continue
+        if choice == "none":
+            for item in items:
+                item.included = False
+            continue
+        if choice in ("a", "add"):
+            raw = Prompt.ask("Module name or path to add (blank to skip)", default="").strip()
+            if not raw:
+                continue
+            if add_extra:
+                extra = add_extra(raw)
+            else:
+                extra = SectionCandidate(
+                    doc_type="features",
+                    name=raw,
+                    description=f"Extra section '{raw}'",
+                    included=True,
+                    extra=True,
+                )
+            items.append(extra)
+            ux.console.print(f"  Added [cyan]{extra.name}[/cyan] ({len(extra.file_paths)} file(s)).")
+            continue
+        if choice.isdigit():
+            index = int(choice) - 1
+            if 0 <= index < len(items):
+                items[index].included = not items[index].included
+            continue
+        ux.print_warning("Use a number, a, all, none, done, or q.")
+
+
 def _cli_progress(message: str) -> None:
     ux.console.print(f"  [dim]{message}[/dim]")
 
@@ -215,7 +284,11 @@ def run_init(repo: str = "", docs: str = "", agent: Optional[str] = None,
              mode: Optional[str] = None, command: Optional[str] = None,
              model: str = "",
              import_existing: Optional[bool] = None, import_from: str = "",
-             import_into: str = "", doc_types: Sequence[str] = ()) -> None:
+             import_into: str = "", doc_types: Sequence[str] = (),
+             yes: bool = False,
+             include_sections: Sequence[str] = (),
+             exclude_sections: Sequence[str] = (),
+             extra_sections: Sequence[str] = ()) -> None:
     app = repo or Prompt.ask("Application repo path", default=os.getcwd())
     app = os.path.abspath(app)
     paths = resolve_paths(app, docs or None, require=False)
@@ -231,6 +304,7 @@ def run_init(repo: str = "", docs: str = "", agent: Optional[str] = None,
     spec = resolve_agent(agent=agent, mode=mode, command=command, config=paths.config, model=model) or pick_agent()
     types = collect_doc_types(doc_types)
     source, into = collect_import(types, import_from, import_into, import_existing)
+    reviewer = review_init_sections if sys.stdout.isatty() and not yes else None
     try:
         result = init_docs(
             app_repo_path=app,
@@ -242,7 +316,14 @@ def run_init(repo: str = "", docs: str = "", agent: Optional[str] = None,
             import_from=source or None,
             import_into=into or None,
             on_progress=_cli_progress,
+            on_review_sections=reviewer,
+            include_sections=include_sections,
+            exclude_sections=exclude_sections,
+            extra_sections=extra_sections,
         )
+    except InitCancelled as exc:
+        ux.print_warning(str(exc))
+        raise click.Abort()
     except ConfigError as exc:
         ux.print_error(str(exc))
         raise click.Abort()

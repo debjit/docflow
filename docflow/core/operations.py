@@ -15,7 +15,7 @@ from pathlib import Path
 import shlex
 from typing import Callable, List, Optional, Sequence, Tuple
 
-from docflow.config.settings import DocFlowConfig, DocTypeSettings
+from docflow.config.settings import DocFlowConfig, DocTypeSettings, ExtraFeatureSettings
 from docflow.core.agent_runner import AGENT_PRESETS, AgentRunner
 from docflow.core.projects import (
     find_by_app,
@@ -31,7 +31,7 @@ from docflow.core.frameworks import (
     stack_file_path,
     stack_guidance,
 )
-from docflow.core.job_runner import Job, default_concurrency, run_jobs
+from docflow.core.job_runner import Job, RunControl, default_concurrency, run_jobs
 from docflow.core.llms_txt_generator import LLMSTxtGenerator
 from docflow.core.models import AgentRunResult, FeatureChunk, PromptContext
 from docflow.core.prompt_builder import PromptBuilder
@@ -46,6 +46,16 @@ class ConfigError(Exception):
 
 class AlreadyInitialized(ConfigError):
     """Docs folder is already a DocFlow repository."""
+
+
+class InitCancelled(ConfigError):
+    """User cancelled init before any docs were written."""
+
+
+NOISY_SECTION_NAMES = {
+    "git", "github", "gitlab", "ci", "vendor", "node_modules",
+    "storage", "bootstrap", "public", "tests", "test", "core",
+}
 
 
 DEFAULT_DOC_TYPES: List[DocTypeSettings] = [
@@ -141,6 +151,166 @@ def generate_section_names(
         seen.add(bucket)
         names.append(bucket)
     return names or ["architecture"]
+
+
+def allowed_feature_names(config: Optional[DocFlowConfig]) -> Optional[set]:
+    if not config:
+        return None
+    extras = [item.name for item in config.generation.extra_features or []]
+    stored = config.generation.features
+    has_features = any(t.name == "features" for t in config.docs.types)
+    if not has_features:
+        return set(extras) if extras else None
+    if stored is None and not extras:
+        return None
+    return set(stored or []) | set(extras)
+
+
+@dataclass
+class SectionCandidate:
+    """One discovered doc type or feature module the user can include or skip."""
+
+    doc_type: str
+    name: str
+    description: str = ""
+    file_paths: List[str] = field(default_factory=list)
+    included: bool = True
+    extra: bool = False
+    sample_snippets: dict = field(default_factory=dict)
+
+    @property
+    def key(self) -> str:
+        if self.doc_type == "features":
+            return f"features/{self.name}"
+        return self.doc_type
+
+    @property
+    def label(self) -> str:
+        count = len(self.file_paths)
+        samples = ", ".join(self.file_paths[:3])
+        extra = " extra" if self.extra else ""
+        sample_bit = f"  {samples}" if samples else ""
+        return f"{self.name} [{self.doc_type}{extra}]  {count} file(s){sample_bit}"
+
+    def to_chunk(self) -> FeatureChunk:
+        return FeatureChunk(
+            feature_name=self.name,
+            description=self.description,
+            file_paths=self.file_paths,
+            sample_snippets=self.sample_snippets,
+        )
+
+
+def suggested_section_included(name: str, has_architecture: bool = False) -> bool:
+    if name in NOISY_SECTION_NAMES:
+        return False
+    if has_architecture and name == "core":
+        return False
+    return True
+
+
+def discover_init_sections(
+    analyzer: GitAnalyzer,
+    types: Sequence[DocTypeSettings],
+    ignore_patterns: set,
+    skip_dirs: set,
+    arch_seeds: Optional[List[str]] = None,
+    on_progress: Optional[Callable[[str], None]] = None,
+) -> List[SectionCandidate]:
+    """Scan the app repo and return toggleable sections before any docs are written."""
+    has_architecture = any(t.name == "architecture" for t in types)
+    candidates: List[SectionCandidate] = []
+    for doc_type in types:
+        if doc_type.name == "features":
+            if on_progress:
+                on_progress("Scanning the app repo for feature modules…")
+            chunks = analyzer.scan_features(
+                ignore_patterns=ignore_patterns,
+                include_architecture=False,
+                skip_as_feature=skip_dirs,
+                on_progress=on_progress,
+            )
+            for chunk in chunks:
+                candidates.append(
+                    SectionCandidate(
+                        doc_type="features",
+                        name=chunk.feature_name,
+                        description=chunk.description,
+                        file_paths=list(chunk.file_paths),
+                        included=suggested_section_included(chunk.feature_name, has_architecture),
+                        sample_snippets=dict(chunk.sample_snippets),
+                    )
+                )
+            continue
+        seed_paths = list(arch_seeds or []) if doc_type.name == "architecture" else []
+        candidates.append(
+            SectionCandidate(
+                doc_type=doc_type.name,
+                name=doc_type.name,
+                description=doc_type.description,
+                file_paths=seed_paths,
+                included=True,
+            )
+        )
+    return candidates
+
+
+def apply_section_filters(
+    candidates: List[SectionCandidate],
+    include: Sequence[str] = (),
+    exclude: Sequence[str] = (),
+) -> List[SectionCandidate]:
+    include_keys = {_normalize_section_filter(item) for item in include if str(item).strip()}
+    exclude_keys = {_normalize_section_filter(item) for item in exclude if str(item).strip()}
+    if include_keys:
+        for candidate in candidates:
+            candidate.included = _candidate_matches(candidate, include_keys)
+    for candidate in candidates:
+        if _candidate_matches(candidate, exclude_keys):
+            candidate.included = False
+    return candidates
+
+
+def _normalize_section_filter(value: str) -> str:
+    text = (value or "").strip().lower().replace("\\", "/")
+    if text.startswith("features/"):
+        text = text.split("/", 1)[1]
+    return text
+
+
+def _candidate_matches(candidate: SectionCandidate, keys: set) -> bool:
+    if not keys:
+        return False
+    names = {
+        candidate.key.lower(),
+        candidate.name.lower(),
+        candidate.doc_type.lower(),
+        f"features/{candidate.name}".lower(),
+    }
+    return bool(names & keys)
+
+
+def extra_section_from_entry(
+    analyzer: GitAnalyzer,
+    raw: str,
+    ignore_patterns: set,
+    skip_dirs: set,
+    doc_type: str = "features",
+) -> SectionCandidate:
+    chunk = analyzer.chunk_from_entry(raw, ignore_patterns, skip_dirs)
+    return SectionCandidate(
+        doc_type=doc_type if doc_type != "features" else "features",
+        name=chunk.feature_name,
+        description=chunk.description,
+        file_paths=list(chunk.file_paths),
+        included=True,
+        extra=True,
+        sample_snippets=dict(chunk.sample_snippets),
+    )
+
+
+def selected_sections(candidates: Sequence[SectionCandidate]) -> List[SectionCandidate]:
+    return [item for item in candidates if item.included]
 
 
 def _generation_context(app_repo_path: str, config: DocFlowConfig) -> Tuple[Optional[str], set, set]:
@@ -1079,6 +1249,7 @@ def _run_shell_jobs(
     concurrency: int,
     capture_output: bool,
     on_progress: Optional[Callable[[str], None]],
+    run_control: Optional[RunControl] = None,
 ) -> List[FeatureRunResult]:
     """Run agent jobs in parallel. specs are (result_name, prompt_file, stored_prompt_path)."""
     capture = _agent_capture(concurrency, capture_output)
@@ -1105,7 +1276,7 @@ def _run_shell_jobs(
         return run
 
     job_objs = [Job(key=name, run=make_run(name, prompt_file, stored)) for name, prompt_file, stored in specs]
-    raw = run_jobs(job_objs, concurrency=concurrency, on_progress=on_progress)
+    raw = run_jobs(job_objs, concurrency=concurrency, on_progress=on_progress, run_control=run_control)
     results: List[FeatureRunResult] = []
     for (name, _prompt_file, stored), result in zip(specs, raw):
         if isinstance(result, FeatureRunResult):
@@ -1272,6 +1443,11 @@ def init_docs(
     import_from: Optional[str] = None,
     import_into: Optional[str] = None,
     concurrency: Optional[int] = None,
+    on_review_sections: Optional[Callable[[List[SectionCandidate]], Optional[List[SectionCandidate]]]] = None,
+    include_sections: Optional[Sequence[str]] = None,
+    exclude_sections: Optional[Sequence[str]] = None,
+    extra_sections: Optional[Sequence[str]] = None,
+    run_control: Optional[RunControl] = None,
 ) -> InitResult:
     def progress(message: str) -> None:
         if on_progress:
@@ -1295,11 +1471,69 @@ def init_docs(
     if not config.project.name or config.project.name == "Project":
         config.project.name = os.path.basename(app_repo_path)
 
+    analyzer = GitAnalyzer(app_repo_path)
+    framework_name, ignore_patterns, skip_dirs = _generation_context(app_repo_path, config)
+    arch_seeds = architecture_seed_paths(app_repo_path, framework_name)
+    candidates = discover_init_sections(
+        analyzer,
+        config.docs.types,
+        ignore_patterns,
+        skip_dirs,
+        arch_seeds=arch_seeds,
+        on_progress=on_progress,
+    )
+    apply_section_filters(candidates, include_sections or (), exclude_sections or ())
+    for raw in extra_sections or ():
+        if str(raw).strip():
+            candidates.append(extra_section_from_entry(analyzer, raw, ignore_patterns, skip_dirs))
+
+    if on_review_sections:
+        progress("Waiting for section selection…")
+        reviewed = on_review_sections(candidates)
+        if reviewed is None:
+            raise InitCancelled("Init cancelled — no docs were written.")
+        candidates = list(reviewed)
+
+    expanded: List[SectionCandidate] = []
+    for item in candidates:
+        if item.extra and not item.file_paths:
+            filled = extra_section_from_entry(analyzer, item.name, ignore_patterns, skip_dirs)
+            filled.included = item.included
+            expanded.append(filled)
+        else:
+            expanded.append(item)
+    candidates = expanded
+
+    chosen = selected_sections(candidates)
+    if not chosen:
+        raise ConfigError("No sections selected to document.")
+
+    type_by_name = {t.name: t for t in config.docs.types}
+    kept_types: List[DocTypeSettings] = []
+    seen_types = set()
+    for item in chosen:
+        if item.doc_type in seen_types:
+            continue
+        seen_types.add(item.doc_type)
+        kept_types.append(
+            type_by_name.get(item.doc_type)
+            or DocTypeSettings(name=item.doc_type, description=item.description)
+        )
+    config.docs.types = kept_types or list(config.docs.types)
+    config.generation.features = [item.name for item in chosen if item.doc_type == "features"]
+    config.generation.extra_features = [
+        ExtraFeatureSettings(name=item.name, paths=list(item.file_paths[:40]))
+        for item in chosen
+        if item.extra
+    ]
+
     progress("Creating blank docs skeleton…")
     os.makedirs(docs_repo_path, exist_ok=True)
     for doc_type in config.docs.types:
         os.makedirs(os.path.join(docs_repo_path, doc_type.name), exist_ok=True)
     config_paths = save_project_config(config, app_repo_path, docs_repo_path)
+    if framework_name:
+        _persist_detected_framework(config, framework_name, app_repo_path, docs_repo_path)
     conventions_text = _conventions_text(docs_repo_path, copy_from_package=True)
 
     imported = ImportResult(dest_type=slug_type_name(import_into or (config.docs.types[0].name)))
@@ -1314,12 +1548,8 @@ def init_docs(
     elif import_existing:
         progress("No --import-from path given; skipping copy. Use a path/folder to import files.")
 
-    analyzer = GitAnalyzer(app_repo_path)
     builder = PromptBuilder()
     runner = AgentRunner(mode=agent.mode, command_template=agent.command)
-    framework_name, ignore_patterns, skip_dirs = _generation_context(app_repo_path, config)
-    _persist_detected_framework(config, framework_name, app_repo_path, docs_repo_path)
-    arch_seeds = architecture_seed_paths(app_repo_path, framework_name)
 
     features: List[FeatureRunResult] = []
     if framework_name and not os.path.isfile(stack_file_path(docs_repo_path)):
@@ -1362,26 +1592,17 @@ def init_docs(
     doc_guidance = _documentation_guidance(docs_repo_path, framework_name)
 
     jobs: List[Tuple[str, str, str, FeatureChunk]] = []
-    for doc_type in config.docs.types:
-        if doc_type.name == "features":
-            progress("Scanning the app repo for feature modules…")
-            chunks = analyzer.scan_features(
-                ignore_patterns=ignore_patterns,
-                include_architecture=False,
-                skip_as_feature=skip_dirs,
-                on_progress=on_progress,
+    type_desc_by_name = {t.name: t.description for t in config.docs.types}
+    for item in chosen:
+        chunk = item.to_chunk()
+        jobs.append(
+            (
+                item.doc_type,
+                type_desc_by_name.get(item.doc_type, item.description),
+                type_output_dir(item.doc_type, item.name),
+                chunk,
             )
-            for chunk in chunks:
-                jobs.append((doc_type.name, doc_type.description, type_output_dir("features", chunk.feature_name), chunk))
-        else:
-            seed_paths = arch_seeds if doc_type.name == "architecture" else []
-            chunk = FeatureChunk(
-                feature_name=doc_type.name,
-                description=doc_type.description,
-                file_paths=seed_paths,
-                sample_snippets={},
-            )
-            jobs.append((doc_type.name, doc_type.description, type_output_dir(doc_type.name, doc_type.name), chunk))
+        )
 
     total = len(jobs)
     progress(f"Writing init prompts for {total} section(s).")
@@ -1443,6 +1664,7 @@ def init_docs(
             concurrency=workers,
             capture_output=capture_output,
             on_progress=on_progress,
+            run_control=run_control,
         )
 
     progress("Generating llms.txt…")
@@ -1484,6 +1706,7 @@ def generate_docs(
     commit_count: Optional[int] = None,
     sync_remote: bool = True,
     concurrency: Optional[int] = None,
+    run_control: Optional[RunControl] = None,
 ) -> GenerateResult:
     app_repo_path = os.path.abspath(app_repo_path)
     docs_repo_path = os.path.abspath(docs_repo_path)
@@ -1612,6 +1835,35 @@ def generate_docs(
         )
 
     section_names = generate_section_names(manifest.changed_files, feature, skip_as_feature=skip_dirs)
+    allowed = allowed_feature_names(config)
+    if allowed and not feature:
+        filtered = [name for name in section_names if name in allowed]
+        if not filtered and is_full:
+            filtered = list(config.generation.features or [])
+        section_names = filtered
+        if not section_names and not is_full:
+            try:
+                mark_repo_documented(app_repo_path, docs_repo_path, included_commits, head_ref)
+            except Exception:
+                pass
+            return GenerateResult(
+                app_repo_path=app_repo_path,
+                docs_repo_path=docs_repo_path,
+                agent_mode=agent.mode,
+                agent_command=agent.command,
+                is_full=is_full,
+                base_ref=base_ref,
+                head_ref=head_ref,
+                task_type="update",
+                feature_name=feature or "",
+                prompt_file="",
+                no_changes=True,
+                commits=included_commits,
+                commit_count=included_count,
+                used_cursor=used_cursor,
+                watermark_stale=watermark_stale,
+                synced_remote=synced_remote,
+            )
     task_type = "full-regen" if is_full else "update"
     builder = PromptBuilder()
     runner = AgentRunner(mode=agent.mode, command_template=agent.command)
@@ -1695,6 +1947,7 @@ def generate_docs(
             concurrency=workers,
             capture_output=capture_output,
             on_progress=on_progress,
+            run_control=run_control,
         )
 
     if feature_runs:

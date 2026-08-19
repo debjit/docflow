@@ -251,6 +251,130 @@ def test_init_docs_custom_type_and_refuses_rerun(tmp_path, monkeypatch):
         pass
 
 
+def test_discover_skips_noisy_defaults(tmp_path):
+    from git import Repo
+
+    from docflow.core.git_analyzer import DEFAULT_IGNORE, GitAnalyzer
+    from docflow.core.operations import DEFAULT_DOC_TYPES, discover_init_sections, suggested_section_included
+
+    app = tmp_path / "app"
+    app.mkdir()
+    Repo.init(app)
+    (app / "README.md").write_text("# App\n")
+    (app / ".gitlab-ci.yml").write_text("image: php\n")
+    auth = app / "src" / "auth"
+    auth.mkdir(parents=True)
+    (auth / "login.py").write_text("def login():\n    return True\n")
+    github = app / ".github" / "workflows"
+    github.mkdir(parents=True)
+    (github / "ci.yml").write_text("name: ci\n")
+
+    analyzer = GitAnalyzer(str(app))
+    candidates = discover_init_sections(
+        analyzer,
+        DEFAULT_DOC_TYPES,
+        ignore_patterns=DEFAULT_IGNORE,
+        skip_dirs=set(),
+    )
+    names = {item.name for item in candidates if item.doc_type == "features"}
+    assert "github" not in names
+    assert "gitlab" not in names
+    assert "auth" in names
+    assert suggested_section_included("git") is False
+    assert suggested_section_included("auth") is True
+
+
+def test_init_docs_review_keeps_selection_and_extra(tmp_path, monkeypatch):
+    from git import Repo
+
+    from docflow.config.settings import DocFlowConfig
+    from docflow.core.operations import AgentSpec, SectionCandidate
+
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+
+    app = tmp_path / "app"
+    docs = tmp_path / "docs"
+    app.mkdir()
+    repo = Repo.init(app)
+    (app / "README.md").write_text("# App\n")
+    auth = app / "src" / "auth"
+    auth.mkdir(parents=True)
+    (auth / "login.py").write_text("def login():\n    return True\n")
+    payments = app / "payments"
+    payments.mkdir()
+    (payments / "charge.py").write_text("def charge():\n    return 1\n")
+    repo.index.add(["README.md", "src/auth/login.py", "payments/charge.py"])
+    repo.index.commit("init")
+    spec = AgentSpec(mode="manual", command="", name="manual")
+
+    def review(candidates):
+        for item in candidates:
+            item.included = item.name in {"architecture", "auth"}
+        candidates.append(
+            SectionCandidate(
+                doc_type="features",
+                name="payments",
+                included=True,
+                extra=True,
+            )
+        )
+        return candidates
+
+    result = init_docs(
+        app_repo_path=str(app),
+        docs_repo_path=str(docs),
+        agent=spec,
+        on_review_sections=review,
+    )
+    assert "architecture" in result.types
+    assert "features" in result.types
+    pending = docs / "prompts" / "pending"
+    assert (pending / "init-features-auth.md").exists()
+    assert (pending / "init-features-payments.md").exists()
+    assert not (pending / "init-features-core.md").exists()
+    saved = DocFlowConfig.load(docs_repo_path=str(docs))
+    assert "auth" in (saved.generation.features or [])
+    assert "payments" in (saved.generation.features or [])
+    assert "core" not in (saved.generation.features or [])
+
+
+def test_init_docs_cancel_writes_nothing(tmp_path, monkeypatch):
+    from git import Repo
+
+    from docflow.core.operations import AgentSpec, InitCancelled
+
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+
+    app = tmp_path / "app"
+    docs = tmp_path / "docs"
+    app.mkdir()
+    repo = Repo.init(app)
+    (app / "README.md").write_text("# App\n")
+    repo.index.add(["README.md"])
+    repo.index.commit("init")
+    spec = AgentSpec(mode="manual", command="", name="manual")
+
+    try:
+        init_docs(
+            app_repo_path=str(app),
+            docs_repo_path=str(docs),
+            agent=spec,
+            on_review_sections=lambda _candidates: None,
+        )
+        assert False, "expected InitCancelled"
+    except InitCancelled:
+        pass
+    assert not (docs / ".docflow.yml").exists()
+
+
 def test_generate_cursor_tracks_new_commits_only(tmp_path):
     from git import Repo
 

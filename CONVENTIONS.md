@@ -130,6 +130,8 @@ Imported files must not be overwritten on import. Updates to existing `index.md`
 
 When DocFlow detects a framework (Laravel first), it skips dependency and generated directories (`vendor/`, `storage/`, framework caches) and avoids creating feature modules for framework scaffolding (`bootstrap/`, `public/`).
 
+During init, DocFlow scans the app and shows a **section picker**. Agents must only document the sections the user kept. Git/CI/tooling folders should be left unchecked. Users may add extra module names or paths the scan missed.
+
 Agents must **document the application layered on the framework**, not the framework itself:
 - Do not write Laravel/Filament/Inertia/Vue/React tutorials or explain bootstrap, the container, or vendor packages.
 - Do document this project's models, controllers, policies, jobs, routes, migrations, Filament resources, Inertia pages, and Vue/React components.

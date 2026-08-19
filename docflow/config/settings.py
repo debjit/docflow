@@ -38,12 +38,19 @@ class PlatformSettings(BaseModel):
     notify_branch_owner: bool = True
 
 
+class ExtraFeatureSettings(BaseModel):
+    name: str
+    paths: List[str] = Field(default_factory=list)
+
+
 class GenerationSettings(BaseModel):
     skill_token_budget: int = 8000
     full_diff_threshold: int = 200
     concurrency: int = 4
     framework: str = "auto"  # auto | none | laravel
     ignore: List[str] = Field(default_factory=lambda: ["*.lock", "node_modules/", "dist/", "__pycache__/"])
+    features: Optional[List[str]] = None
+    extra_features: List[ExtraFeatureSettings] = Field(default_factory=list)
 
 
 class DocFlowConfig(BaseModel):

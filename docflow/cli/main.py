@@ -56,6 +56,10 @@ def cli(ctx: click.Context, repo: str, docs: str):
 @click.option("--import-from", default="", help="Path or folder to import (never overwrites).")
 @click.option("--import-into", default="", help="Doc type folder to import into.")
 @click.option("--doc-type", "doc_types", multiple=True, help="Repeatable type as name:description.")
+@click.option("--yes", is_flag=True, help="Skip the section picker and document suggested sections.")
+@click.option("--include", "include_sections", multiple=True, help="Section name to include (repeatable).")
+@click.option("--exclude", "exclude_sections", multiple=True, help="Section name to skip (repeatable).")
+@click.option("--extra", "extra_sections", multiple=True, help="Extra module name or path to document.")
 @click.option("--mode", type=click.Choice(["shell", "manual"]), help="Agent execution mode (advanced).")
 @click.option("--command", help="Custom shell command template (advanced).")
 def init(
@@ -68,6 +72,10 @@ def init(
     import_from: str,
     import_into: str,
     doc_types: tuple,
+    yes: bool,
+    include_sections: tuple,
+    exclude_sections: tuple,
+    extra_sections: tuple,
     mode: str,
     command: str,
 ):
@@ -83,6 +91,10 @@ def init(
         import_from=import_from,
         import_into=import_into,
         doc_types=doc_types,
+        yes=yes,
+        include_sections=include_sections,
+        exclude_sections=exclude_sections,
+        extra_sections=extra_sections,
     )
 
 

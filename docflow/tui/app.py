@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-import threading
+import re
 from collections import deque
 from typing import Optional
 
@@ -14,16 +14,20 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Header, Input, Label, LoadingIndicator, OptionList, Select, Static, TextArea
+from textual.widgets import Button, Footer, Header, Input, Label, LoadingIndicator, Log, OptionList, ProgressBar, Select, SelectionList, Static, TextArea
 from textual.widgets.option_list import Option
+from textual.widgets.selection_list import Selection
 
 from docflow.core.agent_runner import AGENT_PRESETS
+from docflow.core.job_runner import RunControl
 from docflow.core.operations import (
     AGENT_CHOICES,
     CURSOR_AGENT_KEYS,
     ConfigError,
     DEFAULT_CURSOR_MODEL,
     DEFAULT_DOC_TYPES,
+    InitCancelled,
+    SectionCandidate,
     agent_supports_models,
     default_docs_path,
     generate_docs,
@@ -38,8 +42,34 @@ from docflow.core.operations import (
     pull_app_repo,
     resolve_agent,
     resolve_paths,
+    selected_sections,
 )
 from docflow.core.projects import load_index, open_project
+
+_STATUS_RE = re.compile(
+    r"^(?:"
+    r"\[(?:\d+/\d+|failed|done|running)\b|"
+    r"Scanning |Writing |Running |Generating |Importing |Waiting |"
+    r"Creating |Including |Stack survey|git |Remote is |"
+    r"Setup |Update |Published|Pulled |Already |No sections"
+    r")",
+    re.IGNORECASE,
+)
+_FRACTION_RE = re.compile(r"\[(\d+)/(\d+)")
+
+
+def is_status_line(message: str) -> bool:
+    """True for DocFlow step lines; False for agent/tool stdout that belongs in Logs."""
+    stripped = (message or "").strip()
+    if not stripped:
+        return False
+    if "\n" in stripped and len(stripped) > 160:
+        return False
+    if len(stripped) > 240:
+        return False
+    if stripped.startswith(("✓", "✗", "•")):
+        return True
+    return bool(_STATUS_RE.match(stripped))
 
 
 def _agent_select_options():
@@ -347,6 +377,89 @@ class SetupScreen(ModalScreen[Optional[dict]]):
         )
 
 
+class SectionPickerScreen(ModalScreen[Optional[list]]):
+    """After scan: choose which discovered sections to document, and add extras."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, candidates: list, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._items = list(candidates)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label("What should DocFlow document?", classes="title")
+            yield Static(
+                "Space toggles a section. Uncheck git/CI/tooling. "
+                "Add a module name or path if the scan missed something.",
+                id="section-help",
+            )
+            yield SelectionList(id="section-list")
+            yield Label("Add a module name or path")
+            yield Input(placeholder="app/Services or payments", id="add-path")
+            with Horizontal(classes="buttons"):
+                yield Button("Add", id="add")
+                yield Button("Continue", variant="primary", id="ok")
+                yield Button("Cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        listing = self.query_one("#section-list", SelectionList)
+        listing.clear_options()
+        for i, item in enumerate(self._items):
+            listing.add_option(Selection(item.label, f"s{i}", item.included))
+
+    def _sync_included(self) -> None:
+        listing = self.query_one("#section-list", SelectionList)
+        selected = set(listing.selected)
+        for i, item in enumerate(self._items):
+            item.included = f"s{i}" in selected
+
+    def _add_extra(self) -> None:
+        raw = self.query_one("#add-path", Input).value.strip()
+        if not raw:
+            return
+        self._sync_included()
+        self._items.append(
+            SectionCandidate(
+                doc_type="features",
+                name=raw,
+                description=f"Extra section '{raw}'",
+                included=True,
+                extra=True,
+            )
+        )
+        self.query_one("#add-path", Input).value = ""
+        self._rebuild()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "add-path":
+            event.stop()
+            self._add_extra()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == "cancel":
+            self.dismiss(None)
+            return
+        if event.button.id == "add":
+            self._add_extra()
+            return
+        self._sync_included()
+        picked = selected_sections(self._items)
+        if not picked:
+            self.query_one("#section-help", Static).update(
+                "Select at least one section, or add a module/path."
+            )
+            return
+        self.dismiss(self._items)
+
+
 class ImportScreen(ModalScreen[Optional[dict]]):
     """Copy existing files into a type folder. Never overwrites."""
 
@@ -633,18 +746,58 @@ class DocFlowApp(App[None]):
         border: round $accent;
         margin: 1 1 0 1;
     }
+    #busy-row {
+        height: auto;
+        padding: 0 1;
+        margin-top: 1;
+    }
     #busy {
-        height: 1;
+        width: auto;
+        margin-right: 1;
+    }
+    #step {
+        width: 1fr;
+        height: auto;
+        color: $text-muted;
+    }
+    #run-progress {
+        width: 24;
+        margin-left: 1;
+    }
+    #main {
+        height: 1fr;
+    }
+    #work {
+        height: 1fr;
         margin: 0 1;
     }
-    #log-scroll {
-        margin: 1;
-        border: round $primary;
+    #progress-pane, #log-pane {
         height: 1fr;
-        padding: 0 1;
+        border: round $primary;
+        padding: 0 1 1 1;
+    }
+    #progress-pane {
+        width: 2fr;
+        margin-right: 1;
+    }
+    #log-pane {
+        width: 3fr;
+    }
+    .pane-title {
+        text-style: bold;
+        height: 1;
+        margin: 0 0 1 0;
+    }
+    #progress-scroll {
+        height: 1fr;
+    }
+    #progress {
+        height: auto;
     }
     #log {
-        height: auto;
+        height: 1fr;
+        background: $surface;
+        padding: 0;
     }
     #actions {
         height: auto;
@@ -667,7 +820,17 @@ class DocFlowApp(App[None]):
         text-style: bold;
         margin-bottom: 1;
     }
-    #dialog Input, #dialog Select, #dialog TextArea, #preview, #model-picker {
+    #dialog Input, #dialog Select, #dialog TextArea, #preview, #model-picker, #section-list {
+        margin-bottom: 1;
+    }
+    #section-list {
+        height: 16;
+        border: tall $border-blurred;
+        background: $surface;
+        padding: 0 1;
+    }
+    #section-help {
+        color: $text-muted;
         margin-bottom: 1;
     }
     #dialog TextArea {
@@ -706,6 +869,7 @@ class DocFlowApp(App[None]):
         Binding("i", "setup", "Setup"),
         Binding("s", "switch", "Switch"),
         Binding("m", "mcp", "MCP"),
+        Binding("f8", "toggle_pause", "Pause/Resume"),
         Binding("q", "quit", "Quit"),
     ]
 
@@ -722,59 +886,161 @@ class DocFlowApp(App[None]):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        yield Static("Loading…", id="summary")
-        yield LoadingIndicator(id="busy")
-        with VerticalScroll(id="log-scroll"):
-            yield Static("Ready. Press u to pull, g to update docs from new commits.", id="log")
-        with Horizontal(id="actions"):
-            yield Button("Setup", id="btn-setup")
-            yield Button("Pull", id="btn-pull")
-            yield Button("Update docs", variant="primary", id="btn-generate")
-            yield Button("Publish", id="btn-publish")
-            yield Button("MCP (SSE)", id="btn-mcp")
-            yield Button("Refresh", id="btn-refresh")
-            yield Button("Switch", id="btn-switch")
+        with Vertical(id="main"):
+            yield Static("Loading…", id="summary")
+            with Horizontal(id="busy-row"):
+                yield LoadingIndicator(id="busy")
+                yield Static("Ready", id="step")
+                yield ProgressBar(id="run-progress", total=None, show_eta=False, show_percentage=False)
+            with Horizontal(id="work"):
+                with Vertical(id="progress-pane"):
+                    yield Static("Progress", classes="pane-title", id="progress-title")
+                    with VerticalScroll(id="progress-scroll"):
+                        yield Static("Ready. Press u to pull, g to update docs from new commits.", id="progress")
+                with Vertical(id="log-pane"):
+                    yield Static("Logs", classes="pane-title", id="log-title")
+                    yield Log(id="log", highlight=False, max_lines=500)
+            with Horizontal(id="actions"):
+                yield Button("Setup", id="btn-setup")
+                yield Button("Pull", id="btn-pull")
+                yield Button("Update docs", variant="primary", id="btn-generate")
+                yield Button("Publish", id="btn-publish")
+                yield Button("MCP (SSE)", id="btn-mcp")
+                yield Button("Refresh", id="btn-refresh")
+                yield Button("Switch", id="btn-switch")
+                yield Button("Pause", id="btn-pause", disabled=True)
         yield Footer()
 
     def on_mount(self) -> None:
-        self._lines: deque[str] = deque(maxlen=400)
+        self._progress_lines: deque[str] = deque(maxlen=80)
+        self._log_lines: deque[str] = deque(maxlen=500)
+        self._paused_progress: list[str] = []
+        self._paused_logs: list[str] = []
+        self._run_control = RunControl()
+        self._busy = False
         self.query_one("#busy", LoadingIndicator).display = False
+        self.query_one("#run-progress", ProgressBar).display = False
         self.sub_title = "Ready"
         self.refresh_summary()
 
     def _short(self, message: str) -> str:
         return message.strip().split("\n")[0][:90]
 
-    def _render_log(self) -> None:
-        text = "\n".join(self._lines) if self._lines else ""
-        self.query_one("#log", Static).update(text)
+    def _render_progress(self) -> None:
+        text = "\n".join(self._progress_lines) if self._progress_lines else ""
+        self.query_one("#progress", Static).update(text or "—")
+
+    def _set_step(self, message: str) -> None:
+        short = self._short(message) if message else "Ready"
+        self.query_one("#step", Static).update(short)
+        self.sub_title = short
+
+    def _update_fraction(self, message: str) -> None:
+        bar = self.query_one("#run-progress", ProgressBar)
+        match = _FRACTION_RE.search(message or "")
+        if match:
+            current, total = int(match.group(1)), int(match.group(2))
+            bar.display = True
+            bar.update(total=max(total, 1), progress=min(current, total))
+        elif self._busy:
+            bar.display = True
+
+    def _append_progress(self, message: str) -> None:
+        line = message.strip()
+        if not line:
+            return
+        self._progress_lines.append(line)
+        self._set_step(line)
+        self._update_fraction(line)
+        if self._run_control.paused:
+            self._paused_progress.append(line)
+            return
+        self._render_progress()
+        self.query_one("#progress-scroll", VerticalScroll).scroll_end(animate=False)
+
+    def _append_log(self, message: str) -> None:
+        for line in message.splitlines() or [message]:
+            text = line.rstrip()
+            if not text:
+                continue
+            self._log_lines.append(text)
+            if self._run_control.paused:
+                self._paused_logs.append(text)
+                continue
+            self.query_one("#log", Log).write_line(text)
 
     def _log(self, message: str) -> None:
-        for line in reversed(message.strip().splitlines() or [message]):
-            self._lines.appendleft(line)
-        self._render_log()
-        self.query_one("#log-scroll", VerticalScroll).scroll_home(animate=False)
+        self._append_log(message)
 
     def _progress(self, message: str) -> None:
-        self.sub_title = self._short(message)
-        self._log(message)
+        if is_status_line(message):
+            self._append_progress(message)
+        else:
+            self._append_log(message)
 
     def _thread_progress(self, message: str) -> None:
         self.call_from_thread(self._progress, message)
 
     def _begin_run(self, title: str) -> None:
-        self._lines.clear()
-        self._render_log()
-        self.sub_title = title
+        self._progress_lines.clear()
+        self._log_lines.clear()
+        self._paused_progress.clear()
+        self._paused_logs.clear()
+        self._run_control.resume()
+        self._render_progress()
+        self.query_one("#log", Log).clear()
+        self._append_progress(title)
         self._set_busy(True)
 
     def _finish_run(self, summary: str) -> None:
-        self.sub_title = self._short(summary)
+        if self._run_control.paused:
+            self._resume_output()
+        self._append_progress(summary)
         self._set_busy(False)
-        self._log(summary)
+
+    def _pause_output(self) -> None:
+        if not self._busy or self._run_control.paused:
+            return
+        self._run_control.pause()
+        self.query_one("#btn-pause", Button).label = "Resume"
+        self.query_one("#log-title", Static).update("Logs  (paused — F8 or Resume)")
+        self.query_one("#progress-title", Static).update("Progress  (paused)")
+
+    def _resume_output(self) -> None:
+        if not self._run_control.paused:
+            return
+        self._run_control.resume()
+        if self._paused_progress:
+            self._render_progress()
+            self.query_one("#progress-scroll", VerticalScroll).scroll_end(animate=False)
+            self._paused_progress.clear()
+        if self._paused_logs:
+            self.query_one("#log", Log).write_lines(self._paused_logs)
+            self._paused_logs.clear()
+        self.query_one("#btn-pause", Button).label = "Pause"
+        self.query_one("#log-title", Static).update("Logs")
+        self.query_one("#progress-title", Static).update("Progress")
+
+    def action_toggle_pause(self) -> None:
+        if not self._busy:
+            return
+        if self._run_control.paused:
+            self._resume_output()
+        else:
+            self._pause_output()
 
     def _set_busy(self, busy: bool) -> None:
+        self._busy = busy
         self.query_one("#busy", LoadingIndicator).display = busy
+        bar = self.query_one("#run-progress", ProgressBar)
+        bar.display = busy
+        if not busy:
+            self._run_control.resume()
+            self.query_one("#btn-pause", Button).label = "Pause"
+            self.query_one("#log-title", Static).update("Logs")
+            self.query_one("#progress-title", Static).update("Progress")
+        pause_btn = self.query_one("#btn-pause", Button)
+        pause_btn.disabled = not busy
         for button_id in ("btn-setup", "btn-pull", "btn-generate", "btn-publish", "btn-mcp", "btn-refresh", "btn-switch"):
             self.query_one(f"#{button_id}", Button).disabled = busy
 
@@ -816,6 +1082,7 @@ class DocFlowApp(App[None]):
             "btn-mcp": self.action_mcp,
             "btn-refresh": self.action_refresh,
             "btn-switch": self.action_switch,
+            "btn-pause": self.action_toggle_pause,
         }
         action = mapping.get(event.button.id or "")
         if action:
@@ -894,7 +1161,16 @@ class DocFlowApp(App[None]):
         )
         if spec is None:
             spec = resolve_agent(agent="manual")
-        self._begin_run("Setup running…")
+        self._begin_run("Scanning the app repo…")
+        loop = asyncio.get_running_loop()
+
+        def review(candidates):
+            future = asyncio.run_coroutine_threadsafe(
+                self.push_screen_wait(SectionPickerScreen(list(candidates))),
+                loop,
+            )
+            return future.result()
+
         try:
             result = await asyncio.to_thread(
                 init_docs,
@@ -906,7 +1182,12 @@ class DocFlowApp(App[None]):
                 types=data["types"],
                 import_from=data.get("import_from") or None,
                 import_into=data.get("import_into") or None,
+                on_review_sections=review,
+                run_control=self._run_control,
             )
+        except InitCancelled as exc:
+            self._finish_run(str(exc))
+            return
         except Exception as exc:
             self._finish_run(f"Setup failed: {exc}")
             return
@@ -1011,6 +1292,7 @@ class DocFlowApp(App[None]):
                 capture_output=True,
                 on_progress=self._thread_progress,
                 commit_count=data.get("commit_count"),
+                run_control=self._run_control,
             )
         except Exception as exc:
             self._finish_run(f"Update failed: {exc}")
@@ -1044,6 +1326,7 @@ class DocFlowApp(App[None]):
                     on_progress=self._thread_progress,
                     commit_count=1,
                     sync_remote=False,
+                    run_control=self._run_control,
                 )
             except Exception as exc:
                 self._finish_run(f"Regenerate failed: {exc}")

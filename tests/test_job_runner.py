@@ -44,6 +44,48 @@ def test_run_jobs_progress_running_done_failed():
     assert "nope" in text
 
 
+def test_run_jobs_pause_blocks_next_job():
+    from threading import Event
+    from docflow.core.job_runner import Job, RunControl, run_jobs
+
+    control = RunControl()
+    started = Event()
+    release = Event()
+    order = []
+
+    def first():
+        order.append("first")
+        control.pause()
+        started.set()
+        release.wait(timeout=2)
+        return "a"
+
+    def second():
+        order.append("second")
+        return "b"
+
+    jobs = [Job(key="a", run=first), Job(key="b", run=second)]
+    from threading import Thread
+
+    result = []
+
+    def worker():
+        result.extend(run_jobs(jobs, concurrency=1, auto_retry=False, run_control=control))
+
+    thread = Thread(target=worker)
+    thread.start()
+    assert started.wait(timeout=2)
+    assert order == ["first"]
+    release.set()
+    thread.join(timeout=0.3)
+    assert thread.is_alive()
+    control.resume()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert result == ["a", "b"]
+    assert order == ["first", "second"]
+
+
 def test_default_concurrency_reads_env(monkeypatch):
     monkeypatch.delenv("DOCFLOW_JOBS", raising=False)
     assert default_concurrency() == 4
