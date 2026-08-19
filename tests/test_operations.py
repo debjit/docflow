@@ -540,3 +540,33 @@ def test_pull_without_origin_reports_failure(tmp_path):
     result = pull_app_repo(str(app), str(tmp_path / "docs"))
     assert result.success is False
     assert result.output
+
+
+def test_picker_group_labels_and_toggle():
+    from docflow.core.operations import (
+        SectionCandidate,
+        kind_heading,
+        kind_item_label,
+        resolve_picker_group,
+        toggle_group_included,
+    )
+
+    assert kind_heading("models") == "Eloquent models"
+    assert kind_heading("database") == "Migrations"
+    assert kind_item_label("model") == "Eloquent model"
+    user = SectionCandidate(doc_type="models", name="user", title="User", kind="model")
+    assert user.label == "User  (Eloquent model)"
+
+    migrations = [
+        SectionCandidate(doc_type="database", name="users-table", title="users", kind="migration", included=True),
+        SectionCandidate(doc_type="database", name="posts-table", title="posts", kind="migration", included=True),
+        SectionCandidate(doc_type="models", name="user", title="User", kind="model", included=True),
+    ]
+    assert resolve_picker_group("migrations", ["database", "models"]) == "database"
+    assert toggle_group_included(migrations, "database") is True
+    assert migrations[0].included is False
+    assert migrations[1].included is False
+    assert migrations[2].included is True
+    toggle_group_included(migrations, "database")
+    assert migrations[0].included is True
+    assert migrations[1].included is True

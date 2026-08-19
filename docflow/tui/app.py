@@ -40,6 +40,7 @@ from docflow.core.operations import (
     list_app_branches,
     list_recent_commits,
     parse_doc_types_text,
+    picker_group,
     publish_docs,
     pull_app_repo,
     resolve_agent,
@@ -387,13 +388,16 @@ class SectionPickerScreen(ModalScreen[Optional[list]]):
     def __init__(self, candidates: list, **kwargs) -> None:
         super().__init__(**kwargs)
         self._items = list(candidates)
+        self._syncing = False
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
             yield Label("Review the agent's documentation list", classes="title")
             yield Static(
                 "These are the units the agent recommended from composer/packages. "
-                "Uncheck anything to skip. Add a file path if something important is missing. "
+                "Toggle a group heading to select or skip every item in that group "
+                "(for example all migrations), then re-check any you still want. "
+                "Add a file path if something important is missing. "
                 "Git, GitLab, and CI are never listed.",
                 id="section-help",
             )
@@ -412,12 +416,46 @@ class SectionPickerScreen(ModalScreen[Optional[list]]):
         listing = self.query_one("#section-list", SelectionList)
         listing.clear_options()
         for kind, indices in group_candidates(self._items):
+            group_on = bool(indices) and all(self._items[i].included for i in indices)
             listing.add_option(
-                Selection(f"── {kind_heading(kind)} ──", f"h-{kind}", False, disabled=True)
+                Selection(f"── {kind_heading(kind)} ──  (all)", f"g-{kind}", group_on)
             )
             for i in indices:
                 item = self._items[i]
                 listing.add_option(Selection(item.label, f"s{i}", item.included))
+
+    def _set_value(self, listing: SelectionList, value: str, selected: bool) -> None:
+        if selected:
+            listing.select(value)
+        else:
+            listing.deselect(value)
+
+    def on_selection_list_selection_toggled(self, event: SelectionList.SelectionToggled) -> None:
+        if self._syncing:
+            return
+        listing = event.selection_list
+        value = str(event.selection.value)
+        selected = set(listing.selected)
+        self._syncing = True
+        try:
+            if value.startswith("g-"):
+                kind = value[2:]
+                want = value in selected
+                for i, item in enumerate(self._items):
+                    if picker_group(item) != kind:
+                        continue
+                    self._set_value(listing, f"s{i}", want)
+                return
+            if value.startswith("s"):
+                index = int(value[1:])
+                kind = picker_group(self._items[index])
+                indices = [
+                    i for i, item in enumerate(self._items) if picker_group(item) == kind
+                ]
+                group_on = bool(indices) and all(f"s{i}" in selected for i in indices)
+                self._set_value(listing, f"g-{kind}", group_on)
+        finally:
+            self._syncing = False
 
     def _sync_included(self) -> None:
         listing = self.query_one("#section-list", SelectionList)

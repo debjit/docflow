@@ -76,6 +76,10 @@ async def test_section_picker_lists_candidates_and_add_input():
             screen for screen in app.screen_stack if screen.__class__.__name__ == "SectionPickerScreen"
         )
         assert picker.query_one("#section-list")
+        listing = picker.query_one("#section-list")
+        values = [opt.value for opt in listing._options]
+        assert "g-architecture" in values
+        assert "s0" in values
         assert picker.query_one("#add-path")
         assert picker.query_one("#ok")
         assert picker.query_one("#add")

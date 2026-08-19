@@ -33,6 +33,8 @@ from docflow.core.operations import (
     import_docs,
     init_docs,
     kind_heading,
+    resolve_picker_group,
+    toggle_group_included,
     list_app_branches,
     list_agent_models,
     parse_doc_type,
@@ -182,23 +184,31 @@ def collect_import(
     return "", ""
 
 
-def _print_section_candidates(candidates: Sequence[SectionCandidate]) -> List[int]:
+def _print_section_candidates(
+    candidates: Sequence[SectionCandidate],
+) -> tuple[List[int], List[str]]:
     ux.console.print("\n[bold]Agent recommendations — remove or add before writing docs[/bold]")
     ux.console.print(
-        "[dim]Number toggles one item off/on. Git, GitLab, and CI are not listed. "
-        "Add a file path if something important is missing.[/dim]"
+        "[dim]Number toggles one item. g1 / migrations / models toggles a whole group. "
+        "Git, GitLab, and CI are not listed. Add a file path if something is missing.[/dim]"
     )
     order: List[int] = []
-    for kind, indices in group_candidates(candidates):
-        ux.console.print(f"\n[bold]{kind_heading(kind)}[/bold]")
+    groups: List[str] = []
+    for gi, (kind, indices) in enumerate(group_candidates(candidates), start=1):
+        groups.append(kind)
+        all_on = all(candidates[i].included for i in indices)
+        mark = "[green]Y[/green]" if all_on else "[red]N[/red]"
+        ux.console.print(
+            f"\n  [cyan]g{gi}[/cyan]. [{mark}] [bold]{kind_heading(kind)}[/bold]  [dim](all)[/dim]"
+        )
         for i in indices:
             order.append(i)
             item = candidates[i]
-            mark = "[green]Y[/green]" if item.included else "[red]N[/red]"
-            ux.console.print(f"  [cyan]{len(order)}[/cyan]. [{mark}] {item.label}")
+            item_mark = "[green]Y[/green]" if item.included else "[red]N[/red]"
+            ux.console.print(f"      [cyan]{len(order)}[/cyan]. [{item_mark}] {item.label}")
     included = len(selected_sections(candidates))
     ux.console.print(f"\n[dim]{included}/{len(candidates)} selected[/dim]")
-    return order
+    return order, groups
 
 
 def review_init_sections(
@@ -210,10 +220,11 @@ def review_init_sections(
         return []
     items = list(candidates)
     while True:
-        order = _print_section_candidates(items)
+        order, groups = _print_section_candidates(items)
         ux.console.print(
-            "  [cyan]number[/cyan] toggle one item   [cyan]a[/cyan] add   "
-            "[cyan]all[/cyan]/[cyan]none[/cyan]   [cyan]done[/cyan] continue   [cyan]q[/cyan] cancel"
+            "  [cyan]number[/cyan] one item   [cyan]g1[/cyan] / [cyan]migrations[/cyan] a group   "
+            "[cyan]a[/cyan] add   [cyan]all[/cyan]/[cyan]none[/cyan]   "
+            "[cyan]done[/cyan] continue   [cyan]q[/cyan] cancel"
         )
         choice = Prompt.ask("Item", default="done").strip().lower()
         if choice in ("", "done", "y", "yes"):
@@ -251,12 +262,21 @@ def review_init_sections(
             items.append(extra)
             ux.console.print(f"  Added [cyan]{extra.display_name}[/cyan].")
             continue
+        if choice.startswith("g") and choice[1:].isdigit():
+            index = int(choice[1:]) - 1
+            if 0 <= index < len(groups):
+                toggle_group_included(items, groups[index])
+            continue
+        grouped = resolve_picker_group(choice, groups)
+        if grouped is not None:
+            toggle_group_included(items, grouped)
+            continue
         if choice.isdigit():
             index = int(choice) - 1
             if 0 <= index < len(order):
                 items[order[index]].included = not items[order[index]].included
             continue
-        ux.print_warning("Use a number, a, all, none, done, or q.")
+        ux.print_warning("Use a number, g1, a group name, a, all, none, done, or q.")
 
 
 def _cli_progress(message: str) -> None:

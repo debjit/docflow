@@ -264,9 +264,7 @@ class SectionCandidate:
     @property
     def label(self) -> str:
         kind = self.kind or self.doc_type
-        if self.doc_type != "features":
-            return f"{self.display_name}  ({kind})"
-        return f"{self.display_name}  ({kind})"
+        return f"{self.display_name}  ({kind_item_label(kind)})"
 
     def to_chunk(self) -> FeatureChunk:
         desc = self.description or f"{self.kind or 'feature'}: {self.display_name}"
@@ -462,15 +460,15 @@ def selected_sections(candidates: Sequence[SectionCandidate]) -> List[SectionCan
 KIND_HEADINGS = {
     "architecture": "Architecture",
     "overview": "Architecture",
-    "database": "Database",
-    "models": "Models",
+    "database": "Migrations",
+    "models": "Eloquent models",
     "functions": "Functions",
     "routes": "Routes",
     "pages": "Pages",
     "features": "Features",
     "other": "Also important",
-    "model": "Models",
-    "migration": "Database",
+    "model": "Eloquent models",
+    "migration": "Migrations",
     "filament-resource": "Pages",
     "filament-page": "Pages",
     "controller": "Functions",
@@ -485,12 +483,77 @@ KIND_HEADINGS = {
     "module": "Functions",
 }
 
+KIND_ITEM_LABELS = {
+    "model": "Eloquent model",
+    "models": "Eloquent model",
+    "migration": "migration",
+    "database": "migration",
+    "architecture": "architecture",
+    "overview": "architecture",
+    "filament-resource": "Filament resource",
+    "filament-page": "Filament page",
+    "controller": "controller",
+    "function": "function",
+    "functions": "function",
+    "page": "page",
+    "pages": "page",
+    "route": "route",
+    "routes": "route",
+    "module": "function",
+}
+
 
 def kind_heading(kind: str) -> str:
     key = (kind or "").strip().lower()
     if key in KIND_HEADINGS:
         return KIND_HEADINGS[key]
     return (kind or "other").replace("-", " ").title() or "Other"
+
+
+def kind_item_label(kind: str) -> str:
+    key = (kind or "").strip().lower()
+    if key in KIND_ITEM_LABELS:
+        return KIND_ITEM_LABELS[key]
+    return key.replace("-", " ") or "item"
+
+
+def group_match_keys(kind: str) -> set:
+    heading = kind_heading(kind).lower()
+    keys = {
+        kind.lower(),
+        heading,
+        heading.replace(" ", "-"),
+        heading.replace(" ", ""),
+    }
+    extras = {
+        "database": {"migrations", "migration", "db"},
+        "migration": {"migrations", "database", "db"},
+        "models": {"model", "eloquent", "eloquent-models", "eloquent models"},
+        "model": {"models", "eloquent"},
+    }
+    keys.update(extras.get(kind.lower(), set()))
+    return keys
+
+
+def resolve_picker_group(query: str, groups: Sequence[str]) -> Optional[str]:
+    text = (query or "").strip().lower()
+    if not text:
+        return None
+    for kind in groups:
+        if text in group_match_keys(kind):
+            return kind
+    return None
+
+
+def toggle_group_included(candidates: Sequence[SectionCandidate], group: str) -> bool:
+    """Select all in a picker group, or deselect all if every item is already on."""
+    indices = [i for i, item in enumerate(candidates) if picker_group(item) == group]
+    if not indices:
+        return False
+    want = not all(candidates[i].included for i in indices)
+    for i in indices:
+        candidates[i].included = want
+    return True
 
 
 def picker_group(item: SectionCandidate) -> str:

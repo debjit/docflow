@@ -224,5 +224,5 @@ def test_discover_uses_agent_items_not_folders(tmp_path):
         },
     )
     models = [item for item in candidates if item.doc_type == "models"]
-    assert [item.label for item in models] == ["User  (model)"]
+    assert [item.label for item in models] == ["User  (Eloquent model)"]
     assert models[0].file_paths == ["app/Models/User.php"]
