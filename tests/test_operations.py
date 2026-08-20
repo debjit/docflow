@@ -154,6 +154,30 @@ def test_resolve_agent_uses_saved_config():
     spec = resolve_agent(config=cfg)
     assert spec is not None
     assert spec.command == AGENT_PRESETS["opencode"]
+    assert spec.name == "opencode"
+
+
+def test_saved_agent_name_and_model_are_reused():
+    from docflow.core.operations import (
+        agent_key_from_command,
+        infer_agent_model,
+        infer_agent_name,
+        remember_agent,
+    )
+
+    flagged = apply_agent_model(resolve_agent(agent="cursor-agent"), "composer-2.5")
+    assert agent_key_from_command(flagged.command) == "cursor-agent"
+    cfg = DocFlowConfig()
+    cfg.source_path = "/tmp/.docflow/config.yml"
+    remember_agent(cfg, flagged)
+    assert cfg.agent.name == "cursor-agent"
+    assert cfg.agent.model == "composer-2.5"
+    assert infer_agent_name(cfg) == "cursor-agent"
+    assert infer_agent_model(cfg) == "composer-2.5"
+    reused = resolve_agent(config=cfg)
+    assert reused is not None
+    assert reused.name == "cursor-agent"
+    assert "--model composer-2.5" in reused.command
 
 
 def test_resolve_agent_ignores_defaults_without_file():

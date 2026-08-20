@@ -55,7 +55,12 @@ def print_dashboard(dash: Dashboard) -> None:
         f"[cyan]{dash.docs_repo_path or 'not set'}[/cyan] "
         f"({'exists' if dash.docs_exists else 'missing'})",
     )
-    table.add_row("Agent", f"[yellow]{dash.agent_mode}[/yellow]  {dash.agent_command or 'manual'}")
+    table.add_row(
+        "Agent",
+        f"[yellow]{dash.agent_name or dash.agent_mode}[/yellow]"
+        + (f"  [cyan]{dash.agent_model}[/cyan]" if getattr(dash, "agent_model", "") else "")
+        + f"  {dash.agent_command or 'manual'}",
+    )
     table.add_row(
         "Parallel agents",
         f"[cyan]{getattr(dash, 'concurrency', 1)}[/cyan]  (1 is safest)",

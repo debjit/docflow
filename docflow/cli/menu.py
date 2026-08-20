@@ -29,6 +29,8 @@ from docflow.core.operations import (
     default_docs_path,
     generate_docs,
     get_dashboard,
+    infer_agent_model,
+    infer_agent_name,
     group_candidates,
     import_docs,
     init_docs,
@@ -46,7 +48,7 @@ from docflow.core.operations import (
 )
 
 
-def pick_agent(default_key: str = "agy"):
+def pick_agent(default_key: str = "agy", default_model: str = ""):
     ux.console.print("\n[bold]How should DocFlow run your coding agent?[/bold]")
     keys = []
     for i, (key, label) in enumerate(AGENT_CHOICES, start=1):
@@ -62,7 +64,7 @@ def pick_agent(default_key: str = "agy"):
         )
         return resolve_agent(command=cmd)
     spec = resolve_agent(agent=key)
-    return pick_model(spec)
+    return pick_model(spec, model=default_model if key == default_key else "")
 
 
 def pick_model(spec, model: str = ""):
@@ -131,7 +133,10 @@ def ensure_paths(repo: str, docs: str, prompt_missing: bool = True):
 def ensure_agent(paths, agent: Optional[str] = None, mode: Optional[str] = None, command: Optional[str] = None):
     spec = resolve_agent(agent=agent, mode=mode, command=command, config=paths.config)
     if spec is None:
-        spec = pick_agent()
+        spec = pick_agent(
+            default_key=infer_agent_name(paths.config) or "agy",
+            default_model=infer_agent_model(paths.config),
+        )
     if spec is None:
         raise click.Abort()
     return spec
@@ -354,7 +359,12 @@ def run_init(repo: str = "", docs: str = "", agent: Optional[str] = None,
     except (AlreadyInitialized, ConfigError) as exc:
         ux.print_error(str(exc))
         raise click.Abort()
-    spec = resolve_agent(agent=agent, mode=mode, command=command, config=paths.config, model=model) or pick_agent()
+    spec = resolve_agent(
+        agent=agent, mode=mode, command=command, config=paths.config, model=model
+    ) or pick_agent(
+        default_key=infer_agent_name(paths.config) or "agy",
+        default_model=infer_agent_model(paths.config),
+    )
     types = collect_doc_types(doc_types)
     source, into = collect_import(types, import_from, import_into, import_existing)
     reviewer = review_init_sections if sys.stdout.isatty() and not yes else None
@@ -509,7 +519,7 @@ def maybe_regen_last_docs(paths, spec, result, feature: str = "") -> None:
         ux.console.print("[dim]Exiting without regenerating.[/dim]")
         return
     default_key = spec.name if spec and spec.name in {key for key, _ in AGENT_CHOICES} else "agy"
-    spec = pick_agent(default_key=default_key)
+    spec = pick_agent(default_key=default_key, default_model=infer_agent_model(paths.config))
     if spec is None:
         return
     try:

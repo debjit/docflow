@@ -740,6 +740,8 @@ class Dashboard:
     last_documented: Optional[CommitInfo] = None
     new_commits: List[CommitInfo] = field(default_factory=list)
     concurrency: int = 1
+    agent_name: str = ""
+    agent_model: str = ""
 
 
 @dataclass
@@ -808,6 +810,71 @@ AGY_GROUP_LABELS = {
 _MODEL_FLAG = re.compile(
     r"\s+--model(?:\s+|=)(?:'(?:\\'|[^'])*'|\"(?:\\\"|[^\"])*\"|\S+)"
 )
+_MODEL_VALUE = re.compile(
+    r"--model(?:\s+|=)('(?:\\'|[^'])*'|\"(?:\\\"|[^\"])*\"|\S+)"
+)
+
+
+def command_without_model(command: str) -> str:
+    return re.sub(r"\s+", " ", _MODEL_FLAG.sub("", command or "")).strip()
+
+
+def model_from_command(command: str) -> str:
+    match = _MODEL_VALUE.search(command or "")
+    if not match:
+        return ""
+    raw = match.group(1).strip()
+    if len(raw) >= 2 and raw[0] in {"'", '"'} and raw[-1] == raw[0]:
+        return raw[1:-1]
+    return raw
+
+
+def agent_key_from_command(command: str) -> str:
+    """Map a saved shell command back to an AGENT_CHOICES key."""
+    cmd = command_without_model(command)
+    if not cmd:
+        return ""
+    matches = [
+        key
+        for key, preset in AGENT_PRESETS.items()
+        if key not in {"manual", "cursor"} and command_without_model(preset) == cmd
+    ]
+    if matches:
+        return matches[0]
+    first = cmd.split()[0]
+    aliases = {"agent": "cursor-agent", "agy": "agy", "claude": "claude", "cline": "cline", "opencode": "opencode"}
+    return aliases.get(first, "")
+
+
+def infer_agent_name(config: Optional[DocFlowConfig]) -> str:
+    if config is None:
+        return ""
+    name = (config.agent.name or "").strip().lower()
+    if name and name not in {"saved", "shell"}:
+        return name
+    if (config.agent.mode or "").lower() == "manual":
+        return "manual"
+    return agent_key_from_command(config.agent.command or "")
+
+
+def infer_agent_model(config: Optional[DocFlowConfig]) -> str:
+    if config is None:
+        return ""
+    saved = (config.agent.model or "").strip()
+    if saved:
+        return saved
+    return model_from_command(config.agent.command or "")
+
+
+def remember_agent(config: DocFlowConfig, spec: AgentSpec) -> None:
+    """Keep the last agent + model so the next run can reuse them."""
+    name = spec.name if spec.name not in {"saved", "shell", ""} else agent_key_from_command(spec.command)
+    if spec.mode == "manual":
+        name = "manual"
+    config.agent.mode = spec.mode
+    config.agent.command = spec.command
+    config.agent.name = name or infer_agent_name(config)
+    config.agent.model = model_from_command(spec.command)
 
 
 def project_root() -> str:
@@ -1090,17 +1157,24 @@ def resolve_agent(
             spec = AgentSpec(mode="manual", command="", name="manual")
         else:
             cfg_cmd = (config.agent.command if config else "") or AGENT_PRESETS["agy"]
-            spec = AgentSpec(mode=mode, command=cfg_cmd, name="shell")
+            spec = AgentSpec(mode=mode, command=cfg_cmd, name=infer_agent_name(config) or "shell")
     elif config and config.source_path:
+        name = infer_agent_name(config)
         saved_mode = (config.agent.mode or "manual").lower()
-        if saved_mode == "manual":
+        if name == "manual" or saved_mode == "manual":
             spec = AgentSpec(mode="manual", command="", name="manual")
+        elif name == "custom":
+            spec = AgentSpec(mode="shell", command=config.agent.command or "", name="custom")
+        elif name and name in AGENT_PRESETS:
+            spec = AgentSpec(mode="shell", command=AGENT_PRESETS[name], name=name)
         else:
             spec = AgentSpec(
-                mode=saved_mode,
+                mode=saved_mode if saved_mode in {"shell", "manual"} else "shell",
                 command=config.agent.command or AGENT_PRESETS["agy"],
-                name="saved",
+                name=name or "saved",
             )
+        if not model:
+            model = infer_agent_model(config)
     if spec is None:
         return None
     if model:
@@ -1736,6 +1810,8 @@ def get_dashboard(repo: Optional[str] = None, docs: Optional[str] = None) -> Das
         last_documented=last_documented,
         new_commits=new_commits,
         concurrency=clamp_concurrency(cfg.generation.concurrency, 1),
+        agent_name=infer_agent_name(cfg),
+        agent_model=infer_agent_model(cfg),
     )
 
 
@@ -1775,6 +1851,7 @@ def init_docs(
     config.docs.repo_path = docs_repo_path
     config.agent.mode = agent.mode
     config.agent.command = agent.command
+    remember_agent(config, agent)
     chosen_types = types or configured_types(config)
     if not chosen_types:
         chosen_types = list(DEFAULT_DOC_TYPES)
@@ -2042,8 +2119,11 @@ def generate_docs(
     app_repo_path = os.path.abspath(app_repo_path)
     docs_repo_path = os.path.abspath(docs_repo_path)
     config = config or DocFlowConfig.load(docs_repo_path=docs_repo_path)
+    remember_agent(config, agent)
     if concurrency is not None:
         config.generation.concurrency = clamp_concurrency(concurrency, 1)
+        save_project_config(config, app_repo_path, docs_repo_path)
+    elif config.source_path or config.docs.repo_path:
         save_project_config(config, app_repo_path, docs_repo_path)
 
     is_full = full

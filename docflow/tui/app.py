@@ -46,6 +46,7 @@ from docflow.core.operations import (
     resolve_agent,
     resolve_paths,
     selected_sections,
+    command_without_model,
 )
 from docflow.core.projects import load_index, open_project, remove_project
 
@@ -81,13 +82,17 @@ def _agent_select_options():
 
 def _agent_key_from_dash(dash) -> str:
     """Map saved agent config to a Select value."""
+    name = (getattr(dash, "agent_name", "") or "").strip()
+    select_keys = {key for key, _ in AGENT_CHOICES if key != "custom"}
+    if name in select_keys:
+        return name
     if not dash.configured or dash.agent_mode == "manual":
         return "manual"
     cmd = dash.agent_command or ""
-    select_keys = {key for key, _ in AGENT_CHOICES if key != "custom"}
     for key, preset in AGENT_PRESETS.items():
-        if key in select_keys and cmd == preset:
-            return key
+        if key in select_keys and command_without_model(cmd) == command_without_model(preset):
+            if key != "cursor":
+                return key
     return "agy"
 
 
@@ -232,7 +237,11 @@ async def _load_models(screen, agent_key: str) -> None:
     current = str(screen.query_one("#agent", Select).value)
     if current != agent_key:
         return
-    screen.query_one("#model-picker", ModelPicker).set_choices(choices)
+    dash = _screen_dashboard(screen)
+    preferred = ""
+    if (getattr(dash, "agent_name", "") or "") == agent_key:
+        preferred = getattr(dash, "agent_model", "") or ""
+    screen.query_one("#model-picker", ModelPicker).set_choices(choices, selected=preferred)
 
 
 def _selected_model(screen) -> str:
@@ -1188,7 +1197,9 @@ class DocFlowApp(App[None]):
             f"App      {dash.app_repo_path or 'not set'}  ({'ok' if dash.app_exists else 'missing'})",
             f"Docs     {dash.docs_repo_path or 'not set'}  ({'ok' if dash.docs_exists else 'missing'})",
             f"Jobs     {dash.concurrency} agent(s) at a time",
-            f"Agent {dash.agent_mode}  {dash.agent_command or 'manual'}",
+            f"Agent    {dash.agent_name or dash.agent_mode}"
+            + (f"  {dash.agent_model}" if dash.agent_model else "")
+            + f"  {dash.agent_command or 'manual'}",
             f"Types: {', '.join(dash.doc_types) or 'none'}",
             f"Documented: {dash.last_documented.short_sha}  {dash.last_documented.message}"
             if dash.last_documented

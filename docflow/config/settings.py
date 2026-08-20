@@ -32,6 +32,8 @@ class DocsSettings(BaseModel):
 class AgentSettings(BaseModel):
     mode: str = "manual"  # shell | manual
     command: str = 'agy --dangerously-skip-permissions --add-dir {docs_repo} -p "Follow every instruction in {prompt_file}."'
+    name: str = ""  # agy, cursor-agent, …
+    model: str = ""
 
 
 class PlatformSettings(BaseModel):

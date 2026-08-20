@@ -4,6 +4,8 @@ Agent-powered documentation from git activity. DocFlow writes dual-audience docs
 
 ## Quickstart
 
+Install once (from the DocFlow source tree):
+
 ```bash
 git clone https://github.com/debjit/docflow.git
 cd docflow
@@ -12,13 +14,31 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-From your application repo (the docs folder must be empty the first time):
+Every later session, activate the venv then start the UI. DocFlow opens the last docs project.
+
+```bash
+source .venv/bin/activate
+docflow ui
+```
+
+Same venv, other entry points:
+
+```bash
+source .venv/bin/activate
+docflow              # interactive menu
+docflow generate     # update docs from new commits
+docflow pull
+```
+
+If the `docflow` command is not found, the venv is not active — run `source .venv/bin/activate` again.
+
+First-time pairing (docs folder must be empty):
 
 ```bash
 docflow init
-docflow pull
-docflow generate
 ```
+
+After that, **Update docs** in the UI reuses the last agent and model. Change them only when you want a different LLM.
 
 | Command | What it does |
 | --- | --- |
@@ -107,7 +127,9 @@ docs:
 
 agent:
   mode: "shell"   # or "manual"
-  command: 'agy --dangerously-skip-permissions --add-dir {docs_repo} -p "Follow every instruction in {prompt_file}."'
+  name: "cursor-agent"   # last agent used; next run defaults to this
+  model: "composer-2.5"  # last LLM; next run defaults to this
+  command: 'agent --workspace {docs_repo} --force --trust -p "Follow every instruction in {prompt_file}."'
 
 platform:
   type: "github"  # github | gitlab | bitbucket | generic
@@ -124,6 +146,7 @@ generation:
     - "__pycache__/"
 ```
 
+- **`agent.name` / `agent.model`**: last coding agent and LLM. Init and generate save these; the next UI/CLI run pre-selects them so you do not pick them every time.
 - **`generation.concurrency`**: how many agent jobs run at once. Default is **1**. Raise it only if the PC can run several coding agents together. `--jobs N` or `DOCFLOW_JOBS` overrides for one run.
 - **`generation.ignore`**: merged with DocFlow defaults and framework profiles during scan and diff.
 - **`generation.features`**: units selected during init. Later `generate` only updates those sections.
