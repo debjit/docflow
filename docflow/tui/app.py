@@ -269,42 +269,18 @@ class ModelPicker(Vertical):
         self.call_after_refresh(self._end_suppress_highlight)
 
 
-def _sync_model_select(screen, agent_key: str) -> None:
-    pickers = list(screen.query(ModelPicker))
-    show = agent_supports_models(agent_key)
-    for picker in pickers:
-        picker.display = show
-        if show:
-            picker.set_loading()
-    if show:
-        screen.run_worker(_load_models(screen, agent_key), exclusive=True, group="models")
-
-
-async def _load_models(screen, agent_key: str) -> None:
-    choices = await asyncio.to_thread(list_agent_models, agent_key)
-    if not screen.is_attached:
-        return
-    current = str(screen.query_one("#agent", Select).value)
-    if current != agent_key:
-        return
-    dash = _screen_dashboard(screen)
-    prefs = getattr(getattr(screen, "app", None), "_agent_defaults", {}) or {}
-    same_agent = (getattr(dash, "agent_name", "") or "") == agent_key
-    prefs_match = (prefs.get("name") or "") == agent_key
-    plan_pref = ""
-    work_pref = ""
-    if same_agent:
-        plan_pref = getattr(dash, "plan_model", "") or ""
-        work_pref = getattr(dash, "agent_model", "") or ""
-    elif prefs_match:
-        plan_pref = prefs.get("plan_model") or ""
-        work_pref = prefs.get("model") or ""
-    for picker in screen.query(ModelPicker):
-        selected = plan_pref if picker.role == "plan" else work_pref
-        picker.set_choices(choices, selected=selected)
+def _model_display_name(choices, value: str) -> str:
+    if not value or value == "auto":
+        return "Auto / Default"
+    for c in choices or []:
+        if c.value == value or c.key == value:
+            return c.label or c.value or value
+    return value
 
 
 def _selected_models(screen) -> tuple[str, str]:
+    if hasattr(screen, "_work_model") and hasattr(screen, "_plan_model"):
+        return getattr(screen, "_plan_model", ""), getattr(screen, "_work_model", "")
     plan = ""
     work = ""
     for picker in screen.query(ModelPicker):
@@ -315,6 +291,83 @@ def _selected_models(screen) -> tuple[str, str]:
         else:
             work = picker.selected_value()
     return plan, work
+
+
+class ModelSelectScreen(ModalScreen[Optional[dict]]):
+    """Modal dialog to search and pick a model."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(
+        self,
+        agent_key: str,
+        choices: Optional[list] = None,
+        selected_work: str = "",
+        selected_plan: str = "",
+        show_plan: bool = False,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self._agent_key = agent_key
+        self._choices = list(choices) if choices is not None else None
+        self._selected_work = selected_work
+        self._selected_plan = selected_plan
+        self._show_plan = show_plan
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog", classes="model-select-dialog"):
+            yield Label("Select Model", classes="title")
+            yield ModelPicker(
+                caption="Target Model (write docs)",
+                role="work",
+                id="work-model-picker",
+            )
+            if self._show_plan:
+                yield ModelPicker(
+                    caption="Plan model (search & structure)",
+                    role="plan",
+                    id="plan-model-picker",
+                )
+            with Horizontal(classes="buttons"):
+                yield Button("Select", variant="primary", id="ok")
+                yield Button("Cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        if self._choices is not None and len(self._choices) > 0:
+            self._populate(self._choices)
+        else:
+            self.query_one("#work-model-picker", ModelPicker).set_loading()
+            if self._show_plan:
+                self.query_one("#plan-model-picker", ModelPicker).set_loading()
+            self.run_worker(self._load_choices(), exclusive=True)
+
+    async def _load_choices(self) -> None:
+        choices = await asyncio.to_thread(list_agent_models, self._agent_key)
+        if not self.is_attached:
+            return
+        self._choices = choices
+        self._populate(choices)
+
+    def _populate(self, choices: list) -> None:
+        work_picker = self.query_one("#work-model-picker", ModelPicker)
+        work_picker.set_choices(choices, selected=self._selected_work)
+        if self._show_plan:
+            plan_picker = self.query_one("#plan-model-picker", ModelPicker)
+            plan_picker.set_choices(choices, selected=self._selected_plan)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == "cancel":
+            self.dismiss(None)
+            return
+        work = self.query_one("#work-model-picker", ModelPicker).selected_value()
+        plan = ""
+        if self._show_plan:
+            plan = self.query_one("#plan-model-picker", ModelPicker).selected_value()
+        self.dismiss({"model": work, "plan_model": plan})
 
 
 def _resolve_role_model(agent_key: str, model: Optional[str], role: str) -> str:
@@ -475,6 +528,12 @@ class SetupScreen(ModalScreen[Optional[dict]]):
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._work_model = ""
+        self._plan_model = ""
+        self._model_choices: list = []
+
     def compose(self) -> ComposeResult:
         dash = _screen_dashboard(self)
         app_default = dash.app_repo_path or os.getcwd()
@@ -507,16 +566,9 @@ class SetupScreen(ModalScreen[Optional[dict]]):
                 id="agent",
                 allow_blank=False,
             )
-            yield ModelPicker(
-                caption="Plan model (search & structure)",
-                role="plan",
-                id="plan-model-picker",
-            )
-            yield ModelPicker(
-                caption="Work model (write docs)",
-                role="work",
-                id="work-model-picker",
-            )
+            with Horizontal(id="model-row", classes="model-row"):
+                yield Label("Target Model: loading…", id="model-label")
+                yield Button("Change", id="change-model")
             yield Label("Parallel agents (1 is safest on most PCs)")
             yield Input(value="1", id="jobs")
             yield Label("Doc types (one per line: name: description)")
@@ -530,7 +582,89 @@ class SetupScreen(ModalScreen[Optional[dict]]):
                 yield Button("Cancel", id="cancel")
 
     def on_mount(self) -> None:
-        _sync_model_select(self, str(self.query_one("#agent", Select).value))
+        self._sync_model_select(str(self.query_one("#agent", Select).value))
+
+    def _sync_model_select(self, agent_key: str) -> None:
+        show = agent_supports_models(agent_key)
+        model_row = self.query_one("#model-row")
+        model_row.display = show
+        if show:
+            self.query_one("#model-label", Label).update("Target Model: loading…")
+            self.run_worker(self._load_models(agent_key), exclusive=True, group="models")
+
+    async def _load_models(self, agent_key: str) -> None:
+        choices = await asyncio.to_thread(list_agent_models, agent_key)
+        if not self.is_attached:
+            return
+        current = str(self.query_one("#agent", Select).value)
+        if current != agent_key:
+            return
+        self._model_choices = choices
+        dash = _screen_dashboard(self)
+        prefs = getattr(getattr(self, "app", None), "_agent_defaults", {}) or {}
+        same_agent = (getattr(dash, "agent_name", "") or "") == agent_key
+        prefs_match = (prefs.get("name") or "") == agent_key
+
+        if same_agent:
+            self._plan_model = getattr(dash, "plan_model", "") or ""
+            self._work_model = getattr(dash, "agent_model", "") or ""
+        elif prefs_match:
+            self._plan_model = prefs.get("plan_model") or ""
+            self._work_model = prefs.get("model") or ""
+        else:
+            self._plan_model = ""
+            self._work_model = ""
+
+        if not self._work_model and choices:
+            keys = {c.key: c.value for c in choices}
+            pick = default_cursor_work_model(choices)
+            if pick in keys:
+                self._work_model = keys[pick]
+            else:
+                current_choices = [c for c in choices if c.group == "current"]
+                self._work_model = (current_choices[0] if current_choices else choices[0]).value
+
+        if not self._plan_model and choices:
+            keys = {c.key: c.value for c in choices}
+            pick = default_cursor_plan_model(choices)
+            if pick in keys:
+                self._plan_model = keys[pick]
+            else:
+                current_choices = [c for c in choices if c.group == "current"]
+                self._plan_model = (current_choices[0] if current_choices else choices[0]).value
+
+        self._update_model_label()
+
+    def _update_model_label(self) -> None:
+        display = _model_display_name(self._model_choices, self._work_model)
+        if self._plan_model and self._plan_model != self._work_model and self._plan_model != "auto":
+            plan_display = _model_display_name(self._model_choices, self._plan_model)
+            display = f"{display} (plan: {plan_display})"
+        self.query_one("#model-label", Label).update(f"Target Model: {display}")
+
+    def _open_model_picker(self) -> None:
+        agent_key = str(self.query_one("#agent", Select).value)
+        show_plan = agent_key in CURSOR_AGENT_KEYS
+
+        def _on_picked(result: Optional[dict]) -> None:
+            if not result:
+                return
+            if result.get("model"):
+                self._work_model = result["model"]
+            if "plan_model" in result:
+                self._plan_model = result.get("plan_model") or ""
+            self._update_model_label()
+
+        self.app.push_screen(
+            ModelSelectScreen(
+                agent_key=agent_key,
+                choices=self._model_choices,
+                selected_work=self._work_model,
+                selected_plan=self._plan_model,
+                show_plan=show_plan,
+            ),
+            _on_picked,
+        )
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id != "app-path":
@@ -542,7 +676,7 @@ class SetupScreen(ModalScreen[Optional[dict]]):
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "agent":
-            _sync_model_select(self, str(event.value))
+            self._sync_model_select(str(event.value))
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -552,16 +686,18 @@ class SetupScreen(ModalScreen[Optional[dict]]):
         if event.button.id == "cancel":
             self.dismiss(None)
             return
+        if event.button.id == "change-model":
+            self._open_model_picker()
+            return
         agent_key = str(self.query_one("#agent", Select).value)
         types = parse_doc_types_text(self.query_one("#types", TextArea).text)
-        plan_model, work_model = _selected_models(self)
         self.dismiss(
             {
                 "app": self.query_one("#app-path", Input).value.strip(),
                 "docs": self.query_one("#docs-path", Input).value.strip(),
                 "agent": agent_key,
-                "model": work_model,
-                "plan_model": plan_model,
+                "model": self._work_model,
+                "plan_model": self._plan_model,
                 "types": types or list(DEFAULT_DOC_TYPES),
                 "import_from": self.query_one("#import-from", Input).value.strip(),
                 "import_into": self.query_one("#import-into", Input).value.strip(),
@@ -741,10 +877,20 @@ class GenerateScreen(ModalScreen[Optional[dict]]):
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
+    def __init__(self, repo: str = "", docs: str = "", **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._repo = repo
+        self._docs = docs
+        self._work_model = ""
+        self._plan_model = ""
+        self._model_choices: list = []
+
     def compose(self) -> ComposeResult:
         dash = _screen_dashboard(self)
-        self._repo = dash.app_repo_path if dash.app_exists else ""
-        self._docs = dash.docs_repo_path or ""
+        if not self._repo:
+            self._repo = dash.app_repo_path if dash.app_exists else ""
+        if not self._docs:
+            self._docs = dash.docs_repo_path or ""
         branches = []
         if self._repo:
             try:
@@ -794,16 +940,9 @@ class GenerateScreen(ModalScreen[Optional[dict]]):
                 id="agent",
                 allow_blank=False,
             )
-            yield ModelPicker(
-                caption="Plan model (search & structure)",
-                role="plan",
-                id="plan-model-picker",
-            )
-            yield ModelPicker(
-                caption="Work model (write docs)",
-                role="work",
-                id="work-model-picker",
-            )
+            with Horizontal(id="model-row", classes="model-row"):
+                yield Label("Target Model: loading…", id="model-label")
+                yield Button("Change", id="change-model")
             yield Label("Parallel agents (1 is safest on most PCs)")
             yield Input(value=str(dash.concurrency or 1), id="jobs")
             with Horizontal(classes="buttons"):
@@ -812,7 +951,89 @@ class GenerateScreen(ModalScreen[Optional[dict]]):
 
     def on_mount(self) -> None:
         self._apply_mode("new")
-        _sync_model_select(self, str(self.query_one("#agent", Select).value))
+        self._sync_model_select(str(self.query_one("#agent", Select).value))
+
+    def _sync_model_select(self, agent_key: str) -> None:
+        show = agent_supports_models(agent_key)
+        model_row = self.query_one("#model-row")
+        model_row.display = show
+        if show:
+            self.query_one("#model-label", Label).update("Target Model: loading…")
+            self.run_worker(self._load_models(agent_key), exclusive=True, group="models")
+
+    async def _load_models(self, agent_key: str) -> None:
+        choices = await asyncio.to_thread(list_agent_models, agent_key)
+        if not self.is_attached:
+            return
+        current = str(self.query_one("#agent", Select).value)
+        if current != agent_key:
+            return
+        self._model_choices = choices
+        dash = _screen_dashboard(self)
+        prefs = getattr(getattr(self, "app", None), "_agent_defaults", {}) or {}
+        same_agent = (getattr(dash, "agent_name", "") or "") == agent_key
+        prefs_match = (prefs.get("name") or "") == agent_key
+
+        if same_agent:
+            self._plan_model = getattr(dash, "plan_model", "") or ""
+            self._work_model = getattr(dash, "agent_model", "") or ""
+        elif prefs_match:
+            self._plan_model = prefs.get("plan_model") or ""
+            self._work_model = prefs.get("model") or ""
+        else:
+            self._plan_model = ""
+            self._work_model = ""
+
+        if not self._work_model and choices:
+            keys = {c.key: c.value for c in choices}
+            pick = default_cursor_work_model(choices)
+            if pick in keys:
+                self._work_model = keys[pick]
+            else:
+                current_choices = [c for c in choices if c.group == "current"]
+                self._work_model = (current_choices[0] if current_choices else choices[0]).value
+
+        if not self._plan_model and choices:
+            keys = {c.key: c.value for c in choices}
+            pick = default_cursor_plan_model(choices)
+            if pick in keys:
+                self._plan_model = keys[pick]
+            else:
+                current_choices = [c for c in choices if c.group == "current"]
+                self._plan_model = (current_choices[0] if current_choices else choices[0]).value
+
+        self._update_model_label()
+
+    def _update_model_label(self) -> None:
+        display = _model_display_name(self._model_choices, self._work_model)
+        if self._plan_model and self._plan_model != self._work_model and self._plan_model != "auto":
+            plan_display = _model_display_name(self._model_choices, self._plan_model)
+            display = f"{display} (plan: {plan_display})"
+        self.query_one("#model-label", Label).update(f"Target Model: {display}")
+
+    def _open_model_picker(self) -> None:
+        agent_key = str(self.query_one("#agent", Select).value)
+        show_plan = agent_key in CURSOR_AGENT_KEYS
+
+        def _on_picked(result: Optional[dict]) -> None:
+            if not result:
+                return
+            if result.get("model"):
+                self._work_model = result["model"]
+            if "plan_model" in result:
+                self._plan_model = result.get("plan_model") or ""
+            self._update_model_label()
+
+        self.app.push_screen(
+            ModelSelectScreen(
+                agent_key=agent_key,
+                choices=self._model_choices,
+                selected_work=self._work_model,
+                selected_plan=self._plan_model,
+                show_plan=show_plan,
+            ),
+            _on_picked,
+        )
 
     def _commit_count(self) -> int:
         raw = self.query_one("#commit-count", Input).value.strip()
@@ -889,7 +1110,7 @@ class GenerateScreen(ModalScreen[Optional[dict]]):
         elif event.select.id == "app-branch":
             self._refresh_preview()
         elif event.select.id == "agent":
-            _sync_model_select(self, str(event.value))
+            self._sync_model_select(str(event.value))
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "commit-count":
@@ -903,9 +1124,11 @@ class GenerateScreen(ModalScreen[Optional[dict]]):
         if event.button.id == "cancel":
             self.dismiss(None)
             return
+        if event.button.id == "change-model":
+            self._open_model_picker()
+            return
         source = str(self.query_one("#source", Select).value)
         tip = self._tip()
-        plan_model, work_model = _selected_models(self)
         self.dismiss(
             {
                 "full": source == "full",
@@ -914,8 +1137,8 @@ class GenerateScreen(ModalScreen[Optional[dict]]):
                 "branch": "" if source != "commits" or tip == "HEAD" else tip,
                 "feature": self.query_one("#feature", Input).value.strip(),
                 "agent": str(self.query_one("#agent", Select).value),
-                "model": work_model,
-                "plan_model": plan_model,
+                "model": self._work_model,
+                "plan_model": self._plan_model,
                 "jobs": _jobs_from_input(self, 1),
                 "app_branch": str(self.query_one("#app-branch", Select).value or ""),
             }
@@ -926,6 +1149,12 @@ class RegenLastScreen(ModalScreen[Optional[dict]]):
     """Offer to redo the last documented commit with another agent/model."""
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._work_model = ""
+        self._plan_model = ""
+        self._model_choices: list = []
 
     def compose(self) -> ComposeResult:
         dash = _screen_dashboard(self)
@@ -947,26 +1176,101 @@ class RegenLastScreen(ModalScreen[Optional[dict]]):
                 id="agent",
                 allow_blank=False,
             )
-            yield ModelPicker(
-                caption="Plan model (search & structure)",
-                role="plan",
-                id="plan-model-picker",
-            )
-            yield ModelPicker(
-                caption="Work model (write docs)",
-                role="work",
-                id="work-model-picker",
-            )
+            with Horizontal(id="model-row", classes="model-row"):
+                yield Label("Target Model: loading…", id="model-label")
+                yield Button("Change", id="change-model")
             with Horizontal(classes="buttons"):
                 yield Button("Regenerate", variant="primary", id="ok")
                 yield Button("Exit", id="cancel")
 
     def on_mount(self) -> None:
-        _sync_model_select(self, str(self.query_one("#agent", Select).value))
+        self._sync_model_select(str(self.query_one("#agent", Select).value))
+
+    def _sync_model_select(self, agent_key: str) -> None:
+        show = agent_supports_models(agent_key)
+        model_row = self.query_one("#model-row")
+        model_row.display = show
+        if show:
+            self.query_one("#model-label", Label).update("Target Model: loading…")
+            self.run_worker(self._load_models(agent_key), exclusive=True, group="models")
+
+    async def _load_models(self, agent_key: str) -> None:
+        choices = await asyncio.to_thread(list_agent_models, agent_key)
+        if not self.is_attached:
+            return
+        current = str(self.query_one("#agent", Select).value)
+        if current != agent_key:
+            return
+        self._model_choices = choices
+        dash = _screen_dashboard(self)
+        prefs = getattr(getattr(self, "app", None), "_agent_defaults", {}) or {}
+        same_agent = (getattr(dash, "agent_name", "") or "") == agent_key
+        prefs_match = (prefs.get("name") or "") == agent_key
+
+        if same_agent:
+            self._plan_model = getattr(dash, "plan_model", "") or ""
+            self._work_model = getattr(dash, "agent_model", "") or ""
+        elif prefs_match:
+            self._plan_model = prefs.get("plan_model") or ""
+            self._work_model = prefs.get("model") or ""
+        else:
+            self._plan_model = ""
+            self._work_model = ""
+
+        if not self._work_model and choices:
+            keys = {c.key: c.value for c in choices}
+            pick = default_cursor_work_model(choices)
+            if pick in keys:
+                self._work_model = keys[pick]
+            else:
+                current_choices = [c for c in choices if c.group == "current"]
+                self._work_model = (current_choices[0] if current_choices else choices[0]).value
+
+        if not self._plan_model and choices:
+            keys = {c.key: c.value for c in choices}
+            pick = default_cursor_plan_model(choices)
+            if pick in keys:
+                self._plan_model = keys[pick]
+            else:
+                current_choices = [c for c in choices if c.group == "current"]
+                self._plan_model = (current_choices[0] if current_choices else choices[0]).value
+
+        self._update_model_label()
+
+    def _update_model_label(self) -> None:
+        display = _model_display_name(self._model_choices, self._work_model)
+        if self._plan_model and self._plan_model != self._work_model and self._plan_model != "auto":
+            plan_display = _model_display_name(self._model_choices, self._plan_model)
+            display = f"{display} (plan: {plan_display})"
+        self.query_one("#model-label", Label).update(f"Target Model: {display}")
+
+    def _open_model_picker(self) -> None:
+        agent_key = str(self.query_one("#agent", Select).value)
+        show_plan = agent_key in CURSOR_AGENT_KEYS
+
+        def _on_picked(result: Optional[dict]) -> None:
+            if not result:
+                return
+            if result.get("model"):
+                self._work_model = result["model"]
+            if "plan_model" in result:
+                self._plan_model = result.get("plan_model") or ""
+            self._update_model_label()
+
+        self.app.push_screen(
+            ModelSelectScreen(
+                agent_key=agent_key,
+                choices=self._model_choices,
+                selected_work=self._work_model,
+                selected_plan=self._plan_model,
+                show_plan=show_plan,
+            ),
+            _on_picked,
+        )
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "agent":
-            _sync_model_select(self, str(event.value))
+            self._sync_model_select(str(event.value))
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -976,12 +1280,14 @@ class RegenLastScreen(ModalScreen[Optional[dict]]):
         if event.button.id == "cancel":
             self.dismiss(None)
             return
-        plan_model, work_model = _selected_models(self)
+        if event.button.id == "change-model":
+            self._open_model_picker()
+            return
         self.dismiss(
             {
                 "agent": str(self.query_one("#agent", Select).value),
-                "model": work_model,
-                "plan_model": plan_model,
+                "model": self._work_model,
+                "plan_model": self._plan_model,
             }
         )
 
@@ -1109,8 +1415,25 @@ class DocFlowApp(App[None]):
         text-style: bold;
         margin-bottom: 1;
     }
-    #dialog Input, #dialog Select, #dialog TextArea, #preview, #plan-model-picker, #work-model-picker, #section-list {
+    #dialog Input, #dialog Select, #dialog TextArea, #preview, #model-row, #plan-model-picker, #work-model-picker, #model-picker, #section-list {
         margin-bottom: 1;
+    }
+    #model-row {
+        height: auto;
+        align: left middle;
+    }
+    #model-label {
+        height: auto;
+        margin-right: 2;
+        padding: 0 1 0 0;
+        text-style: bold;
+    }
+    #change-model {
+        height: auto;
+        min-width: 10;
+    }
+    .model-select-dialog {
+        width: 76;
     }
     #project-list, #section-list {
         height: 12;
@@ -1129,16 +1452,16 @@ class DocFlowApp(App[None]):
     #dialog TextArea {
         height: 8;
     }
-    #plan-model-picker, #work-model-picker {
+    #plan-model-picker, #work-model-picker, #model-picker {
         height: auto;
     }
-    #plan-model-picker OptionList, #work-model-picker OptionList {
+    #plan-model-picker OptionList, #work-model-picker OptionList, #model-picker OptionList {
         height: 8;
         border: tall $border-blurred;
         background: $surface;
         padding: 0 1;
     }
-    #plan-model-picker Input, #work-model-picker Input {
+    #plan-model-picker Input, #work-model-picker Input, #model-picker Input {
         margin-bottom: 0;
     }
     #preview {

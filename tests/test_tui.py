@@ -38,10 +38,36 @@ async def test_update_docs_modal_has_agent_select():
             screen for screen in app.screen_stack if screen.__class__.__name__ == "GenerateScreen"
         )
         assert generate.query_one("#agent")
-        assert generate.query_one("#plan-model-picker")
-        assert generate.query_one("#work-model-picker")
+        assert generate.query_one("#model-row")
+        assert generate.query_one("#model-label")
+        assert generate.query_one("#change-model")
         assert generate.query_one("#jobs")
         assert generate.query_one("#app-branch")
+
+
+@pytest.mark.asyncio
+async def test_change_model_opens_model_select_modal():
+    from textual.widgets import Button
+
+    app = DocFlowApp()
+    async with app.run_test(size=(100, 40)) as pilot:
+        await pilot.pause()
+        await pilot.press("g")
+        await pilot.pause()
+        generate = next(
+            screen for screen in app.screen_stack if screen.__class__.__name__ == "GenerateScreen"
+        )
+        generate.query_one("#change-model", Button).press()
+        await pilot.pause()
+        model_select = next(
+            screen for screen in app.screen_stack if screen.__class__.__name__ == "ModelSelectScreen"
+        )
+        assert model_select.query_one("#work-model-picker")
+        assert model_select.query_one("#ok")
+        assert model_select.query_one("#cancel")
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not any(s.__class__.__name__ == "ModelSelectScreen" for s in app.screen_stack)
 
 
 @pytest.mark.asyncio
