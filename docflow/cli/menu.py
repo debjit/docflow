@@ -83,7 +83,7 @@ def pick_model(spec, model: str = "", plan_model: str = ""):
     if model and not agent_supports_models(spec.name):
         return attach_agent_models(spec, model=model, plan_model=plan_model or model)
     if not agent_supports_models(spec.name) and not (spec.command or "").lstrip().startswith(
-        ("agent ", "agy ")
+        ("agent ", "agy ", "opencode ")
     ):
         return spec
     choices = list_agent_models(spec.name)

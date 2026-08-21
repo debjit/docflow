@@ -18,11 +18,12 @@ from textual.widgets import Button, Footer, Header, Input, Label, LoadingIndicat
 from textual.widgets.option_list import Option
 from textual.widgets.selection_list import Selection
 
-from docflow.core.agent_runner import AGENT_PRESETS
+from docflow.core.agent_runner import AGENT_PRESETS, missing_agent_binary
 from docflow.core.job_runner import RunControl, clamp_concurrency
 from docflow.core.operations import (
     AGENT_CHOICES,
     CURSOR_AGENT_KEYS,
+    OPENCODE_AGENT_KEYS,
     ConfigError,
     DEFAULT_CURSOR_MODEL,
     DEFAULT_CURSOR_PLAN_MODEL,
@@ -85,7 +86,14 @@ def is_status_line(message: str) -> bool:
 
 
 def _agent_select_options():
-    return [(label, key) for key, label in AGENT_CHOICES if key != "custom"]
+    options = []
+    for key, label in AGENT_CHOICES:
+        if key == "custom":
+            continue
+        if missing_agent_binary(key):
+            label = f"{label} — not found on PATH"
+        options.append((label, key))
+    return options
 
 
 def _agent_key_from_dash(dash) -> str:
@@ -581,6 +589,7 @@ class SetupScreen(ModalScreen[Optional[dict]]):
                     yield TextArea(_default_types_text(), id="types")
                     yield Label("Parallel agents (1 is safest on most PCs)")
                     yield Input(value="1", id="jobs")
+            yield Label("", id="setup-error")
             with Horizontal(classes="buttons"):
                 yield Button("Start", variant="primary", id="ok")
                 yield Button("Cancel", id="cancel")
@@ -648,7 +657,7 @@ class SetupScreen(ModalScreen[Optional[dict]]):
 
     def _open_model_picker(self) -> None:
         agent_key = str(self.query_one("#agent", Select).value)
-        show_plan = agent_key in CURSOR_AGENT_KEYS
+        show_plan = agent_key in CURSOR_AGENT_KEYS or agent_key in OPENCODE_AGENT_KEYS
 
         def _on_picked(result: Optional[dict]) -> None:
             if not result:
@@ -678,8 +687,17 @@ class SetupScreen(ModalScreen[Optional[dict]]):
         picker.set_options(options)
         picker.value = default
 
+    def _show_setup_error(self, message: str) -> None:
+        error = self.query_one("#setup-error", Label)
+        error.update(message)
+        error.display = True
+
+    def _clear_setup_error(self) -> None:
+        self.query_one("#setup-error", Label).display = False
+
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "agent":
+            self._clear_setup_error()
             self._sync_model_select(str(event.value))
 
     def action_cancel(self) -> None:
@@ -694,6 +712,13 @@ class SetupScreen(ModalScreen[Optional[dict]]):
             self._open_model_picker()
             return
         agent_key = str(self.query_one("#agent", Select).value)
+        if agent_key != "manual" and missing_agent_binary(agent_key):
+            self._show_setup_error(
+                f"'{missing_agent_binary(agent_key)}' was not found on PATH. "
+                "Install it (or run DocFlow where it is installed, e.g. inside WSL), "
+                "or choose a different agent."
+            )
+            return
         types = parse_doc_types_text(self.query_one("#types", TextArea).text)
         self.dismiss(
             {
@@ -1017,7 +1042,7 @@ class GenerateScreen(ModalScreen[Optional[dict]]):
 
     def _open_model_picker(self) -> None:
         agent_key = str(self.query_one("#agent", Select).value)
-        show_plan = agent_key in CURSOR_AGENT_KEYS
+        show_plan = agent_key in CURSOR_AGENT_KEYS or agent_key in OPENCODE_AGENT_KEYS
 
         def _on_picked(result: Optional[dict]) -> None:
             if not result:
@@ -1250,7 +1275,7 @@ class RegenLastScreen(ModalScreen[Optional[dict]]):
 
     def _open_model_picker(self) -> None:
         agent_key = str(self.query_one("#agent", Select).value)
-        show_plan = agent_key in CURSOR_AGENT_KEYS
+        show_plan = agent_key in CURSOR_AGENT_KEYS or agent_key in OPENCODE_AGENT_KEYS
 
         def _on_picked(result: Optional[dict]) -> None:
             if not result:
@@ -1432,6 +1457,11 @@ class DocFlowApp(App[None]):
     .setup-right {
         border-left: tall $border-blurred;
         padding-left: 2;
+    }
+    #setup-error {
+        display: none;
+        color: $error;
+        margin-bottom: 1;
     }
     #dialog .title {
         text-style: bold;

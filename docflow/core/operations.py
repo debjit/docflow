@@ -76,6 +76,29 @@ class InitCancelled(ConfigError):
     """User cancelled init before any docs were written."""
 
 
+class AgentLaunchError(ConfigError):
+    """The selected coding agent binary could not be started."""
+
+
+_LAUNCH_FAILURE_RE = re.compile(r"exit code 12[67]\b")
+_LAUNCH_FAILURE_MARKERS = (
+    "is not recognized",           # cmd.exe: unknown command
+    "cannot find the path",        # cmd.exe / broken shim
+    "cannot find the file",
+    "command not found",           # POSIX sh
+)
+
+
+def looks_like_agent_launch_failure(error_message: Optional[str]) -> bool:
+    """True when an agent run failed because its executable could not start."""
+    text = (error_message or "").lower()
+    if not text:
+        return False
+    if _LAUNCH_FAILURE_RE.search(text):
+        return True
+    return any(marker in text for marker in _LAUNCH_FAILURE_MARKERS)
+
+
 NOISY_SECTION_NAMES = {
     "git", "github", "gitlab", "ci", "vendor", "node_modules",
     "storage", "bootstrap", "public", "tests", "test", "core",
@@ -811,6 +834,7 @@ AGENT_CHOICES: Sequence[Tuple[str, str]] = (
 
 CURSOR_AGENT_KEYS = frozenset({"cursor", "cursor-agent", "cursor-interactive"})
 AGY_AGENT_KEYS = frozenset({"agy", "agy-interactive"})
+OPENCODE_AGENT_KEYS = frozenset({"opencode"})
 PREFERRED_APP_BRANCHES = ("main", "master", "develop")
 DEFAULT_CURSOR_MODEL = "composer-2.5"
 DEFAULT_CURSOR_PLAN_MODEL = "composer-2.5"
@@ -947,7 +971,11 @@ def is_configured(config: Optional[DocFlowConfig] = None) -> bool:
 
 
 def agent_supports_models(agent_key: str) -> bool:
-    return agent_key in CURSOR_AGENT_KEYS or agent_key in AGY_AGENT_KEYS
+    return (
+        agent_key in CURSOR_AGENT_KEYS
+        or agent_key in AGY_AGENT_KEYS
+        or agent_key in OPENCODE_AGENT_KEYS
+    )
 
 
 def parse_cursor_model_list(output: str) -> List[Tuple[str, str]]:
@@ -993,6 +1021,23 @@ def parse_agy_model_list(output: str) -> List[Tuple[str, str]]:
             continue
         seen.add(key)
         rows.append((key, label or key))
+    return rows
+
+
+def parse_opencode_model_list(output: str) -> List[Tuple[str, str]]:
+    """Parse `opencode models` output: one provider/model id per line."""
+    rows: List[Tuple[str, str]] = []
+    seen = set()
+    pattern = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*/[A-Za-z0-9][A-Za-z0-9._+-]*$")
+    for raw in (output or "").splitlines():
+        line = raw.strip()
+        if not line or "/" not in line:
+            continue
+        key = line.split()[0]
+        if not pattern.match(key) or key in seen:
+            continue
+        seen.add(key)
+        rows.append((key, key))
     return rows
 
 
@@ -1161,7 +1206,59 @@ def list_agent_models(agent_key: str) -> List[ModelChoice]:
         return catalog_cursor_models(list_cursor_models())
     if agent_key in AGY_AGENT_KEYS:
         return catalog_agy_models(list_agy_models())
+    if agent_key in OPENCODE_AGENT_KEYS:
+        return catalog_opencode_models(list_opencode_models())
     return []
+
+
+def list_opencode_models(timeout: float = 30.0) -> List[Tuple[str, str]]:
+    """Ask the OpenCode CLI which models the configured providers offer."""
+    try:
+        proc = subprocess.run(
+            ["opencode", "models"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
+    return parse_opencode_model_list((proc.stdout or "") + "\n" + (proc.stderr or ""))
+
+
+def catalog_opencode_models(rows: Sequence[Tuple[str, str]]) -> List[ModelChoice]:
+    """OpenCode Zen providers first; other configured providers underneath."""
+    current = [(k, lab) for k, lab in rows if k.split("/", 1)[0].startswith("opencode")]
+    third = [(k, lab) for k, lab in rows if not k.split("/", 1)[0].startswith("opencode")]
+    choices = [
+        ModelChoice(
+            key="default",
+            value="",
+            label="Default (opencode default)",
+            group="current",
+            group_label="Default",
+        )
+    ]
+    choices.extend(
+        ModelChoice(
+            key=k,
+            value=k,
+            label=lab,
+            group="current",
+            group_label="OpenCode included",
+        )
+        for k, lab in sorted(current)
+    )
+    choices.extend(
+        ModelChoice(
+            key=k,
+            value=k,
+            label=lab,
+            group="third_party",
+            group_label="Configured providers",
+        )
+        for k, lab in sorted(third)
+    )
+    return choices
 
 
 def apply_agent_model(spec: AgentSpec, model: Optional[str]) -> AgentSpec:
@@ -1178,6 +1275,10 @@ def apply_agent_model(spec: AgentSpec, model: Optional[str]) -> AgentSpec:
             cmd = re.sub(r"^(\s*agy)\b", rf"\1 --model {quoted}", cmd, count=1)
         elif spec.name == "claude" or stripped.startswith("claude "):
             cmd = re.sub(r"^(\s*claude)\b", rf"\1 --model {quoted}", cmd, count=1)
+        elif spec.name in OPENCODE_AGENT_KEYS or stripped.startswith("opencode"):
+            cmd = re.sub(
+                r"^(\s*opencode(?:\s+run)?)\b", rf"\1 --model {quoted}", cmd, count=1
+            )
     return AgentSpec(
         mode=spec.mode,
         command=cmd,
@@ -2078,6 +2179,14 @@ def init_docs(
             progress("Stack survey complete.")
         else:
             progress(f"Stack survey failed: {survey_res.error_message or 'unknown error'}")
+            if looks_like_agent_launch_failure(survey_res.error_message):
+                if created_docs:
+                    shutil.rmtree(docs_repo_path, ignore_errors=True)
+                raise AgentLaunchError(
+                    f"The '{config.agent.name or 'selected'}' agent could not be started: "
+                    f"{survey_res.error_message}. Install it on this system (check PATH), "
+                    "then retry Setup — or pick a different agent."
+                )
         stack_payload = load_stack_file(docs_repo_path)
 
     candidates = discover_init_sections(

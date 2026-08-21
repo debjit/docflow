@@ -4,6 +4,7 @@ Agent runner supporting preset agent CLI commands, custom shell execution, and m
 
 import os
 import re
+import shutil
 import subprocess
 import shlex
 import sys
@@ -15,7 +16,7 @@ from docflow.core.models import AgentRunResult
 AGENT_PRESETS: Dict[str, str] = {
     "agy": 'agy --dangerously-skip-permissions --add-dir {docs_repo} -p "Follow every instruction in {prompt_file}."',
     "agy-interactive": 'agy --dangerously-skip-permissions --add-dir {docs_repo} -i "Follow every instruction in {prompt_file}."',
-    "opencode": 'opencode "Follow every instruction in {prompt_file}."',
+    "opencode": 'opencode run "Follow every instruction in {prompt_file}."',
     "cursor": 'agent --workspace {docs_repo} --force --trust -p "Follow every instruction in {prompt_file}."',
     "cursor-agent": 'agent --workspace {docs_repo} --force --trust -p "Follow every instruction in {prompt_file}."',
     "cursor-interactive": 'agent --workspace {docs_repo} "Follow every instruction in {prompt_file}."',
@@ -23,6 +24,30 @@ AGENT_PRESETS: Dict[str, str] = {
     "cline": "cline {prompt_file}",
     "manual": "manual",
 }
+
+_AGENT_BINARIES: Dict[str, str] = {
+    "agy": "agy",
+    "agy-interactive": "agy",
+    "opencode": "opencode",
+    "cursor": "agent",
+    "cursor-agent": "agent",
+    "cursor-interactive": "agent",
+    "claude": "claude",
+    "cline": "cline",
+}
+
+
+def missing_agent_binary(agent_key: str) -> str:
+    """Return the executable name when the agent is not on PATH, else ''.
+
+    Manual mode and unknown keys never report a missing binary. Uses
+    shutil.which so Windows PATHEXT (.exe/.cmd/.bat) is honored.
+    """
+    key = (agent_key or "").strip().lower()
+    binary = _AGENT_BINARIES.get(key)
+    if not binary:
+        return ""
+    return "" if shutil.which(binary) else binary
 
 _PROMPT_POINTER = "Follow every instruction in {prompt_file}."
 _CAT_TEMPLATE_RE = re.compile(
@@ -38,6 +63,18 @@ _CAT_FORMATTED_RE = re.compile(
 def _rewrite_cat_prompt_template(template: str) -> str:
     """Rewrite saved `$(cat {prompt_file})` commands to a file-path pointer."""
     return _CAT_TEMPLATE_RE.sub(_PROMPT_POINTER, template)
+
+
+_BARE_OPENCODE_RE = re.compile(r"^(\s*opencode)(\s+(?!run\b))")
+
+
+def _ensure_opencode_run_subcommand(template: str) -> str:
+    """Route prompts through `opencode run`.
+
+    Modern opencode treats a bare positional as a project directory and
+    tries to chdir into it; only the `run` subcommand takes a prompt.
+    """
+    return _BARE_OPENCODE_RE.sub(r"\1 run\2", template or "")
 
 
 def _neutralize_cat_after_format(cmd: str) -> str:
@@ -135,6 +172,7 @@ class AgentRunner:
             )
 
         template = _rewrite_cat_prompt_template(self.command_template)
+        template = _ensure_opencode_run_subcommand(template)
         formatted_cmd = template.format(
             prompt_file=shlex.quote(abs_prompt_path),
             docs_repo=shlex.quote(abs_docs_path),
