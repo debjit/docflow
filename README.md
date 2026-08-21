@@ -6,6 +6,8 @@ Agent-powered documentation from git activity. DocFlow writes dual-audience docs
 
 Install once (from the DocFlow source tree):
 
+### Linux / macOS / WSL
+
 ```bash
 git clone https://github.com/debjit/docflow.git
 cd docflow
@@ -31,6 +33,42 @@ docflow pull
 ```
 
 If the `docflow` command is not found, the venv is not active — run `source .venv/bin/activate` again.
+
+### Windows (PowerShell)
+
+```powershell
+git clone https://github.com/debjit/docflow.git
+cd docflow
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -e .
+```
+
+If script execution is blocked (`running scripts is disabled on this system`), run this once per user, then retry:
+
+```powershell
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+```
+
+Every later session:
+
+```powershell
+.venv\Scripts\Activate.ps1
+docflow ui
+```
+
+Other entry points:
+
+```powershell
+.venv\Scripts\Activate.ps1
+docflow              # interactive menu
+docflow generate     # update docs from new commits
+docflow pull
+```
+
+If the `docflow` command is not found, the venv is not active — run `.venv\Scripts\Activate.ps1` again.
+
+> **Note:** In `cmd.exe` use `.venv\Scripts\activate.bat`; under WSL follow the Linux steps above.
 
 First-time pairing (docs folder must be empty):
 

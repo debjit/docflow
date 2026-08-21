@@ -546,37 +546,41 @@ class SetupScreen(ModalScreen[Optional[dict]]):
             if preferred in select_keys:
                 agent_default = preferred
         branch_options, branch_default = _branch_select_options(app_default)
-        with Vertical(id="dialog"):
+        with Vertical(id="dialog", classes="setup-dialog"):
             yield Label("Set up DocFlow", classes="title")
-            yield Label("Application repo")
-            yield Input(value=app_default, id="app-path")
-            yield Label("Docs repo (must be empty)")
-            yield Input(value=docs_default, id="docs-path")
-            yield Label("Application branch")
-            yield Select(
-                branch_options,
-                value=branch_default,
-                id="app-branch",
-                allow_blank=False,
-            )
-            yield Label("Agent")
-            yield Select(
-                _agent_select_options(),
-                value=agent_default,
-                id="agent",
-                allow_blank=False,
-            )
-            with Horizontal(id="model-row", classes="model-row"):
-                yield Label("Target Model: loading…", id="model-label")
-                yield Button("Change", id="change-model")
-            yield Label("Parallel agents (1 is safest on most PCs)")
-            yield Input(value="1", id="jobs")
-            yield Label("Doc types (one per line: name: description)")
-            yield TextArea(_default_types_text(), id="types")
-            yield Label("Import from path/folder (optional, never overwrites)")
-            yield Input(placeholder="leave blank to skip", id="import-from")
-            yield Label("Import into type")
-            yield Input(placeholder="defaults to the first type", id="import-into")
+            with Horizontal(id="setup-columns"):
+                with Vertical(classes="setup-pane setup-left"):
+                    yield Label("Project settings", classes="pane-title")
+                    yield Label("Application repo")
+                    yield Input(value=app_default, id="app-path")
+                    yield Label("Docs repo (must be empty)")
+                    yield Input(value=docs_default, id="docs-path")
+                    yield Label("Application branch")
+                    yield Select(
+                        branch_options,
+                        value=branch_default,
+                        id="app-branch",
+                        allow_blank=False,
+                    )
+                    yield Label("Import from path/folder (optional, never overwrites)")
+                    yield Input(placeholder="leave blank to skip", id="import-from")
+                    yield Label("Import into type")
+                    yield Input(placeholder="defaults to the first type", id="import-into")
+                with Vertical(classes="setup-pane setup-right"):
+                    yield Label("Agent", classes="pane-title")
+                    yield Select(
+                        _agent_select_options(),
+                        value=agent_default,
+                        id="agent",
+                        allow_blank=False,
+                    )
+                    with Horizontal(id="model-row", classes="model-row"):
+                        yield Label("Target Model: loading…", id="model-label")
+                        yield Button("Change", id="change-model")
+                    yield Label("Doc types (one per line: name: description)")
+                    yield TextArea(_default_types_text(), id="types")
+                    yield Label("Parallel agents (1 is safest on most PCs)")
+                    yield Input(value="1", id="jobs")
             with Horizontal(classes="buttons"):
                 yield Button("Start", variant="primary", id="ok")
                 yield Button("Cancel", id="cancel")
@@ -1410,6 +1414,24 @@ class DocFlowApp(App[None]):
         background: $surface;
         margin: 1 3;
         overflow-y: auto;
+    }
+    #dialog.setup-dialog {
+        width: 100%;
+        margin: 1 0;
+    }
+    #setup-columns {
+        height: auto;
+    }
+    .setup-pane {
+        width: 1fr;
+        height: auto;
+    }
+    .setup-left {
+        margin-right: 2;
+    }
+    .setup-right {
+        border-left: tall $border-blurred;
+        padding-left: 2;
     }
     #dialog .title {
         text-style: bold;
