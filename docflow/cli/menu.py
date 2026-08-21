@@ -29,6 +29,7 @@ from docflow.core.operations import (
     attach_agent_models,
     assert_can_init,
     default_docs_path,
+    default_app_branch,
     generate_docs,
     get_dashboard,
     infer_agent_model,
@@ -352,6 +353,7 @@ def run_init(repo: str = "", docs: str = "", agent: Optional[str] = None,
              mode: Optional[str] = None, command: Optional[str] = None,
              model: str = "",
              plan_model: str = "",
+             branch: str = "",
              import_existing: Optional[bool] = None, import_from: str = "",
              import_into: str = "", doc_types: Sequence[str] = (),
              yes: bool = False,
@@ -384,6 +386,18 @@ def run_init(repo: str = "", docs: str = "", agent: Optional[str] = None,
     )
     types = collect_doc_types(doc_types)
     source, into = collect_import(types, import_from, import_into, import_existing)
+    if not branch and sys.stdout.isatty():
+        branches = []
+        try:
+            branches = list_app_branches(app)
+        except Exception:
+            branches = []
+        default_branch = default_app_branch(app)
+        if branches:
+            ux.console.print("\n[bold]Application branch[/bold]")
+            for name in branches:
+                ux.console.print(f"  [cyan]{name}[/cyan]")
+        branch = Prompt.ask("Application branch (main / master / develop)", default=default_branch)
     reviewer = review_init_sections if sys.stdout.isatty() and not yes else None
     try:
         result = init_docs(
@@ -400,6 +414,7 @@ def run_init(repo: str = "", docs: str = "", agent: Optional[str] = None,
             include_sections=include_sections,
             exclude_sections=exclude_sections,
             extra_sections=extra_sections,
+            branch=branch,
         )
     except InitCancelled as exc:
         ux.print_warning(str(exc))
@@ -449,7 +464,8 @@ def run_generate(repo: str = "", docs: str = "", agent: Optional[str] = None,
                  branch: str = "", from_ref: str = "", to_ref: str = "",
                  feature: str = "", full: bool = False, interactive_mode: bool = False,
                  commit_count: Optional[int] = None,
-                 concurrency: Optional[int] = None) -> None:
+                 concurrency: Optional[int] = None,
+                 app_branch: str = "") -> None:
     paths = ensure_paths(repo, docs)
     spec = ensure_agent(paths, agent, mode, command)
     if model or plan_model:
@@ -459,6 +475,8 @@ def run_generate(repo: str = "", docs: str = "", agent: Optional[str] = None,
         dash = get_dashboard(paths.app_repo_path, paths.docs_repo_path)
         ux.console.print("\n[bold]Update docs from[/bold]")
         new_n = len(dash.new_commits)
+        if dash.app_branch:
+            ux.console.print(f"  Application branch: [cyan]{dash.app_branch}[/cyan]")
         if dash.last_documented:
             ux.console.print(
                 f"  Last documented: [cyan]{dash.last_documented.short_sha}[/cyan]  "
@@ -470,9 +488,25 @@ def run_generate(repo: str = "", docs: str = "", agent: Optional[str] = None,
         ux.console.print("  [cyan]2[/cyan]. Last N commits (any number)")
         ux.console.print("  [cyan]3[/cyan]. Branch — last N commits on a named branch")
         ux.console.print("  [cyan]4[/cyan]. Full regeneration of existing docs")
-        choice = Prompt.ask("Choice", choices=["1", "2", "3", "4"], default="1")
+        ux.console.print("  [cyan]5[/cyan]. Change application branch (main / master / develop)")
+        choice = Prompt.ask("Choice", choices=["1", "2", "3", "4", "5"], default="1")
         if choice == "4":
             is_full = True
+        elif choice == "5":
+            branches = []
+            try:
+                branches = list_app_branches(paths.app_repo_path)
+            except Exception:
+                branches = []
+            if branches:
+                ux.console.print("  Branches:")
+                for name in branches:
+                    ux.console.print(f"    [cyan]{name}[/cyan]")
+            app_branch = Prompt.ask(
+                "Application branch",
+                default=app_branch or dash.app_branch or default_app_branch(paths.app_repo_path),
+            )
+            commit_count = None
         elif choice == "1":
             commit_count = None
         elif choice == "2":
@@ -513,6 +547,8 @@ def run_generate(repo: str = "", docs: str = "", agent: Optional[str] = None,
             commit_count=commit_count,
             concurrency=concurrency,
             on_progress=_cli_progress,
+            app_branch=app_branch,
+            on_review_sections=review_init_sections if sys.stdout.isatty() else None,
         )
     except Exception as exc:
         ux.print_error(str(exc))

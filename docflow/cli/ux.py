@@ -51,6 +51,10 @@ def print_dashboard(dash: Dashboard) -> None:
         f"({'exists' if dash.app_exists else 'missing'})",
     )
     table.add_row(
+        "App branch",
+        f"[cyan]{getattr(dash, 'app_branch', '') or 'not set'}[/cyan]",
+    )
+    table.add_row(
         "Docs repo",
         f"[cyan]{dash.docs_repo_path or 'not set'}[/cyan] "
         f"({'exists' if dash.docs_exists else 'missing'})",

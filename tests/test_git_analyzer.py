@@ -75,6 +75,9 @@ def test_list_commits_and_range(temp_git_repo):
     assert len(on_branch) >= 1
     assert analyzer.is_ancestor(commit1, commit2)
     assert analyzer.head_commit()["sha"] == commit2
+    tree = analyzer.list_tree_paths()
+    assert "src/auth/login.py" in tree
+    assert "README.md" in tree
 
 
 def test_feature_bucket_and_ignore_globs():

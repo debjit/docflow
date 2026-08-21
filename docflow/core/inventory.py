@@ -5,6 +5,7 @@ not CLI glue, folders, or developer tooling (git, GitHub CLI, CI).
 
 from __future__ import annotations
 
+import fnmatch
 import re
 from pathlib import Path
 from typing import List, Optional, Sequence, Set
@@ -164,10 +165,22 @@ def _unique_name(title: str, used: Set[str]) -> str:
     return name
 
 
+def _kind_for_path(posix: str) -> Optional[str]:
+    rel = posix_rel(posix)
+    name = Path(rel).name
+    for kind, directory, pattern in _KIND_PATTERNS:
+        dir_posix = directory.replace("\\", "/").rstrip("/")
+        if rel == dir_posix or rel.startswith(dir_posix + "/"):
+            if fnmatch.fnmatch(name, pattern):
+                return kind
+    return None
+
+
 def inventory_app_items(
     repo_path: str,
     ignore_patterns: Optional[Set[str]] = None,
     limit: int = 80,
+    paths: Optional[Sequence[str]] = None,
 ) -> List[dict]:
     """List individual application files worth documenting."""
     root = Path(repo_path)
@@ -201,6 +214,15 @@ def inventory_app_items(
                 "include": kind in APP_KINDS,
             }
         )
+
+    if paths is not None:
+        for rel in paths:
+            if len(items) >= limit:
+                break
+            kind = _kind_for_path(rel)
+            if kind:
+                consider(rel, kind)
+        return items[:limit]
 
     for kind, directory, pattern in _KIND_PATTERNS:
         if len(items) >= limit:

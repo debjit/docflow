@@ -55,6 +55,15 @@ def test_inventory_skips_cli_main_and_menu(tmp_path):
     assert "login" in ids
     assert all(row["kind"] != "module" for row in items)
 
+    from_tree = inventory_app_items(
+        str(tmp_path),
+        DEFAULT_IGNORE,
+        paths=["src/cli/main.py", "src/auth/login.py", "src/cli/menu.py"],
+    )
+    ids_tree = {row["id"] for row in from_tree}
+    assert "login" in ids_tree
+    assert "main" not in ids_tree
+
 
 def test_stack_payload_drops_folders_and_tooling(tmp_path):
     models = tmp_path / "app" / "Models"

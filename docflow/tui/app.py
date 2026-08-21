@@ -42,6 +42,9 @@ from docflow.core.operations import (
     default_cursor_plan_model,
     default_cursor_work_model,
     list_app_branches,
+    default_app_branch,
+    new_commits_since,
+    resolve_branch_rev,
     list_recent_commits,
     parse_doc_types_text,
     picker_group,
@@ -59,7 +62,8 @@ _STATUS_RE = re.compile(
     r"\[(?:\d+/\d+|failed|done|running)\b|"
     r"Scanning |Writing |Running |Generating |Importing |Waiting |"
     r"Creating |Including |Stack survey|git |Remote is |"
-    r"Setup |Update |Published|Pulled |Already |No sections"
+    r"Setup |Update |Published|Pulled |Already |No sections|"
+    r"Application |Checking "
     r")",
     re.IGNORECASE,
 )
@@ -100,6 +104,31 @@ def _agent_key_from_dash(dash) -> str:
             if key != "cursor":
                 return key
     return "agy"
+
+
+def _branch_select_options(repo: str, selected: str = ""):
+    names: list = []
+    if repo:
+        try:
+            names = list_app_branches(repo)
+        except Exception:
+            names = []
+    default = (selected or "").strip() or (default_app_branch(repo) if repo else "HEAD")
+    options = []
+    seen = set()
+    for name in names:
+        if name and name not in seen:
+            options.append((name, name))
+            seen.add(name)
+    if default and default not in seen:
+        options.insert(0, (default, default))
+        seen.add(default)
+    if not options:
+        options = [("HEAD", "HEAD")]
+        default = "HEAD"
+    if default not in {value for _label, value in options}:
+        default = options[0][1]
+    return options, default
 
 
 class ModelPicker(Vertical):
@@ -457,12 +486,20 @@ class SetupScreen(ModalScreen[Optional[dict]]):
             select_keys = {key for key, _ in AGENT_CHOICES if key != "custom"}
             if preferred in select_keys:
                 agent_default = preferred
+        branch_options, branch_default = _branch_select_options(app_default)
         with Vertical(id="dialog"):
             yield Label("Set up DocFlow", classes="title")
             yield Label("Application repo")
             yield Input(value=app_default, id="app-path")
             yield Label("Docs repo (must be empty)")
             yield Input(value=docs_default, id="docs-path")
+            yield Label("Application branch")
+            yield Select(
+                branch_options,
+                value=branch_default,
+                id="app-branch",
+                allow_blank=False,
+            )
             yield Label("Agent")
             yield Select(
                 _agent_select_options(),
@@ -495,6 +532,14 @@ class SetupScreen(ModalScreen[Optional[dict]]):
     def on_mount(self) -> None:
         _sync_model_select(self, str(self.query_one("#agent", Select).value))
 
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "app-path":
+            return
+        options, default = _branch_select_options(event.value.strip())
+        picker = self.query_one("#app-branch", Select)
+        picker.set_options(options)
+        picker.value = default
+
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "agent":
             _sync_model_select(self, str(event.value))
@@ -521,6 +566,7 @@ class SetupScreen(ModalScreen[Optional[dict]]):
                 "import_from": self.query_one("#import-from", Input).value.strip(),
                 "import_into": self.query_one("#import-into", Input).value.strip(),
                 "jobs": _jobs_from_input(self, 1),
+                "branch": str(self.query_one("#app-branch", Select).value or ""),
             }
         )
 
@@ -709,8 +755,19 @@ class GenerateScreen(ModalScreen[Optional[dict]]):
         for name in branches:
             if name != "HEAD":
                 tip_options.append((name, name))
+        app_branch_options, app_branch_default = _branch_select_options(
+            self._repo,
+            getattr(dash, "app_branch", "") or "",
+        )
         with Vertical(id="dialog"):
             yield Label("Update documentation", classes="title")
+            yield Label("Application branch")
+            yield Select(
+                app_branch_options,
+                value=app_branch_default,
+                id="app-branch",
+                allow_blank=False,
+            )
             yield Label("What to use")
             yield Select(
                 [
@@ -776,21 +833,31 @@ class GenerateScreen(ModalScreen[Optional[dict]]):
             return "No app repo configured."
         if source == "new":
             dash = _screen_dashboard(self)
-            lines = []
+            app_branch = str(self.query_one("#app-branch", Select).value or dash.app_branch or "HEAD")
+            lines = [f"Application branch: {app_branch}"]
             if dash.last_documented:
                 lines.append(
                     f"Last documented: {dash.last_documented.short_sha}  {dash.last_documented.message}"
                 )
             else:
                 lines.append("No previous update recorded — will use the latest commit.")
-            if dash.new_commits:
-                lines.append(f"{len(dash.new_commits)} new commit(s):")
-                for commit in dash.new_commits[:15]:
+            new_commits = dash.new_commits
+            if self._repo and self._docs:
+                try:
+                    rev = resolve_branch_rev(self._repo, app_branch)
+                    _cursor, new_commits, stale = new_commits_since(self._repo, self._docs, rev=rev)
+                    if stale:
+                        lines.append("Last documented commit is not on this branch — will scan from the common ancestor.")
+                except Exception:
+                    pass
+            if new_commits:
+                lines.append(f"{len(new_commits)} new commit(s) on {app_branch}:")
+                for commit in new_commits[:15]:
                     lines.append(f"{commit.short_sha}  {commit.message}")
-                if len(dash.new_commits) > 15:
-                    lines.append(f"… {len(dash.new_commits) - 15} more")
+                if len(new_commits) > 15:
+                    lines.append(f"… {len(new_commits) - 15} more")
             else:
-                lines.append("Nothing new locally. Update docs will fetch the remote first.")
+                lines.append("Nothing new on this branch locally. Update docs will fetch the remote first.")
             return "\n".join(lines)
         count = self._commit_count()
         try:
@@ -818,6 +885,8 @@ class GenerateScreen(ModalScreen[Optional[dict]]):
         if event.select.id == "source":
             self._apply_mode(str(event.value))
         elif event.select.id == "tip":
+            self._refresh_preview()
+        elif event.select.id == "app-branch":
             self._refresh_preview()
         elif event.select.id == "agent":
             _sync_model_select(self, str(event.value))
@@ -848,6 +917,7 @@ class GenerateScreen(ModalScreen[Optional[dict]]):
                 "model": work_model,
                 "plan_model": plan_model,
                 "jobs": _jobs_from_input(self, 1),
+                "app_branch": str(self.query_one("#app-branch", Select).value or ""),
             }
         )
 
@@ -1335,6 +1405,7 @@ class DocFlowApp(App[None]):
             f"Project  [bold]{dash.project_name or 'not set'}[/bold]",
             f"App      {dash.app_repo_path or 'not set'}  ({'ok' if dash.app_exists else 'missing'})",
             f"Docs     {dash.docs_repo_path or 'not set'}  ({'ok' if dash.docs_exists else 'missing'})",
+            f"Branch   {dash.app_branch or 'not set'}",
             f"Jobs     {dash.concurrency} agent(s) at a time",
             f"Agent    {dash.agent_name or dash.agent_mode}"
             + (f"  plan {dash.plan_model}" if getattr(dash, "plan_model", "") else "")
@@ -1475,6 +1546,7 @@ class DocFlowApp(App[None]):
                 concurrency=data.get("jobs"),
                 on_review_sections=review,
                 run_control=self._run_control,
+                branch=data.get("branch") or "",
             )
         except InitCancelled as exc:
             self._finish_run(str(exc))
@@ -1568,10 +1640,11 @@ class DocFlowApp(App[None]):
             config=paths.config,
         ) or resolve_agent(config=paths.config) or resolve_agent(agent="manual")
         branch = data.get("branch") or ""
+        app_branch = data.get("app_branch") or ""
         if data["full"]:
             label = "Full regeneration"
         elif data.get("since_last"):
-            label = "Updating new commits since last docs update"
+            label = f"Updating {app_branch or 'tracked branch'} since last docs update"
         elif branch:
             n = data.get("commit_count") or 1
             label = f"Updating {n} commit(s) on {branch}"
@@ -1579,6 +1652,15 @@ class DocFlowApp(App[None]):
             n = data.get("commit_count") or 1
             label = f"Updating last {n} commit" + ("" if n == 1 else "s") + " on HEAD"
         self._begin_run(f"{label}…")
+        loop = asyncio.get_running_loop()
+
+        def review(candidates):
+            future = asyncio.run_coroutine_threadsafe(
+                self.push_screen_wait(SectionPickerScreen(list(candidates))),
+                loop,
+            )
+            return future.result()
+
         try:
             result = await asyncio.to_thread(
                 generate_docs,
@@ -1596,6 +1678,8 @@ class DocFlowApp(App[None]):
                 commit_count=data.get("commit_count"),
                 concurrency=data.get("jobs"),
                 run_control=self._run_control,
+                app_branch=app_branch,
+                on_review_sections=review,
             )
         except Exception as exc:
             self._finish_run(f"Update failed: {exc}")
@@ -1631,26 +1715,37 @@ class DocFlowApp(App[None]):
                     commit_count=1,
                     sync_remote=False,
                     run_control=self._run_control,
+                    app_branch=app_branch,
                 )
             except Exception as exc:
                 self._finish_run(f"Regenerate failed: {exc}")
                 return
         if result.already_current:
-            self._finish_run("Already documented through current HEAD.")
+            self._finish_run("Already documented through the application branch.")
         elif result.no_changes:
-            self._finish_run("Update finished: no changed files in those commits")
+            extra = (
+                f"; added {', '.join(result.new_items)}"
+                if getattr(result, "new_items", None)
+                else ""
+            )
+            self._finish_run(f"Update finished: no changed files in those commits{extra}")
         elif result.features and not all(item.success for item in result.features):
             failed = [item.feature_name for item in result.features if not item.success]
             self._finish_run(f"Update failed for: {', '.join(failed)}")
         elif result.run and result.run.success:
+            added = (
+                f"; new items: {', '.join(result.new_items)}"
+                if getattr(result, "new_items", None)
+                else ""
+            )
             if result.commits:
                 tip = result.commits[0]
                 self._finish_run(
                     f"Update finished: {result.task_type} / {result.feature_name} "
-                    f"({result.commit_count} commit(s), {tip.short_sha} {tip.message})"
+                    f"({result.commit_count} commit(s), {tip.short_sha} {tip.message}){added}"
                 )
             else:
-                self._finish_run(f"Update finished: {result.task_type} / {result.feature_name}")
+                self._finish_run(f"Update finished: {result.task_type} / {result.feature_name}{added}")
         elif result.run:
             self._finish_run(f"Update failed: {result.run.error_message}")
         else:

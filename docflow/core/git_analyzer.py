@@ -234,12 +234,43 @@ class GitAnalyzer:
 
     def list_branches(self) -> List[str]:
         names = [head.name for head in self.repo.heads]
+        seen = {name.lower() for name in names}
+        try:
+            for remote in self.repo.remotes:
+                for ref in remote.refs:
+                    try:
+                        short = ref.remote_head
+                    except Exception:
+                        continue
+                    if not short or short == "HEAD":
+                        continue
+                    if short.lower() in seen:
+                        continue
+                    names.append(short)
+                    seen.add(short.lower())
+        except Exception:
+            pass
         try:
             current = self.repo.active_branch.name
             names.sort(key=lambda name: (name != current, name.lower()))
         except Exception:
             names.sort(key=str.lower)
         return names
+
+    def list_tree_paths(self, rev: str = "HEAD") -> List[str]:
+        """File paths in the commit tree for rev, without checking out."""
+        try:
+            commit = self.repo.commit(rev or "HEAD")
+        except Exception:
+            return []
+        paths: List[str] = []
+        try:
+            for item in commit.tree.traverse():
+                if getattr(item, "type", None) == "blob":
+                    paths.append(posix_rel(item.path))
+        except Exception:
+            return []
+        return paths
 
     def is_ancestor(self, maybe_ancestor: str, rev: str = "HEAD") -> bool:
         if not maybe_ancestor:
@@ -346,16 +377,25 @@ class GitAnalyzer:
 
         return chunks
 
-    def _snippets_for(self, files: List[str], limit: int = 5) -> Dict[str, str]:
+    def _snippets_for(self, files: List[str], limit: int = 5, rev: Optional[str] = None) -> Dict[str, str]:
         snippets: Dict[str, str] = {}
         for fpath in files[:limit]:
-            full_p = os.path.join(self.repo_path, fpath)
-            try:
-                with open(full_p, "r", encoding="utf-8", errors="ignore") as f:
-                    lines = [f.readline() for _ in range(20)]
-                    snippets[fpath] = "".join(lines)
-            except Exception:
-                pass
+            text = ""
+            if rev:
+                try:
+                    text = self.repo.git.show(f"{rev}:{fpath}")
+                except Exception:
+                    text = ""
+            if not text:
+                full_p = os.path.join(self.repo_path, fpath)
+                try:
+                    with open(full_p, "r", encoding="utf-8", errors="ignore") as f:
+                        text = "".join(f.readline() for _ in range(20))
+                except Exception:
+                    text = ""
+            if text:
+                lines = text.splitlines()[:20]
+                snippets[fpath] = "\n".join(lines) + ("\n" if lines else "")
         return snippets
 
     def chunk_from_entry(

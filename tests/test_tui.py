@@ -41,6 +41,7 @@ async def test_update_docs_modal_has_agent_select():
         assert generate.query_one("#plan-model-picker")
         assert generate.query_one("#work-model-picker")
         assert generate.query_one("#jobs")
+        assert generate.query_one("#app-branch")
 
 
 @pytest.mark.asyncio
@@ -95,10 +96,17 @@ async def test_setup_and_publish_open_modals():
         await pilot.pause()
         await pilot.press("i")
         await pilot.pause()
-        assert any(
-            screen.__class__.__name__ in ("SetupScreen", "ImportScreen")
-            for screen in app.screen_stack
+        setup = next(
+            (
+                screen
+                for screen in app.screen_stack
+                if screen.__class__.__name__ in ("SetupScreen", "ImportScreen")
+            ),
+            None,
         )
+        assert setup is not None
+        if setup.__class__.__name__ == "SetupScreen":
+            assert setup.query_one("#app-branch")
         await pilot.press("escape")
         await pilot.pause()
         await pilot.press("p")

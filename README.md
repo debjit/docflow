@@ -108,6 +108,7 @@ project:
 
 app:
   repo_path: "/path/to/app-repo"
+  branch: "main"   # tracked branch; change later if master was renamed to main, or develop becomes master
 
 docs:
   repo_path: "/path/to/docs-repo"
@@ -147,6 +148,7 @@ generation:
     - "__pycache__/"
 ```
 
+- **`app.branch`**: application branch DocFlow documents (`main`, `master`, `develop`, …). Set at init; change it on Update docs. New-commit updates and the dashboard use this branch, not whatever is checked out. Switching branch also scans for new units that were not documented yet.
 - **`agent.name` / `agent.plan_model` / `agent.model`**: last coding agent, plus two LLMs. The **plan** model runs the init stack survey (search the app and structure the docs list). The **work** model writes each section. Init and generate save these; the next UI/CLI run pre-selects them. Cursor defaults: plan `composer-2.5`, work `composer-2.5-fast`.
 - **`generation.concurrency`**: how many agent jobs run at once. Default is **1**. Raise it only if the PC can run several coding agents together. `--jobs N` or `DOCFLOW_JOBS` overrides for one run.
 - **`generation.ignore`**: merged with DocFlow defaults and framework profiles during scan and diff.

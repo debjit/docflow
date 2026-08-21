@@ -17,6 +17,7 @@ class ProjectSettings(BaseModel):
 
 class AppSettings(BaseModel):
     repo_path: str = ""
+    branch: str = ""  # tracked app branch: main, master, develop, …
 
 
 class DocTypeSettings(BaseModel):

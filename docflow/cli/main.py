@@ -53,6 +53,7 @@ def cli(ctx: click.Context, repo: str, docs: str):
 @click.option("--agent", help="Coding agent (agy, opencode, cursor-agent, claude, cline, manual).")
 @click.option("--model", default="", help="Work LLM for writing docs (Cursor: agent models).")
 @click.option("--plan-model", default="", help="Plan LLM for search and structure (init stack survey).")
+@click.option("--branch", default="", help="Application branch to document (main, master, develop, …).")
 @click.option("--import-existing/--fresh", default=None, help="Ask to import files vs start blank.")
 @click.option("--import-from", default="", help="Path or folder to import (never overwrites).")
 @click.option("--import-into", default="", help="Doc type folder to import into.")
@@ -70,6 +71,7 @@ def init(
     agent: Optional[str],
     model: str,
     plan_model: str,
+    branch: str,
     import_existing: Optional[bool],
     import_from: str,
     import_into: str,
@@ -88,6 +90,7 @@ def init(
         agent=agent,
         model=model,
         plan_model=plan_model,
+        branch=branch,
         mode=mode,
         command=command,
         import_existing=import_existing,
@@ -122,6 +125,7 @@ def import_cmd(ctx, docs: str, import_from: str, type_name: str):
 @click.option("--agent", help="Coding agent (agy, opencode, cursor-agent, claude, cline, manual).")
 @click.option("--model", default="", help="Work LLM for writing docs (Cursor: agent models).")
 @click.option("--plan-model", default="", help="Plan LLM saved for search/structure (next init).")
+@click.option("--app-branch", default="", help="Tracked application branch (main, master, develop). Saved and used for new-commit updates.")
 @click.option("--branch", default="", help="Branch or tip to read commits from (default: current HEAD).")
 @click.option("--from", "from_ref", default="", help="Base commit/branch (advanced).")
 @click.option("--to", "to_ref", default="", help="Head commit/branch (advanced).")
@@ -138,6 +142,7 @@ def generate(
     agent: Optional[str],
     model: str,
     plan_model: str,
+    app_branch: str,
     branch: str,
     from_ref: str,
     to_ref: str,
@@ -170,6 +175,7 @@ def generate(
                 full=full,
                 commit_count=commit_count,
                 concurrency=job_count,
+                app_branch=app_branch,
             )
             return
         ux.print_error(str(exc))
@@ -203,6 +209,7 @@ def generate(
             agent=agent,
             model=model,
             plan_model=plan_model,
+            app_branch=app_branch,
             mode=mode,
             command=command,
             branch=branch,
@@ -228,6 +235,7 @@ def generate(
             full=full,
             commit_count=commit_count,
             concurrency=job_count,
+            app_branch=app_branch,
         )
     except Exception as exc:
         ux.print_error(str(exc))

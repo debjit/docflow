@@ -14,6 +14,7 @@ from docflow.core.operations import (
     assert_can_init,
     catalog_agy_models,
     catalog_cursor_models,
+    default_app_branch,
     default_cursor_model,
     generate_docs,
     generate_section_names,
@@ -294,6 +295,8 @@ def test_init_docs_custom_type_and_refuses_rerun(tmp_path, monkeypatch):
     assert "front-end" in result.types
     assert (docs / "front-end").is_dir()
     assert (docs / ".docflow" / "config.yml").exists()
+    saved = DocFlowConfig.load(docs_repo_path=str(docs))
+    assert saved.app.branch
     assert not (app / ".docflow.yml").exists()
     assert not (app / ".docflow" / "config.yml").exists()
     try:
@@ -519,6 +522,79 @@ def test_generate_cursor_tracks_new_commits_only(tmp_path):
     _, new_commits, stale = new_commits_since(str(app), str(docs))
     assert not stale
     assert [c.sha for c in new_commits] == [second.hexsha]
+
+
+def test_default_app_branch_prefers_main(tmp_path):
+    from git import Repo
+
+    app = tmp_path / "app"
+    app.mkdir()
+    repo = Repo.init(app)
+    (app / "README.md").write_text("# App\n")
+    repo.index.add(["README.md"])
+    repo.index.commit("init")
+    if "main" not in [head.name for head in repo.heads]:
+        repo.create_head("main")
+    if "master" not in [head.name for head in repo.heads]:
+        repo.create_head("master")
+    if "develop" not in [head.name for head in repo.heads]:
+        repo.create_head("develop")
+    assert default_app_branch(str(app)) == "main"
+
+
+def test_generate_checks_new_items_when_branch_changes(tmp_path, monkeypatch):
+    from git import Repo
+
+    from docflow.core.agent_runner import AgentRunResult
+    from docflow.core.operations import AgentSpec
+
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+
+    app = tmp_path / "app"
+    docs = tmp_path / "docs"
+    app.mkdir()
+    repo = Repo.init(app)
+    src = app / "src"
+    src.mkdir()
+    (src / "login.py").write_text("def login():\n    return True\n")
+    repo.index.add(["src/login.py"])
+    repo.index.commit("login")
+    base_name = repo.active_branch.name
+    spec = AgentSpec(mode="manual", command="", name="manual")
+    init_docs(app_repo_path=str(app), docs_repo_path=str(docs), agent=spec, branch=base_name)
+    saved = DocFlowConfig.load(docs_repo_path=str(docs))
+    assert saved.app.branch == base_name
+
+    other = repo.create_head("develop")
+    other.checkout()
+    (src / "billing.py").write_text("def charge():\n    return 1\n")
+    repo.index.add(["src/billing.py"])
+    repo.index.commit("billing")
+    repo.heads[base_name].checkout()
+
+    seen = []
+
+    def review(candidates):
+        seen.extend(item.name for item in candidates)
+        return candidates
+
+    generate_docs(
+        app_repo_path=str(app),
+        docs_repo_path=str(docs),
+        agent=spec,
+        app_branch="develop",
+        sync_remote=False,
+        on_review_sections=review,
+    )
+    assert "billing" in seen
+    saved = DocFlowConfig.load(docs_repo_path=str(docs))
+    assert saved.app.branch == "develop"
+    dash = get_dashboard(str(app), str(docs))
+    assert dash.app_branch == "develop"
 
 
 def test_generate_section_names_groups_wrappers_and_features():

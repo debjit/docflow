@@ -292,6 +292,7 @@ def _candidate_from_item(
     analyzer: GitAnalyzer,
     known_types: Optional[set] = None,
     fallback_type: str = "features",
+    rev: str = "",
 ) -> Optional[SectionCandidate]:
     title = str(item.get("title") or item.get("id") or "").strip()
     kind = str(item.get("kind") or "module").strip()
@@ -300,7 +301,7 @@ def _candidate_from_item(
     if not name or is_tooling_item(title or name, kind, rel) or is_bootstrap_item(title or name, kind, rel):
         return None
     paths = [rel.replace("\\", "/")] if rel else []
-    snippets = analyzer._snippets_for(paths[:1]) if paths else {}
+    snippets = analyzer._snippets_for(paths[:1], rev=rev or None) if paths else {}
     included = bool(item.get("include", True))
     if not suggested_section_included(name, kind=kind):
         included = False
@@ -340,6 +341,7 @@ def discover_init_sections(
     arch_seeds: Optional[List[str]] = None,
     on_progress: Optional[Callable[[str], None]] = None,
     stack_payload: Optional[dict] = None,
+    rev: str = "",
 ) -> List[SectionCandidate]:
     """Return individual application units (not folders) for the init picker."""
     del skip_dirs
@@ -350,12 +352,17 @@ def discover_init_sections(
     if on_progress:
         on_progress("Finding application units to document…")
     agent_items = stack_items_from_payload(stack_payload, analyzer.repo_path)
-    raw_items = agent_items or inventory_app_items(analyzer.repo_path, ignore_patterns)
+    tree_paths = analyzer.list_tree_paths(rev) if rev else None
+    raw_items = agent_items or inventory_app_items(
+        analyzer.repo_path,
+        ignore_patterns,
+        paths=tree_paths,
+    )
     candidates: List[SectionCandidate] = []
     seen = set()
     covered: set = set()
     for raw in raw_items:
-        candidate = _candidate_from_item(raw, analyzer, known_set, fallback)
+        candidate = _candidate_from_item(raw, analyzer, known_set, fallback, rev=rev)
         if candidate is None or candidate.name in seen:
             continue
         if has_architecture and candidate.name == "core":
@@ -719,6 +726,8 @@ class GenerateResult:
     used_cursor: bool = False
     features: List[FeatureRunResult] = field(default_factory=list)
     synced_remote: bool = False
+    app_branch: str = ""
+    new_items: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -745,6 +754,7 @@ class Dashboard:
     agent_name: str = ""
     agent_model: str = ""
     plan_model: str = ""
+    app_branch: str = ""
 
 
 @dataclass
@@ -801,6 +811,7 @@ AGENT_CHOICES: Sequence[Tuple[str, str]] = (
 
 CURSOR_AGENT_KEYS = frozenset({"cursor", "cursor-agent", "cursor-interactive"})
 AGY_AGENT_KEYS = frozenset({"agy", "agy-interactive"})
+PREFERRED_APP_BRANCHES = ("main", "master", "develop")
 DEFAULT_CURSOR_MODEL = "composer-2.5"
 DEFAULT_CURSOR_PLAN_MODEL = "composer-2.5"
 DEFAULT_CURSOR_WORK_MODEL = "composer-2.5-fast"
@@ -1333,6 +1344,81 @@ def list_app_branches(app_repo_path: str) -> List[str]:
     return GitAnalyzer(app_repo_path).list_branches()
 
 
+def default_app_branch(app_repo_path: str) -> str:
+    """Prefer main, then master, then develop, then the current checkout."""
+    if not app_repo_path or not os.path.isdir(app_repo_path):
+        return "HEAD"
+    try:
+        names = list_app_branches(app_repo_path)
+    except Exception:
+        names = []
+    by_lower = {name.lower(): name for name in names}
+    for want in PREFERRED_APP_BRANCHES:
+        if want in by_lower:
+            return by_lower[want]
+    current = _current_branch(app_repo_path)
+    if current and current != "HEAD":
+        return current
+    return names[0] if names else "HEAD"
+
+
+def resolve_branch_rev(app_repo_path: str, branch: str) -> str:
+    """Map a branch name to a local rev, falling back to origin/<name>."""
+    name = (branch or "").strip() or "HEAD"
+    if name == "HEAD":
+        return "HEAD"
+    if _rev_exists(app_repo_path, name):
+        return name
+    remote = f"origin/{name}"
+    if _rev_exists(app_repo_path, remote):
+        return remote
+    return name
+
+
+def infer_app_branch(config: Optional[DocFlowConfig], app_repo_path: str = "") -> str:
+    saved = ""
+    if config is not None:
+        saved = (getattr(config.app, "branch", None) or "").strip()
+    if saved:
+        if not app_repo_path:
+            return saved
+        if _rev_exists(app_repo_path, saved) or _rev_exists(app_repo_path, f"origin/{saved}"):
+            return saved
+    if app_repo_path:
+        return default_app_branch(app_repo_path)
+    return saved or "HEAD"
+
+
+def merge_base_sha(app_repo_path: str, a: str, b: str) -> str:
+    try:
+        proc = _git(app_repo_path, ["merge-base", a, b])
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip()
+
+
+def documented_unit_names(config: DocFlowConfig, docs_repo_path: str) -> set:
+    names: set = set()
+    if config.generation.features:
+        names.update(config.generation.features)
+    for extra in config.generation.extra_features or []:
+        if extra.name:
+            names.add(extra.name)
+    for doc_type in config.docs.types:
+        folder = os.path.join(docs_repo_path, doc_type.name)
+        if not os.path.isdir(folder):
+            continue
+        if doc_type.name == "architecture":
+            names.add("architecture")
+            continue
+        for entry in os.listdir(folder):
+            if os.path.isdir(os.path.join(folder, entry)):
+                names.add(entry)
+    return names
+
+
 def list_commits_in_range(app_repo_path: str, base_ref: str, head_ref: str) -> List[CommitInfo]:
     analyzer = GitAnalyzer(app_repo_path)
     return [CommitInfo(**row) for row in analyzer.commits_between(base_ref, head_ref)]
@@ -1631,7 +1717,9 @@ def pull_app_repo(
     if cursor:
         last = CommitInfo(sha=cursor.head_sha, short_sha=cursor.short_sha, message=cursor.message)
     if success and docs_repo_path:
-        _, new_commits, _ = new_commits_since(app_repo_path, docs_repo_path)
+        cfg = DocFlowConfig.load(docs_repo_path=docs_repo_path)
+        rev = resolve_branch_rev(app_repo_path, infer_app_branch(cfg, app_repo_path))
+        _, new_commits, _ = new_commits_since(app_repo_path, docs_repo_path, rev=rev)
     already = success and ("already up to date" in output.lower())
     return PullResult(
         success=success,
@@ -1833,9 +1921,11 @@ def get_dashboard(
     types = configured_types(cfg)
     last_documented = None
     new_commits: List[CommitInfo] = []
+    app_branch = infer_app_branch(cfg, app_path)
     if app_path and docs_path and os.path.isdir(app_path):
         try:
-            cursor, new_commits, _stale = new_commits_since(app_path, docs_path)
+            rev = resolve_branch_rev(app_path, app_branch)
+            cursor, new_commits, _stale = new_commits_since(app_path, docs_path, rev=rev)
             if cursor:
                 last_documented = CommitInfo(
                     sha=cursor.head_sha,
@@ -1874,6 +1964,7 @@ def get_dashboard(
         agent_name=infer_agent_name(cfg),
         agent_model=infer_agent_model(cfg),
         plan_model=infer_plan_model(cfg),
+        app_branch=app_branch,
     )
 
 
@@ -1899,6 +1990,7 @@ def init_docs(
     exclude_sections: Optional[Sequence[str]] = None,
     extra_sections: Optional[Sequence[str]] = None,
     run_control: Optional[RunControl] = None,
+    branch: str = "",
 ) -> InitResult:
     def progress(message: str) -> None:
         if on_progress:
@@ -1924,6 +2016,8 @@ def init_docs(
         config.project.name = os.path.basename(app_repo_path)
     if concurrency is not None:
         config.generation.concurrency = clamp_concurrency(concurrency, 1)
+    tracked_branch = (branch or "").strip() or default_app_branch(app_repo_path)
+    config.app.branch = tracked_branch
 
     analyzer = GitAnalyzer(app_repo_path)
     framework_name, ignore_patterns, skip_dirs = _generation_context(app_repo_path, config)
@@ -1946,6 +2040,7 @@ def init_docs(
     conventions_text = _conventions_text(docs_repo_path, copy_from_package=True)
 
     stack_payload = load_stack_file(docs_repo_path)
+    tracked_rev = resolve_branch_rev(app_repo_path, tracked_branch)
     if agent.mode == "shell" and not stack_payload:
         progress("Asking the plan model what to document from composer/packages…")
         survey_prompt = pending_prompt_path(docs_repo_path, "init-stack-survey.md")
@@ -1993,6 +2088,7 @@ def init_docs(
         arch_seeds=arch_seeds,
         on_progress=on_progress,
         stack_payload=stack_payload,
+        rev=tracked_rev,
     )
     apply_section_filters(candidates, include_sections or (), exclude_sections or ())
     for raw in extra_sections or ():
@@ -2149,7 +2245,7 @@ def init_docs(
     progress("Generating llms.txt…")
     LLMSTxtGenerator(docs_repo_path).generate(config.project.name)
     try:
-        mark_repo_documented(app_repo_path, docs_repo_path)
+        mark_repo_documented(app_repo_path, docs_repo_path, rev=tracked_rev)
     except Exception:
         pass
 
@@ -2170,6 +2266,105 @@ def init_docs(
     )
 
 
+def _merge_section_into_config(config: DocFlowConfig, item: SectionCandidate) -> None:
+    features = list(config.generation.features or [])
+    if item.doc_type != "architecture" and item.name not in features:
+        features.append(item.name)
+        config.generation.features = features
+    extras = list(config.generation.extra_features or [])
+    if item.file_paths and not any(extra.name == item.name for extra in extras):
+        extras.append(
+            ExtraFeatureSettings(
+                name=item.name,
+                paths=list(item.file_paths[:40]),
+                doc_type=item.doc_type,
+            )
+        )
+        config.generation.extra_features = extras
+    type_names = {t.name for t in config.docs.types}
+    if item.doc_type and item.doc_type not in type_names:
+        config.docs.types.append(DocTypeSettings(name=item.doc_type, description=item.description))
+
+
+def _run_init_jobs_for_sections(
+    chosen: Sequence[SectionCandidate],
+    config: DocFlowConfig,
+    app_repo_path: str,
+    docs_repo_path: str,
+    agent: AgentSpec,
+    capture_output: bool,
+    on_progress: Optional[Callable[[str], None]],
+    concurrency: Optional[int],
+    run_control: Optional[RunControl],
+    extra_instructions: str = "",
+    conventions_text: str = "",
+) -> List[FeatureRunResult]:
+    builder = PromptBuilder()
+    work_model = agent.model or model_from_command(agent.command)
+    runner = AgentRunner(
+        mode=agent.mode,
+        command_template=apply_agent_model(agent, work_model).command,
+    )
+    type_desc_by_name = {t.name: t.description for t in config.docs.types}
+    prepared: List[Tuple[str, str, str]] = []
+    features: List[FeatureRunResult] = []
+    total = len(chosen)
+    for index, item in enumerate(chosen, start=1):
+        chunk = item.to_chunk()
+        output_dir = type_output_dir(item.doc_type, item.name)
+        os.makedirs(os.path.join(docs_repo_path, output_dir), exist_ok=True)
+        feature_name = chunk.feature_name
+        rel_prompt_file = rel_pending_prompt(f"init-{item.doc_type}-{feature_name}.md")
+        prompt_file = pending_prompt_path(docs_repo_path, f"init-{item.doc_type}-{feature_name}.md")
+        context = PromptContext(
+            task_type="init",
+            project_name=config.project.name,
+            feature_name=feature_name,
+            app_repo_path=app_repo_path,
+            docs_repo_path=docs_repo_path,
+            feature_chunk=chunk,
+            conventions_text=conventions_text,
+            doc_type=item.doc_type,
+            doc_type_description=type_desc_by_name.get(item.doc_type, item.description),
+            output_dir=output_dir,
+            extra_instructions=extra_instructions,
+        )
+        if on_progress:
+            on_progress(f"[{index}/{total}] Writing prompt for {item.doc_type}/{feature_name}…")
+        builder.save_prompt(context, prompt_file)
+        result_name = f"{item.doc_type}/{feature_name}"
+        if agent.mode == "shell":
+            prepared.append((result_name, prompt_file, rel_prompt_file))
+            continue
+        res = runner.run(
+            prompt_file,
+            docs_repo_path,
+            capture=True if capture_output else None,
+            on_output=on_progress,
+        )
+        features.append(
+            FeatureRunResult(
+                feature_name=result_name,
+                prompt_file=rel_prompt_file,
+                success=res.success,
+                error_message=res.error_message,
+                output_log=res.output_log,
+            )
+        )
+    if agent.mode == "shell" and prepared:
+        workers = _job_concurrency(config, concurrency)
+        features = features + _run_shell_jobs(
+            runner,
+            prepared,
+            docs_repo_path,
+            concurrency=workers,
+            capture_output=capture_output,
+            on_progress=on_progress,
+            run_control=run_control,
+        )
+    return features
+
+
 def generate_docs(
     app_repo_path: str,
     docs_repo_path: str,
@@ -2186,25 +2381,31 @@ def generate_docs(
     sync_remote: bool = True,
     concurrency: Optional[int] = None,
     run_control: Optional[RunControl] = None,
+    app_branch: str = "",
+    on_review_sections: Optional[Callable[[List[SectionCandidate]], Optional[List[SectionCandidate]]]] = None,
 ) -> GenerateResult:
     app_repo_path = os.path.abspath(app_repo_path)
     docs_repo_path = os.path.abspath(docs_repo_path)
     config = config or DocFlowConfig.load(docs_repo_path=docs_repo_path)
     remember_agent(config, agent)
+    previous_branch = (config.app.branch or "").strip()
+    tracked = (app_branch or "").strip() or infer_app_branch(config, app_repo_path)
+    branch_changed = bool(previous_branch and tracked and previous_branch != tracked)
+    config.app.branch = tracked
     if concurrency is not None:
         config.generation.concurrency = clamp_concurrency(concurrency, 1)
-        save_project_config(config, app_repo_path, docs_repo_path)
-    elif config.source_path or config.docs.repo_path:
-        save_project_config(config, app_repo_path, docs_repo_path)
+    save_project_config(config, app_repo_path, docs_repo_path)
 
     is_full = full
     included_count = commit_count or 1
     synced_remote = False
+    tracked_rev = resolve_branch_rev(app_repo_path, tracked)
+    sync_rev = branch or tracked_rev
     if sync_remote and not from_ref and not to_ref:
         sync = ensure_app_repo_current(
             app_repo_path,
             docs_repo_path,
-            rev=branch or "HEAD",
+            rev=sync_rev,
             on_progress=on_progress,
         )
         synced_remote = bool(sync.success and not sync.already_up_to_date)
@@ -2213,11 +2414,65 @@ def generate_docs(
 
     analyzer = GitAnalyzer(app_repo_path)
     framework_name, ignore_patterns, skip_dirs = _generation_context(app_repo_path, config)
+    conventions_text = _conventions_text(docs_repo_path)
+    doc_guidance = _documentation_guidance(docs_repo_path, framework_name)
+    new_item_names: List[str] = []
+    new_item_runs: List[FeatureRunResult] = []
+    if branch_changed and not feature and not from_ref and not to_ref:
+        if on_progress:
+            on_progress(f"Application branch is now {tracked}. Checking for new items…")
+        stack_payload = load_stack_file(docs_repo_path)
+        arch_seeds = architecture_seed_paths(app_repo_path, framework_name)
+        fresh = discover_init_sections(
+            analyzer,
+            config.docs.types,
+            ignore_patterns,
+            skip_dirs,
+            arch_seeds=arch_seeds,
+            on_progress=on_progress,
+            stack_payload=stack_payload,
+            rev=tracked_rev,
+        )
+        documented = documented_unit_names(config, docs_repo_path)
+        candidates = [
+            item
+            for item in fresh
+            if item.name not in documented
+            and not (item.doc_type == "architecture" and "architecture" in documented)
+        ]
+        for item in candidates:
+            item.included = suggested_section_included(item.name, kind=item.kind)
+        if candidates and on_review_sections:
+            if on_progress:
+                on_progress("Waiting for you to confirm new items…")
+            reviewed = on_review_sections(candidates)
+            candidates = selected_sections(reviewed) if reviewed else []
+        elif candidates:
+            candidates = selected_sections(candidates)
+        if candidates:
+            for item in candidates:
+                _merge_section_into_config(config, item)
+            save_project_config(config, app_repo_path, docs_repo_path)
+            new_item_names = [item.name for item in candidates]
+            new_item_runs = _run_init_jobs_for_sections(
+                candidates,
+                config,
+                app_repo_path,
+                docs_repo_path,
+                agent,
+                capture_output=capture_output,
+                on_progress=on_progress,
+                concurrency=concurrency,
+                run_control=run_control,
+                extra_instructions=doc_guidance,
+                conventions_text=conventions_text,
+            )
+
     used_cursor = False
     watermark_stale = False
     explicit_range = bool(from_ref or to_ref or is_full or commit_count is not None or branch)
     if not is_full and not from_ref and not to_ref:
-        rev = branch or "HEAD"
+        rev = tracked_rev if not branch else resolve_branch_rev(app_repo_path, branch)
         if not explicit_range:
             cursor = load_generate_cursor(docs_repo_path)
             if cursor and analyzer.is_ancestor(cursor.head_sha, rev):
@@ -2227,6 +2482,31 @@ def generate_docs(
                         on_progress(
                             f"Already documented through {cursor.short_sha} {cursor.message}. "
                             "Pass --commits / --full to regenerate."
+                        )
+                    if new_item_runs:
+                        try:
+                            mark_repo_documented(app_repo_path, docs_repo_path, rev=rev)
+                        except Exception:
+                            pass
+                        return GenerateResult(
+                            app_repo_path=app_repo_path,
+                            docs_repo_path=docs_repo_path,
+                            agent_mode=agent.mode,
+                            agent_command=agent.command,
+                            is_full=False,
+                            base_ref=cursor.head_sha,
+                            head_ref=rev,
+                            task_type="init",
+                            feature_name=", ".join(new_item_names),
+                            prompt_file="",
+                            no_changes=False,
+                            already_current=False,
+                            used_cursor=True,
+                            commit_count=0,
+                            synced_remote=synced_remote,
+                            features=new_item_runs,
+                            app_branch=tracked,
+                            new_items=new_item_names,
                         )
                     return GenerateResult(
                         app_repo_path=app_repo_path,
@@ -2244,6 +2524,7 @@ def generate_docs(
                         used_cursor=True,
                         commit_count=0,
                         synced_remote=synced_remote,
+                        app_branch=tracked,
                     )
                 from_ref = cursor.head_sha
                 to_ref = analyzer.head_commit(rev)["sha"] if analyzer.head_commit(rev) else rev
@@ -2252,16 +2533,31 @@ def generate_docs(
             else:
                 if cursor:
                     watermark_stale = True
-                    if on_progress:
-                        on_progress(
-                            f"Last documented commit {cursor.short_sha} is no longer on this branch. "
-                            "Falling back to the latest commit."
-                        )
-                recent = analyzer.list_commits(max_count=1, rev=rev)
-                if recent:
-                    from_ref = f"{recent[0]['sha']}^"
-                    to_ref = recent[0]["sha"]
-                    included_count = 1
+                    base = merge_base_sha(app_repo_path, cursor.head_sha, rev) if branch_changed else ""
+                    if base:
+                        if on_progress:
+                            on_progress(
+                                f"Branch changed to {tracked}. Updating from the common ancestor."
+                            )
+                        from_ref = base
+                        to_ref = analyzer.head_commit(rev)["sha"] if analyzer.head_commit(rev) else rev
+                    else:
+                        if on_progress:
+                            on_progress(
+                                f"Last documented commit {cursor.short_sha} is no longer on this branch. "
+                                "Falling back to the latest commit."
+                            )
+                        recent = analyzer.list_commits(max_count=1, rev=rev)
+                        if recent:
+                            from_ref = f"{recent[0]['sha']}^"
+                            to_ref = recent[0]["sha"]
+                            included_count = 1
+                else:
+                    recent = analyzer.list_commits(max_count=1, rev=rev)
+                    if recent:
+                        from_ref = f"{recent[0]['sha']}^"
+                        to_ref = recent[0]["sha"]
+                        included_count = 1
         else:
             n = max(1, int(commit_count or 1))
             recent = analyzer.list_commits(max_count=n, rev=rev)
@@ -2272,7 +2568,7 @@ def generate_docs(
                 included_count = n
                 branch = ""
     base_ref = from_ref or "HEAD~1"
-    head_ref = to_ref or branch or "HEAD"
+    head_ref = to_ref or branch or tracked_rev
     conventions_text = _conventions_text(docs_repo_path)
 
     manifest = analyzer.extract_diff(
@@ -2300,6 +2596,28 @@ def generate_docs(
             mark_repo_documented(app_repo_path, docs_repo_path, included_commits, head_ref)
         except Exception:
             pass
+        if new_item_runs:
+            return GenerateResult(
+                app_repo_path=app_repo_path,
+                docs_repo_path=docs_repo_path,
+                agent_mode=agent.mode,
+                agent_command=agent.command,
+                is_full=is_full,
+                base_ref=base_ref,
+                head_ref=head_ref,
+                task_type="init",
+                feature_name=", ".join(new_item_names),
+                prompt_file="",
+                no_changes=False,
+                commits=included_commits,
+                commit_count=included_count,
+                used_cursor=used_cursor,
+                watermark_stale=watermark_stale,
+                synced_remote=synced_remote,
+                features=new_item_runs,
+                app_branch=tracked,
+                new_items=new_item_names,
+            )
         return GenerateResult(
             app_repo_path=app_repo_path,
             docs_repo_path=docs_repo_path,
@@ -2317,6 +2635,8 @@ def generate_docs(
             used_cursor=used_cursor,
             watermark_stale=watermark_stale,
             synced_remote=synced_remote,
+            app_branch=tracked,
+            new_items=new_item_names,
         )
 
     section_names = generate_section_names(
@@ -2333,6 +2653,28 @@ def generate_docs(
                 mark_repo_documented(app_repo_path, docs_repo_path, included_commits, head_ref)
             except Exception:
                 pass
+            if new_item_runs:
+                return GenerateResult(
+                    app_repo_path=app_repo_path,
+                    docs_repo_path=docs_repo_path,
+                    agent_mode=agent.mode,
+                    agent_command=agent.command,
+                    is_full=is_full,
+                    base_ref=base_ref,
+                    head_ref=head_ref,
+                    task_type="init",
+                    feature_name=", ".join(new_item_names),
+                    prompt_file="",
+                    no_changes=False,
+                    commits=included_commits,
+                    commit_count=included_count,
+                    used_cursor=used_cursor,
+                    watermark_stale=watermark_stale,
+                    synced_remote=synced_remote,
+                    features=new_item_runs,
+                    app_branch=tracked,
+                    new_items=new_item_names,
+                )
             return GenerateResult(
                 app_repo_path=app_repo_path,
                 docs_repo_path=docs_repo_path,
@@ -2436,6 +2778,7 @@ def generate_docs(
             on_progress=on_progress,
             run_control=run_control,
         )
+    feature_runs = new_item_runs + feature_runs
 
     if feature_runs:
         last = feature_runs[-1]
@@ -2474,6 +2817,8 @@ def generate_docs(
         watermark_stale=watermark_stale,
         features=feature_runs,
         synced_remote=synced_remote,
+        app_branch=tracked,
+        new_items=new_item_names,
     )
 
 
