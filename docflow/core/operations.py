@@ -641,6 +641,8 @@ class AgentSpec:
     mode: str
     command: str
     name: str = ""
+    model: str = ""
+    plan_model: str = ""
 
 
 @dataclass(frozen=True)
@@ -742,6 +744,7 @@ class Dashboard:
     concurrency: int = 1
     agent_name: str = ""
     agent_model: str = ""
+    plan_model: str = ""
 
 
 @dataclass
@@ -799,6 +802,8 @@ AGENT_CHOICES: Sequence[Tuple[str, str]] = (
 CURSOR_AGENT_KEYS = frozenset({"cursor", "cursor-agent", "cursor-interactive"})
 AGY_AGENT_KEYS = frozenset({"agy", "agy-interactive"})
 DEFAULT_CURSOR_MODEL = "composer-2.5"
+DEFAULT_CURSOR_PLAN_MODEL = "composer-2.5"
+DEFAULT_CURSOR_WORK_MODEL = "composer-2.5-fast"
 CURSOR_GROUP_LABELS = {
     "current": "Cursor included usage",
     "third_party": "Third-party API usage",
@@ -866,15 +871,24 @@ def infer_agent_model(config: Optional[DocFlowConfig]) -> str:
     return model_from_command(config.agent.command or "")
 
 
+def infer_plan_model(config: Optional[DocFlowConfig]) -> str:
+    if config is None:
+        return ""
+    return (config.agent.plan_model or "").strip()
+
+
 def remember_agent(config: DocFlowConfig, spec: AgentSpec) -> None:
-    """Keep the last agent + model so the next run can reuse them."""
+    """Keep the last agent + models so the next run can reuse them."""
     name = spec.name if spec.name not in {"saved", "shell", ""} else agent_key_from_command(spec.command)
     if spec.mode == "manual":
         name = "manual"
     config.agent.mode = spec.mode
     config.agent.command = spec.command
     config.agent.name = name or infer_agent_name(config)
-    config.agent.model = model_from_command(spec.command)
+    work = (spec.model or "").strip() or model_from_command(spec.command)
+    config.agent.model = work
+    if (spec.plan_model or "").strip():
+        config.agent.plan_model = spec.plan_model.strip()
 
 
 def project_root() -> str:
@@ -1037,11 +1051,33 @@ def default_cursor_model(catalog: Sequence[ModelChoice]) -> str:
     if DEFAULT_CURSOR_MODEL in keys:
         return DEFAULT_CURSOR_MODEL
     for key in keys:
+        if key.startswith("composer-") and not key.endswith("-fast"):
+            return key
+    for key in keys:
         if key.startswith("composer-"):
             return key
     if "auto" in keys:
         return "auto"
     return keys[0] if keys else ""
+
+
+def default_cursor_plan_model(catalog: Sequence[ModelChoice]) -> str:
+    """Bigger default for search / stack survey."""
+    keys = [c.key for c in catalog]
+    if DEFAULT_CURSOR_PLAN_MODEL in keys:
+        return DEFAULT_CURSOR_PLAN_MODEL
+    return default_cursor_model(catalog)
+
+
+def default_cursor_work_model(catalog: Sequence[ModelChoice]) -> str:
+    """Smaller default for writing docs from a prepared prompt."""
+    keys = [c.key for c in catalog]
+    if DEFAULT_CURSOR_WORK_MODEL in keys:
+        return DEFAULT_CURSOR_WORK_MODEL
+    for key in keys:
+        if key.endswith("-fast"):
+            return key
+    return default_cursor_model(catalog)
 
 
 def catalog_agy_models(rows: Sequence[Tuple[str, str]]) -> List[ModelChoice]:
@@ -1121,17 +1157,36 @@ def apply_agent_model(spec: AgentSpec, model: Optional[str]) -> AgentSpec:
     """Insert or strip `--model` on Cursor/agy/Claude command templates."""
     cmd = _MODEL_FLAG.sub("", spec.command or "")
     chosen = (model or "").strip()
-    if not chosen or chosen == "auto":
-        return AgentSpec(mode=spec.mode, command=cmd, name=spec.name)
-    quoted = shlex.quote(chosen)
-    stripped = cmd.lstrip()
-    if spec.name in CURSOR_AGENT_KEYS or stripped.startswith("agent "):
-        cmd = re.sub(r"^(\s*agent)\b", rf"\1 --model {quoted}", cmd, count=1)
-    elif spec.name in AGY_AGENT_KEYS or stripped.startswith("agy "):
-        cmd = re.sub(r"^(\s*agy)\b", rf"\1 --model {quoted}", cmd, count=1)
-    elif spec.name == "claude" or stripped.startswith("claude "):
-        cmd = re.sub(r"^(\s*claude)\b", rf"\1 --model {quoted}", cmd, count=1)
-    return AgentSpec(mode=spec.mode, command=cmd, name=spec.name)
+    work = "" if not chosen or chosen == "auto" else chosen
+    if work:
+        quoted = shlex.quote(work)
+        stripped = cmd.lstrip()
+        if spec.name in CURSOR_AGENT_KEYS or stripped.startswith("agent "):
+            cmd = re.sub(r"^(\s*agent)\b", rf"\1 --model {quoted}", cmd, count=1)
+        elif spec.name in AGY_AGENT_KEYS or stripped.startswith("agy "):
+            cmd = re.sub(r"^(\s*agy)\b", rf"\1 --model {quoted}", cmd, count=1)
+        elif spec.name == "claude" or stripped.startswith("claude "):
+            cmd = re.sub(r"^(\s*claude)\b", rf"\1 --model {quoted}", cmd, count=1)
+    return AgentSpec(
+        mode=spec.mode,
+        command=cmd,
+        name=spec.name,
+        model=work,
+        plan_model=spec.plan_model,
+    )
+
+
+def attach_agent_models(
+    spec: AgentSpec,
+    model: Optional[str] = None,
+    plan_model: Optional[str] = None,
+) -> AgentSpec:
+    """Set the work model on the command and remember the plan model separately."""
+    work = (model if model is not None else spec.model) or ""
+    plan = (plan_model if plan_model is not None else spec.plan_model) or ""
+    updated = apply_agent_model(spec, work)
+    updated.plan_model = "" if plan.strip() == "auto" else plan.strip()
+    return updated
 
 
 def resolve_agent(
@@ -1140,6 +1195,7 @@ def resolve_agent(
     command: Optional[str] = None,
     config: Optional[DocFlowConfig] = None,
     model: Optional[str] = None,
+    plan_model: Optional[str] = None,
 ) -> Optional[AgentSpec]:
     """Resolve agent execution from flags, then saved config. Returns None if unset."""
     spec: Optional[AgentSpec] = None
@@ -1175,17 +1231,18 @@ def resolve_agent(
             )
         if not model:
             model = infer_agent_model(config)
+        if not plan_model:
+            plan_model = infer_plan_model(config)
     if spec is None:
         return None
-    if model:
-        spec = apply_agent_model(spec, model)
-    return spec
+    return attach_agent_models(spec, model=model or spec.model, plan_model=plan_model or spec.plan_model)
 
 
 def resolve_paths(
     repo: Optional[str] = None,
     docs: Optional[str] = None,
     require: bool = True,
+    use_last: bool = True,
 ) -> ResolvedPaths:
     docs_repo_path = ""
     if docs:
@@ -1198,7 +1255,7 @@ def resolve_paths(
             docs_repo_path = docs_repo_from_cwd()
     else:
         docs_repo_path = docs_repo_from_cwd()
-        if not docs_repo_path:
+        if not docs_repo_path and use_last:
             entry = last_usable_project()
             if entry:
                 docs_repo_path = entry.docs_path
@@ -1762,8 +1819,12 @@ def list_pending_prompts(docs_repo_path: str) -> List[str]:
     return sorted(set(names))
 
 
-def get_dashboard(repo: Optional[str] = None, docs: Optional[str] = None) -> Dashboard:
-    paths = resolve_paths(repo, docs, require=False)
+def get_dashboard(
+    repo: Optional[str] = None,
+    docs: Optional[str] = None,
+    use_last: bool = True,
+) -> Dashboard:
+    paths = resolve_paths(repo, docs, require=False, use_last=use_last)
     app_path = paths.app_repo_path
     docs_path = paths.docs_repo_path
     cfg = paths.config
@@ -1812,6 +1873,7 @@ def get_dashboard(repo: Optional[str] = None, docs: Optional[str] = None) -> Das
         concurrency=clamp_concurrency(cfg.generation.concurrency, 1),
         agent_name=infer_agent_name(cfg),
         agent_model=infer_agent_model(cfg),
+        plan_model=infer_plan_model(cfg),
     )
 
 
@@ -1867,7 +1929,16 @@ def init_docs(
     framework_name, ignore_patterns, skip_dirs = _generation_context(app_repo_path, config)
     arch_seeds = architecture_seed_paths(app_repo_path, framework_name)
     builder = PromptBuilder()
-    runner = AgentRunner(mode=agent.mode, command_template=agent.command)
+    work_model = agent.model or model_from_command(agent.command)
+    plan_model = agent.plan_model or work_model
+    plan_runner = AgentRunner(
+        mode=agent.mode,
+        command_template=apply_agent_model(agent, plan_model).command,
+    )
+    runner = AgentRunner(
+        mode=agent.mode,
+        command_template=apply_agent_model(agent, work_model).command,
+    )
     features: List[FeatureRunResult] = []
 
     created_docs = not os.path.isdir(docs_repo_path)
@@ -1876,7 +1947,7 @@ def init_docs(
 
     stack_payload = load_stack_file(docs_repo_path)
     if agent.mode == "shell" and not stack_payload:
-        progress("Asking the agent what to document from composer/packages…")
+        progress("Asking the plan model what to document from composer/packages…")
         survey_prompt = pending_prompt_path(docs_repo_path, "init-stack-survey.md")
         survey_context = PromptContext(
             task_type="stack-survey",
@@ -1893,7 +1964,7 @@ def init_docs(
             ],
         )
         builder.save_prompt(survey_context, survey_prompt)
-        survey_res = runner.run(
+        survey_res = plan_runner.run(
             survey_prompt,
             docs_repo_path,
             capture=True if capture_output else None,
@@ -2013,7 +2084,7 @@ def init_docs(
         )
 
     total = len(jobs)
-    progress(f"Writing init prompts for {total} section(s).")
+    progress(f"Writing init prompts for {total} section(s) with the work model.")
     imported_note = None
     if imported.copied:
         imported_note = "Imported files (do not overwrite):\n" + "\n".join(f"- {p}" for p in imported.copied[:40])

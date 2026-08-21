@@ -19,18 +19,21 @@ from docflow.core.operations import (
     ConfigError,
     CURSOR_AGENT_KEYS,
     DEFAULT_CURSOR_MODEL,
+    DEFAULT_CURSOR_PLAN_MODEL,
+    DEFAULT_CURSOR_WORK_MODEL,
     DEFAULT_DOC_TYPES,
     AlreadyInitialized,
     InitCancelled,
     SectionCandidate,
     agent_supports_models,
-    apply_agent_model,
+    attach_agent_models,
     assert_can_init,
     default_docs_path,
     generate_docs,
     get_dashboard,
     infer_agent_model,
     infer_agent_name,
+    infer_plan_model,
     group_candidates,
     import_docs,
     init_docs,
@@ -48,7 +51,7 @@ from docflow.core.operations import (
 )
 
 
-def pick_agent(default_key: str = "agy", default_model: str = ""):
+def pick_agent(default_key: str = "agy", default_model: str = "", default_plan_model: str = ""):
     ux.console.print("\n[bold]How should DocFlow run your coding agent?[/bold]")
     keys = []
     for i, (key, label) in enumerate(AGENT_CHOICES, start=1):
@@ -64,14 +67,20 @@ def pick_agent(default_key: str = "agy", default_model: str = ""):
         )
         return resolve_agent(command=cmd)
     spec = resolve_agent(agent=key)
-    return pick_model(spec, model=default_model if key == default_key else "")
+    return pick_model(
+        spec,
+        model=default_model if key == default_key else "",
+        plan_model=default_plan_model if key == default_key else "",
+    )
 
 
-def pick_model(spec, model: str = ""):
+def pick_model(spec, model: str = "", plan_model: str = ""):
     if spec is None:
         return spec
-    if model:
-        return apply_agent_model(spec, model)
+    if model and plan_model:
+        return attach_agent_models(spec, model=model, plan_model=plan_model)
+    if model and not agent_supports_models(spec.name):
+        return attach_agent_models(spec, model=model, plan_model=plan_model or model)
     if not agent_supports_models(spec.name) and not (spec.command or "").lstrip().startswith(
         ("agent ", "agy ")
     ):
@@ -82,37 +91,37 @@ def pick_model(spec, model: str = ""):
     is_cursor = spec.name in CURSOR_AGENT_KEYS or (spec.command or "").lstrip().startswith(
         "agent "
     )
-    if is_cursor:
-        ux.console.print("\n[bold]Usage pool[/bold]")
-        ux.console.print("  [cyan]1[/cyan]. Cursor included usage")
-        ux.console.print("  [cyan]2[/cyan]. Third-party API usage")
-        pool = Prompt.ask("Usage pool", choices=["1", "2"], default="1")
-        group = current if pool == "1" else third
-        ux.console.print("\n[bold]Which LLM model?[/bold]")
-        for choice in group:
-            ux.console.print(f"  [cyan]{choice.value or choice.key}[/cyan]  {choice.label}")
-        ids = {c.value or c.key for c in group}
-        default = DEFAULT_CURSOR_MODEL if DEFAULT_CURSOR_MODEL in ids else (
-            (group[0].value or group[0].key) if group else DEFAULT_CURSOR_MODEL
-        )
-        chosen = Prompt.ask("Model", default=default)
-        if chosen in ("default", "auto"):
-            chosen = ""
-        return apply_agent_model(spec, chosen)
-    ux.console.print("\n[bold]Which LLM model?[/bold]")
+    ux.console.print("\n[bold]Which LLM models?[/bold]")
+    ux.console.print("[dim]Plan model searches the app and structures the docs list.[/dim]")
+    ux.console.print("[dim]Work model writes each section from that list.[/dim]")
     if current:
-        ux.console.print("[dim]Current[/dim]")
+        ux.console.print("[dim]Current / included usage[/dim]")
         for choice in current:
             ux.console.print(f"  [cyan]{choice.value or choice.key}[/cyan]  {choice.label}")
     if third:
         ux.console.print("[dim]Third-party[/dim]")
         for choice in third:
             ux.console.print(f"  [cyan]{choice.value or choice.key}[/cyan]  {choice.label}")
-    default = ""
-    chosen = Prompt.ask("Model", default=default or "default")
-    if chosen in ("default", "auto"):
-        chosen = ""
-    return apply_agent_model(spec, chosen)
+    ids = {c.value or c.key for c in choices}
+    if is_cursor:
+        plan_default = (
+            plan_model
+            or (DEFAULT_CURSOR_PLAN_MODEL if DEFAULT_CURSOR_PLAN_MODEL in ids else DEFAULT_CURSOR_MODEL)
+        )
+        work_default = (
+            model
+            or (DEFAULT_CURSOR_WORK_MODEL if DEFAULT_CURSOR_WORK_MODEL in ids else DEFAULT_CURSOR_MODEL)
+        )
+    else:
+        plan_default = plan_model or model or "default"
+        work_default = model or "default"
+    chosen_plan = Prompt.ask("Plan model (search & structure)", default=plan_default)
+    chosen_work = Prompt.ask("Work model (write docs)", default=work_default)
+    if chosen_plan in ("default", "auto"):
+        chosen_plan = ""
+    if chosen_work in ("default", "auto"):
+        chosen_work = ""
+    return attach_agent_models(spec, model=chosen_work, plan_model=chosen_plan)
 
 
 def ensure_paths(repo: str, docs: str, prompt_missing: bool = True):
@@ -136,6 +145,7 @@ def ensure_agent(paths, agent: Optional[str] = None, mode: Optional[str] = None,
         spec = pick_agent(
             default_key=infer_agent_name(paths.config) or "agy",
             default_model=infer_agent_model(paths.config),
+            default_plan_model=infer_plan_model(paths.config),
         )
     if spec is None:
         raise click.Abort()
@@ -341,6 +351,7 @@ def pick_open_project(repo: str = "", docs: str = "", force_list: bool = False) 
 def run_init(repo: str = "", docs: str = "", agent: Optional[str] = None,
              mode: Optional[str] = None, command: Optional[str] = None,
              model: str = "",
+             plan_model: str = "",
              import_existing: Optional[bool] = None, import_from: str = "",
              import_into: str = "", doc_types: Sequence[str] = (),
              yes: bool = False,
@@ -360,10 +371,16 @@ def run_init(repo: str = "", docs: str = "", agent: Optional[str] = None,
         ux.print_error(str(exc))
         raise click.Abort()
     spec = resolve_agent(
-        agent=agent, mode=mode, command=command, config=paths.config, model=model
+        agent=agent,
+        mode=mode,
+        command=command,
+        config=paths.config,
+        model=model,
+        plan_model=plan_model,
     ) or pick_agent(
         default_key=infer_agent_name(paths.config) or "agy",
-        default_model=infer_agent_model(paths.config),
+        default_model=infer_agent_model(paths.config) or model,
+        default_plan_model=infer_plan_model(paths.config) or plan_model,
     )
     types = collect_doc_types(doc_types)
     source, into = collect_import(types, import_from, import_into, import_existing)
@@ -428,13 +445,15 @@ def run_import(docs: str = "", source: str = "", type_name: str = "") -> None:
 def run_generate(repo: str = "", docs: str = "", agent: Optional[str] = None,
                  mode: Optional[str] = None, command: Optional[str] = None,
                  model: str = "",
+                 plan_model: str = "",
                  branch: str = "", from_ref: str = "", to_ref: str = "",
                  feature: str = "", full: bool = False, interactive_mode: bool = False,
                  commit_count: Optional[int] = None,
                  concurrency: Optional[int] = None) -> None:
     paths = ensure_paths(repo, docs)
     spec = ensure_agent(paths, agent, mode, command)
-    spec = apply_agent_model(spec, model) if model else spec
+    if model or plan_model:
+        spec = attach_agent_models(spec, model=model or spec.model, plan_model=plan_model or spec.plan_model)
     is_full = full
     if interactive_mode and not from_ref and not to_ref and not branch and not full and commit_count is None:
         dash = get_dashboard(paths.app_repo_path, paths.docs_repo_path)
@@ -519,7 +538,11 @@ def maybe_regen_last_docs(paths, spec, result, feature: str = "") -> None:
         ux.console.print("[dim]Exiting without regenerating.[/dim]")
         return
     default_key = spec.name if spec and spec.name in {key for key, _ in AGENT_CHOICES} else "agy"
-    spec = pick_agent(default_key=default_key, default_model=infer_agent_model(paths.config))
+    spec = pick_agent(
+        default_key=default_key,
+        default_model=infer_agent_model(paths.config),
+        default_plan_model=infer_plan_model(paths.config),
+    )
     if spec is None:
         return
     try:

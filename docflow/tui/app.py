@@ -25,6 +25,8 @@ from docflow.core.operations import (
     CURSOR_AGENT_KEYS,
     ConfigError,
     DEFAULT_CURSOR_MODEL,
+    DEFAULT_CURSOR_PLAN_MODEL,
+    DEFAULT_CURSOR_WORK_MODEL,
     DEFAULT_DOC_TYPES,
     InitCancelled,
     SectionCandidate,
@@ -37,6 +39,8 @@ from docflow.core.operations import (
     init_docs,
     kind_heading,
     list_agent_models,
+    default_cursor_plan_model,
+    default_cursor_work_model,
     list_app_branches,
     list_recent_commits,
     parse_doc_types_text,
@@ -86,7 +90,9 @@ def _agent_key_from_dash(dash) -> str:
     select_keys = {key for key, _ in AGENT_CHOICES if key != "custom"}
     if name in select_keys:
         return name
-    if not dash.configured or dash.agent_mode == "manual":
+    if not dash.configured:
+        return "agy"
+    if dash.agent_mode == "manual":
         return "manual"
     cmd = dash.agent_command or ""
     for key, preset in AGENT_PRESETS.items():
@@ -99,24 +105,29 @@ def _agent_key_from_dash(dash) -> str:
 class ModelPicker(Vertical):
     """Filterable model list: included usage on top, third-party underneath."""
 
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, caption: str = "Model", role: str = "work", **kwargs) -> None:
         super().__init__(**kwargs)
+        self._caption = caption
+        self.role = role
         self._choices = []
         self._selected_value = ""
         self._id_to_value: dict[str, str] = {}
         self._suppress_highlight = False
 
     def compose(self) -> ComposeResult:
-        yield Label("Model")
-        yield Input(placeholder="Filter models…  try composer, grok, gemini", id="model-filter")
-        yield OptionList(id="model-list")
+        yield Label(self._caption)
+        yield Input(placeholder="Filter models…  try composer, grok, gemini")
+        yield OptionList()
 
     def selected_value(self) -> str:
         return self._selected_value
 
+    def _listing(self) -> OptionList:
+        return self.query_one(OptionList)
+
     def set_loading(self) -> None:
         self._selected_value = ""
-        listing = self.query_one("#model-list", OptionList)
+        listing = self._listing()
         listing.clear_options()
         listing.add_option(Option("Loading models…", disabled=True))
 
@@ -126,28 +137,36 @@ class ModelPicker(Vertical):
             self._selected_value = selected
         elif not self._selected_value and choices:
             keys = {c.key: c.value for c in choices}
-            if DEFAULT_CURSOR_MODEL in keys:
-                self._selected_value = keys[DEFAULT_CURSOR_MODEL]
+            if self.role == "plan":
+                pick = default_cursor_plan_model(choices)
+            else:
+                pick = default_cursor_work_model(choices)
+            if pick in keys:
+                self._selected_value = keys[pick]
             else:
                 current = [c for c in choices if c.group == "current"]
                 self._selected_value = (current[0] if current else choices[0]).value
         query = ""
         try:
-            query = self.query_one("#model-filter", Input).value
+            query = self.query_one(Input).value
         except Exception:
             pass
         self._rebuild(query)
 
     def on_input_changed(self, event: Input.Changed) -> None:
-        if event.input.id == "model-filter":
+        if event.input.parent is self:
             event.stop()
             self._rebuild(event.value)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_list.parent is not self:
+            return
         event.stop()
         self._remember(event.option)
 
     def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        if event.option_list.parent is not self:
+            return
         event.stop()
         if self._suppress_highlight:
             return
@@ -169,7 +188,7 @@ class ModelPicker(Vertical):
         return query in blob
 
     def _rebuild(self, query: str) -> None:
-        listing = self.query_one("#model-list", OptionList)
+        listing = self._listing()
         q = (query or "").strip().lower()
         current = [c for c in self._choices if c.group == "current" and self._match(c, q)]
         third = [c for c in self._choices if c.group == "third_party" and self._match(c, q)]
@@ -222,11 +241,13 @@ class ModelPicker(Vertical):
 
 
 def _sync_model_select(screen, agent_key: str) -> None:
-    picker = screen.query_one("#model-picker", ModelPicker)
+    pickers = list(screen.query(ModelPicker))
     show = agent_supports_models(agent_key)
-    picker.display = show
+    for picker in pickers:
+        picker.display = show
+        if show:
+            picker.set_loading()
     if show:
-        picker.set_loading()
         screen.run_worker(_load_models(screen, agent_key), exclusive=True, group="models")
 
 
@@ -238,23 +259,41 @@ async def _load_models(screen, agent_key: str) -> None:
     if current != agent_key:
         return
     dash = _screen_dashboard(screen)
-    preferred = ""
-    if (getattr(dash, "agent_name", "") or "") == agent_key:
-        preferred = getattr(dash, "agent_model", "") or ""
-    screen.query_one("#model-picker", ModelPicker).set_choices(choices, selected=preferred)
+    prefs = getattr(getattr(screen, "app", None), "_agent_defaults", {}) or {}
+    same_agent = (getattr(dash, "agent_name", "") or "") == agent_key
+    prefs_match = (prefs.get("name") or "") == agent_key
+    plan_pref = ""
+    work_pref = ""
+    if same_agent:
+        plan_pref = getattr(dash, "plan_model", "") or ""
+        work_pref = getattr(dash, "agent_model", "") or ""
+    elif prefs_match:
+        plan_pref = prefs.get("plan_model") or ""
+        work_pref = prefs.get("model") or ""
+    for picker in screen.query(ModelPicker):
+        selected = plan_pref if picker.role == "plan" else work_pref
+        picker.set_choices(choices, selected=selected)
 
 
-def _selected_model(screen) -> str:
-    picker = screen.query_one("#model-picker", ModelPicker)
-    if not picker.display:
-        return ""
-    return picker.selected_value()
+def _selected_models(screen) -> tuple[str, str]:
+    plan = ""
+    work = ""
+    for picker in screen.query(ModelPicker):
+        if not picker.display:
+            continue
+        if picker.role == "plan":
+            plan = picker.selected_value()
+        else:
+            work = picker.selected_value()
+    return plan, work
 
 
-def _resolve_screen_model(agent_key: str, model: Optional[str]) -> str:
+def _resolve_role_model(agent_key: str, model: Optional[str], role: str) -> str:
     chosen = (model or "").strip()
     if agent_key in CURSOR_AGENT_KEYS and not chosen:
-        return DEFAULT_CURSOR_MODEL
+        if role == "plan":
+            return DEFAULT_CURSOR_PLAN_MODEL
+        return DEFAULT_CURSOR_WORK_MODEL if role == "work" else DEFAULT_CURSOR_MODEL
     return chosen
 
 
@@ -412,6 +451,12 @@ class SetupScreen(ModalScreen[Optional[dict]]):
         app_default = dash.app_repo_path or os.getcwd()
         docs_default = dash.docs_repo_path or default_docs_path(app_default)
         agent_default = _agent_key_from_dash(dash)
+        if not dash.configured:
+            prefs = getattr(getattr(self, "app", None), "_agent_defaults", {}) or {}
+            preferred = prefs.get("name") or ""
+            select_keys = {key for key, _ in AGENT_CHOICES if key != "custom"}
+            if preferred in select_keys:
+                agent_default = preferred
         with Vertical(id="dialog"):
             yield Label("Set up DocFlow", classes="title")
             yield Label("Application repo")
@@ -425,7 +470,16 @@ class SetupScreen(ModalScreen[Optional[dict]]):
                 id="agent",
                 allow_blank=False,
             )
-            yield ModelPicker(id="model-picker")
+            yield ModelPicker(
+                caption="Plan model (search & structure)",
+                role="plan",
+                id="plan-model-picker",
+            )
+            yield ModelPicker(
+                caption="Work model (write docs)",
+                role="work",
+                id="work-model-picker",
+            )
             yield Label("Parallel agents (1 is safest on most PCs)")
             yield Input(value="1", id="jobs")
             yield Label("Doc types (one per line: name: description)")
@@ -455,12 +509,14 @@ class SetupScreen(ModalScreen[Optional[dict]]):
             return
         agent_key = str(self.query_one("#agent", Select).value)
         types = parse_doc_types_text(self.query_one("#types", TextArea).text)
+        plan_model, work_model = _selected_models(self)
         self.dismiss(
             {
                 "app": self.query_one("#app-path", Input).value.strip(),
                 "docs": self.query_one("#docs-path", Input).value.strip(),
                 "agent": agent_key,
-                "model": _selected_model(self),
+                "model": work_model,
+                "plan_model": plan_model,
                 "types": types or list(DEFAULT_DOC_TYPES),
                 "import_from": self.query_one("#import-from", Input).value.strip(),
                 "import_into": self.query_one("#import-into", Input).value.strip(),
@@ -681,7 +737,16 @@ class GenerateScreen(ModalScreen[Optional[dict]]):
                 id="agent",
                 allow_blank=False,
             )
-            yield ModelPicker(id="model-picker")
+            yield ModelPicker(
+                caption="Plan model (search & structure)",
+                role="plan",
+                id="plan-model-picker",
+            )
+            yield ModelPicker(
+                caption="Work model (write docs)",
+                role="work",
+                id="work-model-picker",
+            )
             yield Label("Parallel agents (1 is safest on most PCs)")
             yield Input(value=str(dash.concurrency or 1), id="jobs")
             with Horizontal(classes="buttons"):
@@ -771,6 +836,7 @@ class GenerateScreen(ModalScreen[Optional[dict]]):
             return
         source = str(self.query_one("#source", Select).value)
         tip = self._tip()
+        plan_model, work_model = _selected_models(self)
         self.dismiss(
             {
                 "full": source == "full",
@@ -779,7 +845,8 @@ class GenerateScreen(ModalScreen[Optional[dict]]):
                 "branch": "" if source != "commits" or tip == "HEAD" else tip,
                 "feature": self.query_one("#feature", Input).value.strip(),
                 "agent": str(self.query_one("#agent", Select).value),
-                "model": _selected_model(self),
+                "model": work_model,
+                "plan_model": plan_model,
                 "jobs": _jobs_from_input(self, 1),
             }
         )
@@ -810,7 +877,16 @@ class RegenLastScreen(ModalScreen[Optional[dict]]):
                 id="agent",
                 allow_blank=False,
             )
-            yield ModelPicker(id="model-picker")
+            yield ModelPicker(
+                caption="Plan model (search & structure)",
+                role="plan",
+                id="plan-model-picker",
+            )
+            yield ModelPicker(
+                caption="Work model (write docs)",
+                role="work",
+                id="work-model-picker",
+            )
             with Horizontal(classes="buttons"):
                 yield Button("Regenerate", variant="primary", id="ok")
                 yield Button("Exit", id="cancel")
@@ -830,10 +906,12 @@ class RegenLastScreen(ModalScreen[Optional[dict]]):
         if event.button.id == "cancel":
             self.dismiss(None)
             return
+        plan_model, work_model = _selected_models(self)
         self.dismiss(
             {
                 "agent": str(self.query_one("#agent", Select).value),
-                "model": _selected_model(self),
+                "model": work_model,
+                "plan_model": plan_model,
             }
         )
 
@@ -961,7 +1039,7 @@ class DocFlowApp(App[None]):
         text-style: bold;
         margin-bottom: 1;
     }
-    #dialog Input, #dialog Select, #dialog TextArea, #preview, #model-picker, #section-list {
+    #dialog Input, #dialog Select, #dialog TextArea, #preview, #plan-model-picker, #work-model-picker, #section-list {
         margin-bottom: 1;
     }
     #project-list, #section-list {
@@ -981,16 +1059,16 @@ class DocFlowApp(App[None]):
     #dialog TextArea {
         height: 8;
     }
-    #model-picker {
+    #plan-model-picker, #work-model-picker {
         height: auto;
     }
-    #model-list {
-        height: 14;
+    #plan-model-picker OptionList, #work-model-picker OptionList {
+        height: 8;
         border: tall $border-blurred;
         background: $surface;
         padding: 0 1;
     }
-    #model-filter {
+    #plan-model-picker Input, #work-model-picker Input {
         margin-bottom: 0;
     }
     #preview {
@@ -1022,12 +1100,53 @@ class DocFlowApp(App[None]):
         super().__init__(**kwargs)
         self._repo = repo or ""
         self._docs = docs or ""
+        self._blank_session = False
+        self._agent_defaults: dict = {}
+        self._previous_session: Optional[tuple] = None
 
     def _dashboard(self):
-        return get_dashboard(self._repo or None, self._docs or None)
+        return get_dashboard(
+            self._repo or None,
+            self._docs or None,
+            use_last=not self._blank_session,
+        )
 
     def _resolve(self, require: bool = True):
         return resolve_paths(self._repo or None, self._docs or None, require=require)
+
+    def _clear_run_views(self) -> None:
+        self._progress_lines.clear()
+        self._log_lines.clear()
+        self._paused_progress.clear()
+        self._paused_logs.clear()
+        self._run_control.resume()
+        self._render_progress()
+        self.query_one("#log", Log).clear()
+        self._set_step("Ready")
+
+    def _begin_new_project(self) -> None:
+        dash = self._dashboard()
+        self._agent_defaults = {
+            "name": dash.agent_name if dash.configured else "",
+            "model": dash.agent_model,
+            "plan_model": getattr(dash, "plan_model", ""),
+        }
+        self._previous_session = (self._repo, self._docs, self._blank_session)
+        self._repo = ""
+        self._docs = ""
+        self._blank_session = True
+        self.title = "DocFlow"
+        self._clear_run_views()
+        self.sub_title = "New project"
+        self.query_one("#step", Static).update("New project")
+        self.refresh_summary()
+
+    def _restore_previous_session(self) -> None:
+        if not self._previous_session:
+            return
+        self._repo, self._docs, self._blank_session = self._previous_session
+        self._previous_session = None
+        self.refresh_summary()
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -1190,6 +1309,26 @@ class DocFlowApp(App[None]):
             self.query_one(f"#{button_id}", Button).disabled = busy
 
     def refresh_summary(self) -> None:
+        if self._blank_session:
+            self.title = "DocFlow"
+            self.query_one("#btn-setup", Button).label = "Setup"
+            self.query_one("#summary", Static).update(
+                "\n".join(
+                    [
+                        "Project  [bold]not set[/bold]",
+                        "App      not set",
+                        "Docs     not set",
+                        "Jobs     1 agent(s) at a time",
+                        "Agent    not set",
+                        "Types: none",
+                        "Documented: none yet",
+                        "New commits (0): none",
+                        "Features (0): none",
+                        "Pending prompts (0): none",
+                    ]
+                )
+            )
+            return
         dash = self._dashboard()
         self.title = dash.project_name or "DocFlow"
         lines = [
@@ -1198,7 +1337,8 @@ class DocFlowApp(App[None]):
             f"Docs     {dash.docs_repo_path or 'not set'}  ({'ok' if dash.docs_exists else 'missing'})",
             f"Jobs     {dash.concurrency} agent(s) at a time",
             f"Agent    {dash.agent_name or dash.agent_mode}"
-            + (f"  {dash.agent_model}" if dash.agent_model else "")
+            + (f"  plan {dash.plan_model}" if getattr(dash, "plan_model", "") else "")
+            + (f"  work {dash.agent_model}" if dash.agent_model else "")
             + f"  {dash.agent_command or 'manual'}",
             f"Types: {', '.join(dash.doc_types) or 'none'}",
             f"Documented: {dash.last_documented.short_sha}  {dash.last_documented.message}"
@@ -1306,7 +1446,8 @@ class DocFlowApp(App[None]):
             return
         spec = resolve_agent(
             agent=data["agent"],
-            model=_resolve_screen_model(data["agent"], data.get("model")),
+            model=_resolve_role_model(data["agent"], data.get("model"), "work"),
+            plan_model=_resolve_role_model(data["agent"], data.get("plan_model"), "plan"),
         )
         if spec is None:
             spec = resolve_agent(agent="manual")
@@ -1345,6 +1486,8 @@ class DocFlowApp(App[None]):
         imported = f", imported {len(result.imported_copied)}" if result.imported_copied else ""
         self._docs = result.docs_repo_path
         self._repo = result.app_repo_path
+        self._blank_session = False
+        self._previous_session = None
         open_project(result.docs_repo_path)
         self._finish_run(
             f"Setup complete: {ok}/{len(result.features)} sections{imported} → {result.docs_repo_path}"
@@ -1389,8 +1532,13 @@ class DocFlowApp(App[None]):
         if not picked:
             return None
         if picked.get("new"):
+            self._begin_new_project()
             await self._do_setup()
+            if self._blank_session and not self._docs:
+                self._restore_previous_session()
             return picked
+        self._blank_session = False
+        self._previous_session = None
         self._docs = picked.get("docs") or ""
         self._repo = picked.get("repo") or ""
         self.refresh_summary()
@@ -1415,7 +1563,8 @@ class DocFlowApp(App[None]):
             return
         spec = resolve_agent(
             agent=data.get("agent"),
-            model=_resolve_screen_model(data.get("agent") or "", data.get("model")),
+            model=_resolve_role_model(data.get("agent") or "", data.get("model"), "work"),
+            plan_model=_resolve_role_model(data.get("agent") or "", data.get("plan_model"), "plan"),
             config=paths.config,
         ) or resolve_agent(config=paths.config) or resolve_agent(agent="manual")
         branch = data.get("branch") or ""
@@ -1460,7 +1609,8 @@ class DocFlowApp(App[None]):
                 return
             spec = resolve_agent(
                 agent=regen.get("agent"),
-                model=_resolve_screen_model(regen.get("agent") or "", regen.get("model")),
+                model=_resolve_role_model(regen.get("agent") or "", regen.get("model"), "work"),
+                plan_model=_resolve_role_model(regen.get("agent") or "", regen.get("plan_model"), "plan"),
                 config=paths.config,
             ) or spec
             self._begin_run("Regenerating last documented commit…")

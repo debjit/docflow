@@ -101,6 +101,21 @@ def test_default_cursor_model_without_composer_25():
     assert default_cursor_model(no_composer) == "auto"
 
 
+def test_cursor_plan_and_work_defaults():
+    from docflow.core.operations import default_cursor_plan_model, default_cursor_work_model
+
+    catalog = catalog_cursor_models(
+        [
+            ("auto", "Auto"),
+            ("composer-2.5", "Composer 2.5"),
+            ("composer-2.5-fast", "Composer 2.5 Fast"),
+            ("gpt-5.2", "GPT-5.2"),
+        ]
+    )
+    assert default_cursor_plan_model(catalog) == "composer-2.5"
+    assert default_cursor_work_model(catalog) == "composer-2.5-fast"
+
+
 def test_parse_and_catalog_agy_models():
     rows = parse_agy_model_list(
         "Fetching available models...\n"
@@ -174,9 +189,17 @@ def test_saved_agent_name_and_model_are_reused():
     assert cfg.agent.model == "composer-2.5"
     assert infer_agent_name(cfg) == "cursor-agent"
     assert infer_agent_model(cfg) == "composer-2.5"
+    flagged.plan_model = "gpt-5.2"
+    remember_agent(cfg, flagged)
+    assert cfg.agent.plan_model == "gpt-5.2"
+    from docflow.core.operations import infer_plan_model
+
+    assert infer_plan_model(cfg) == "gpt-5.2"
     reused = resolve_agent(config=cfg)
     assert reused is not None
     assert reused.name == "cursor-agent"
+    assert reused.model == "composer-2.5"
+    assert reused.plan_model == "gpt-5.2"
     assert "--model composer-2.5" in reused.command
 
 
@@ -382,6 +405,60 @@ def test_init_docs_review_keeps_selection_and_extra(tmp_path, monkeypatch):
     assert dash.docs_repo_path == str(docs)
     assert dash.configured is True
     assert dash.source_path.endswith("config.yml")
+
+
+def test_init_uses_plan_model_for_survey_and_work_model_for_writing(tmp_path, monkeypatch):
+    from git import Repo
+
+    from docflow.core.models import AgentRunResult
+    from docflow.core.operations import AgentSpec
+
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+
+    app = tmp_path / "app"
+    docs = tmp_path / "docs"
+    app.mkdir()
+    repo = Repo.init(app)
+    (app / "README.md").write_text("# App\n")
+    repo.index.add(["README.md"])
+    repo.index.commit("init")
+
+    templates: list = []
+
+    class FakeRunner:
+        def __init__(self, mode="shell", command_template=None):
+            templates.append(command_template or "")
+            self.mode = mode
+
+        def run(self, prompt_file, docs_repo, capture=None, on_output=None):
+            return AgentRunResult(
+                success=True,
+                mode="shell",
+                prompt_file_path=prompt_file,
+                output_log="ok",
+            )
+
+    monkeypatch.setattr("docflow.core.operations.AgentRunner", FakeRunner)
+    spec = AgentSpec(
+        mode="shell",
+        command=AGENT_PRESETS["cursor-agent"],
+        name="cursor-agent",
+        model="composer-2.5-fast",
+        plan_model="gpt-5.2",
+    )
+    result = init_docs(app_repo_path=str(app), docs_repo_path=str(docs), agent=spec)
+    assert result.features
+    assert any("gpt-5.2" in (t or "") for t in templates)
+    assert any("composer-2.5-fast" in (t or "") for t in templates)
+    assert templates[0].startswith("agent --model gpt-5.2 ")
+    assert templates[1].startswith("agent --model composer-2.5-fast ")
+    saved = DocFlowConfig.load(docs_repo_path=str(docs))
+    assert saved.agent.model == "composer-2.5-fast"
+    assert saved.agent.plan_model == "gpt-5.2"
 
 
 def test_init_docs_cancel_writes_nothing(tmp_path, monkeypatch):
@@ -640,6 +717,39 @@ def test_dashboard_reads_nested_config_and_shows_app(tmp_path, monkeypatch):
     assert dash.app_repo_path == str(app.resolve())
     assert dash.docs_repo_path == str(docs.resolve())
     assert is_configured(paths.config) is True
+
+
+def test_dashboard_skips_last_project_when_use_last_false(tmp_path, monkeypatch):
+    from docflow.core.operations import get_dashboard, resolve_paths
+    from docflow.core.projects import register_project
+    from docflow.core.workspace import write_config_path
+
+    home = tmp_path / "home"
+    xdg = tmp_path / "xdg"
+    home.mkdir()
+    xdg.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+
+    app = tmp_path / "shop"
+    docs = tmp_path / "shop-docs"
+    app.mkdir()
+    docs.mkdir()
+    config_path = write_config_path(str(docs))
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    Path(config_path).write_text(
+        "project:\n  name: Shop\n"
+        f"app:\n  repo_path: {app}\n"
+        f"docs:\n  repo_path: {docs}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    register_project(str(docs), str(app), "Shop")
+    paths = resolve_paths(require=False, use_last=False)
+    assert paths.docs_repo_path == ""
+    dash = get_dashboard(use_last=False)
+    assert dash.docs_repo_path == ""
+    assert dash.configured is False
 
 
 def test_cwd_pointer_config_uses_real_docs_repo(tmp_path, monkeypatch):

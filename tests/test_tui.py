@@ -4,7 +4,9 @@ Smoke test for the Textual UI.
 
 import pytest
 
-from docflow.tui.app import DocFlowApp, _agent_select_options
+from textual.widgets import OptionList, Static
+
+from docflow.tui.app import DocFlowApp, ModelPicker, _agent_select_options
 
 
 def test_agent_select_includes_cursor_agent():
@@ -36,8 +38,8 @@ async def test_update_docs_modal_has_agent_select():
             screen for screen in app.screen_stack if screen.__class__.__name__ == "GenerateScreen"
         )
         assert generate.query_one("#agent")
-        assert generate.query_one("#model-picker")
-        assert generate.query_one("#model-list")
+        assert generate.query_one("#plan-model-picker")
+        assert generate.query_one("#work-model-picker")
         assert generate.query_one("#jobs")
 
 
@@ -145,7 +147,7 @@ async def test_model_picker_cursor_headers_and_default():
         picker = app.query_one("#model-picker", ModelPicker)
         picker.set_choices(catalog)
         assert picker.selected_value() == "composer-2.5"
-        listing = app.query_one("#model-list")
+        listing = picker.query_one(OptionList)
         prompts = [
             str(listing.get_option_at_index(i).prompt)
             for i in range(listing.option_count)
@@ -155,6 +157,48 @@ async def test_model_picker_cursor_headers_and_default():
         assert "Third-party API usage" in prompts
         assert "Current" not in prompts
         assert "Third-party" not in prompts
+
+
+@pytest.mark.asyncio
+async def test_work_picker_defaults_to_fast_when_listed():
+    from textual.app import App, ComposeResult
+
+    from docflow.core.operations import catalog_cursor_models
+
+    class PickerApp(App):
+        def compose(self) -> ComposeResult:
+            yield ModelPicker(role="work", id="model-picker")
+
+    catalog = catalog_cursor_models(
+        [
+            ("auto", "Auto"),
+            ("composer-2.5", "Composer 2.5"),
+            ("composer-2.5-fast", "Composer 2.5 Fast"),
+        ]
+    )
+    app = PickerApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        picker = app.query_one("#model-picker", ModelPicker)
+        picker.set_choices(catalog)
+        assert picker.selected_value() == "composer-2.5-fast"
+
+
+@pytest.mark.asyncio
+async def test_switch_new_clears_summary_header():
+    app = DocFlowApp(repo="/tmp/old-app", docs="/tmp/old-docs")
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._begin_new_project()
+        await pilot.pause()
+        assert app._blank_session
+        assert app._repo == ""
+        assert app._docs == ""
+        assert app.title == "DocFlow"
+        assert app.sub_title == "New project"
+        summary = str(app.query_one("#summary", Static).render())
+        assert "not set" in summary
+        assert "Documented: none yet" in summary
 
 
 @pytest.mark.asyncio

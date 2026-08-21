@@ -128,7 +128,8 @@ docs:
 agent:
   mode: "shell"   # or "manual"
   name: "cursor-agent"   # last agent used; next run defaults to this
-  model: "composer-2.5"  # last LLM; next run defaults to this
+  plan_model: "composer-2.5"       # search / structure (init stack survey)
+  model: "composer-2.5-fast"       # writes each section
   command: 'agent --workspace {docs_repo} --force --trust -p "Follow every instruction in {prompt_file}."'
 
 platform:
@@ -146,7 +147,7 @@ generation:
     - "__pycache__/"
 ```
 
-- **`agent.name` / `agent.model`**: last coding agent and LLM. Init and generate save these; the next UI/CLI run pre-selects them so you do not pick them every time.
+- **`agent.name` / `agent.plan_model` / `agent.model`**: last coding agent, plus two LLMs. The **plan** model runs the init stack survey (search the app and structure the docs list). The **work** model writes each section. Init and generate save these; the next UI/CLI run pre-selects them. Cursor defaults: plan `composer-2.5`, work `composer-2.5-fast`.
 - **`generation.concurrency`**: how many agent jobs run at once. Default is **1**. Raise it only if the PC can run several coding agents together. `--jobs N` or `DOCFLOW_JOBS` overrides for one run.
 - **`generation.ignore`**: merged with DocFlow defaults and framework profiles during scan and diff.
 - **`generation.features`**: units selected during init. Later `generate` only updates those sections.

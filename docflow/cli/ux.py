@@ -58,7 +58,16 @@ def print_dashboard(dash: Dashboard) -> None:
     table.add_row(
         "Agent",
         f"[yellow]{dash.agent_name or dash.agent_mode}[/yellow]"
-        + (f"  [cyan]{dash.agent_model}[/cyan]" if getattr(dash, "agent_model", "") else "")
+        + (
+            f"  plan [cyan]{dash.plan_model}[/cyan]"
+            if getattr(dash, "plan_model", "")
+            else ""
+        )
+        + (
+            f"  work [cyan]{dash.agent_model}[/cyan]"
+            if getattr(dash, "agent_model", "")
+            else ""
+        )
         + f"  {dash.agent_command or 'manual'}",
     )
     table.add_row(

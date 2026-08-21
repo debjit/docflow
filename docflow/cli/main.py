@@ -14,7 +14,7 @@ from docflow import __version__
 from docflow.cli import menu, ux
 from docflow.core.operations import (
     ConfigError,
-    apply_agent_model,
+    attach_agent_models,
     generate_docs,
     resolve_agent,
     resolve_paths,
@@ -51,7 +51,8 @@ def cli(ctx: click.Context, repo: str, docs: str):
 @click.option("--repo", default="", help="Path to application source repository.")
 @click.option("--docs", default="", help="Path to dedicated documentation repository.")
 @click.option("--agent", help="Coding agent (agy, opencode, cursor-agent, claude, cline, manual).")
-@click.option("--model", default="", help="LLM model id for the agent (Cursor: agent models).")
+@click.option("--model", default="", help="Work LLM for writing docs (Cursor: agent models).")
+@click.option("--plan-model", default="", help="Plan LLM for search and structure (init stack survey).")
 @click.option("--import-existing/--fresh", default=None, help="Ask to import files vs start blank.")
 @click.option("--import-from", default="", help="Path or folder to import (never overwrites).")
 @click.option("--import-into", default="", help="Doc type folder to import into.")
@@ -68,6 +69,7 @@ def init(
     docs: str,
     agent: Optional[str],
     model: str,
+    plan_model: str,
     import_existing: Optional[bool],
     import_from: str,
     import_into: str,
@@ -85,6 +87,7 @@ def init(
         docs=_from_ctx(ctx, "docs", docs),
         agent=agent,
         model=model,
+        plan_model=plan_model,
         mode=mode,
         command=command,
         import_existing=import_existing,
@@ -117,7 +120,8 @@ def import_cmd(ctx, docs: str, import_from: str, type_name: str):
 @click.option("--repo", default="", help="Path to application source repository.")
 @click.option("--docs", default="", help="Path to dedicated documentation repository.")
 @click.option("--agent", help="Coding agent (agy, opencode, cursor-agent, claude, cline, manual).")
-@click.option("--model", default="", help="LLM model id for the agent (Cursor: agent models).")
+@click.option("--model", default="", help="Work LLM for writing docs (Cursor: agent models).")
+@click.option("--plan-model", default="", help="Plan LLM saved for search/structure (next init).")
 @click.option("--branch", default="", help="Branch or tip to read commits from (default: current HEAD).")
 @click.option("--from", "from_ref", default="", help="Base commit/branch (advanced).")
 @click.option("--to", "to_ref", default="", help="Head commit/branch (advanced).")
@@ -133,6 +137,7 @@ def generate(
     docs: str,
     agent: Optional[str],
     model: str,
+    plan_model: str,
     branch: str,
     from_ref: str,
     to_ref: str,
@@ -155,6 +160,7 @@ def generate(
                 docs=docs,
                 agent=agent,
                 model=model,
+                plan_model=plan_model,
                 mode=mode,
                 command=command,
                 branch=branch,
@@ -168,12 +174,19 @@ def generate(
             return
         ux.print_error(str(exc))
         raise click.Abort()
-    spec = resolve_agent(agent=agent, mode=mode, command=command, config=paths.config, model=model)
+    spec = resolve_agent(
+        agent=agent,
+        mode=mode,
+        command=command,
+        config=paths.config,
+        model=model,
+        plan_model=plan_model,
+    )
     if spec is None:
         if sys.stdout.isatty():
             spec = menu.pick_agent()
-            if model:
-                spec = apply_agent_model(spec, model)
+            if model or plan_model:
+                spec = attach_agent_models(spec, model=model or spec.model, plan_model=plan_model or spec.plan_model)
         else:
             spec = resolve_agent(agent="manual")
     if (
@@ -189,6 +202,7 @@ def generate(
             docs=docs,
             agent=agent,
             model=model,
+            plan_model=plan_model,
             mode=mode,
             command=command,
             branch=branch,
