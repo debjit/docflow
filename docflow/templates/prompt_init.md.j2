@@ -36,6 +36,14 @@ Output directory: `{{ output_dir }}/`
 ```
 {% endif %}
 
+{% if extra_instructions %}
+## Application Documentation Scope
+
+{{ extra_instructions }}
+
+If `.docflow/stack.json` exists in the docs repository, follow its `guidance`, `skip_paths`, and `document` fields.
+{% endif %}
+
 ## Task Instructions
 
 Create documentation for this **{{ doc_type }}** section. Write the kind of content described above (not a generic feature dump).

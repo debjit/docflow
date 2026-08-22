@@ -18,31 +18,42 @@ DocFlow supports two primary agent execution modes:
 
 1. **Shell Mode (`mode: shell`)**:
    - DocFlow automatically executes the configured CLI coding agent (e.g., `agy`, `opencode`, `claude`) via subprocess.
-   - Commands MUST include direct workspace access to the target documentation repository (e.g., `agy --dangerously-skip-permissions --add-dir {docs_repo} -p "$(cat {prompt_file})"`).
-   - The coding agent writes documentation files directly into the target paths (`<type>/index.md` or `features/<feature>/index.md`, plus `context.json`, `files.md`, `changelog.md`), and DocFlow automatically moves processed prompts from `prompts/pending/` to `prompts/completed/`.
+   - v1 runs on **Linux** (macOS/WSL acceptable). Agent commands are POSIX shell commands; Windows-native shells are out of scope.
+   - Commands MUST include direct workspace access to the target documentation repository (e.g., `agy --dangerously-skip-permissions --add-dir {docs_repo} -p "Follow every instruction in {prompt_file}."`).
+   - The coding agent writes documentation files directly into the target paths (`<type>/index.md` or `<type>/<unit>/index.md`, plus `context.json`, `files.md`, `changelog.md`), and DocFlow automatically moves processed prompts from `.docflow/prompts/pending/` to `.docflow/prompts/completed/`.
 
 2. **Manual Mode (`mode: manual`)**:
-   - DocFlow generates caveman prompt markdown files staged inside `prompts/pending/`.
+   - DocFlow generates caveman prompt markdown files staged inside `.docflow/prompts/pending/`.
    - Every generated prompt includes a **`⚠️ CRITICAL OUTPUT FILE LOCATION DIRECTIVE`** specifying the exact absolute file paths in the target documentation repository.
    - When an AI agent executes a pending prompt, it MUST write directly to the target absolute file paths in the documentation repository rather than storing output into internal session artifact storage (`.gemini` or scratch space).
 
 ---
 
-## 3. Type and feature directory layout
+## 3. Type and unit directory layout
 
-Doc types are folders you configure (`architecture`, `features`, `front-end`, …). Each type stores the same four files.
+Doc types are **application** documentation folders (`architecture`, `database`, `models`, `functions`, `routes`, `pages`, …). DocFlow working files live in `.docflow/` and are not documentation.
 
-`features` is the only type that is split per module:
+`architecture` is a single overview:
 
 ```
-features/<feature-name>/
+architecture/
 ├── index.md
 ├── context.json
 ├── files.md
 └── changelog.md
 ```
 
-Other types use a single folder named after the type (`front-end/index.md`, …).
+`database`, `models`, `functions`, `routes`, and `pages` are split per unit:
+
+```
+models/<unit-name>/
+├── index.md
+├── context.json
+├── files.md
+└── changelog.md
+```
+
+Do not document CLI glue (`main`, `menu`), git, GitLab, or DocFlow internals.
 
 ---
 
@@ -118,8 +129,22 @@ tags: ["tag1", "tag2"]
 
 ---
 
-## 4. Generate watermark (`.docflow-state.json`)
+## 4. Generate watermark (`.docflow/state.json`)
 
-DocFlow records the last documented application commit in `.docflow-state.json` in the docs repo. That file is machine state, not human documentation. Agents must not treat it as a content target. Subsequent updates cover only commits after that SHA unless the user requests last-N or a full regeneration.
+DocFlow records the last documented application commit in `.docflow/state.json` in the docs repo. That file is machine state, not human documentation. Agents must not treat it as a content target. Subsequent updates cover only commits after that SHA unless the user requests last-N or a full regeneration.
 
 Imported files must not be overwritten on import. Updates to existing `index.md` / `context.json` happen through generate, which receives the current files and applies the new git range.
+
+---
+
+## 5. Framework-aware documentation
+
+When DocFlow detects a framework (Laravel first), it skips dependency and generated directories (`vendor/`, `storage/`, framework caches) and avoids creating feature modules for framework scaffolding (`bootstrap/`, `public/`).
+
+During init, DocFlow scans the app and shows a **section picker**. Agents must only document the units the user kept. Git/CI/CLI glue should never appear. Users may add extra file paths the scan missed.
+
+Agents must **document the application layered on the framework**, not the framework itself:
+- Do not write Laravel/Filament/Inertia/Vue/React tutorials or explain bootstrap, the container, or vendor packages.
+- Do document this project's models, controllers, policies, jobs, routes, migrations, Filament resources, Inertia pages, and Vue/React components.
+
+During init, DocFlow may write `.docflow/stack.json`. When present, all documentation agents must follow its `guidance`, `skip_paths`, and `document` fields.

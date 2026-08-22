@@ -2,6 +2,9 @@
 Tests for shared operations helpers.
 """
 
+import os
+from pathlib import Path
+
 from docflow.config.settings import DocFlowConfig, DocTypeSettings
 from docflow.core.agent_runner import AGENT_PRESETS
 from docflow.core.operations import (
@@ -11,8 +14,11 @@ from docflow.core.operations import (
     assert_can_init,
     catalog_agy_models,
     catalog_cursor_models,
+    default_app_branch,
+    default_cursor_model,
     generate_docs,
     generate_section_names,
+    get_dashboard,
     import_docs,
     init_docs,
     load_generate_cursor,
@@ -75,9 +81,40 @@ def test_catalog_cursor_models_groups_and_labels_normal():
     current = [c for c in catalog if c.group == "current"]
     third = [c for c in catalog if c.group == "third_party"]
     assert [c.key for c in current][:3] == ["auto", "composer-2.5", "composer-2.5-fast"]
+    assert default_cursor_model(catalog) == "composer-2.5"
+    assert {c.group_label for c in current} == {"Cursor included usage"}
+    assert {c.group_label for c in third} == {"Third-party API usage"}
     assert "Composer 2.5 (normal)" in {c.label for c in current}
     assert {c.key for c in third} == {"gpt-5.2", "claude-opus-5-high"}
     assert all(c.group == "third_party" for c in third)
+
+
+def test_default_cursor_model_without_composer_25():
+    catalog = catalog_cursor_models(
+        [
+            ("auto", "Auto"),
+            ("composer-2", "Composer 2"),
+            ("gpt-5.2", "GPT-5.2"),
+        ]
+    )
+    assert default_cursor_model(catalog) == "composer-2"
+    no_composer = catalog_cursor_models([("auto", "Auto"), ("gpt-5.2", "GPT-5.2")])
+    assert default_cursor_model(no_composer) == "auto"
+
+
+def test_cursor_plan_and_work_defaults():
+    from docflow.core.operations import default_cursor_plan_model, default_cursor_work_model
+
+    catalog = catalog_cursor_models(
+        [
+            ("auto", "Auto"),
+            ("composer-2.5", "Composer 2.5"),
+            ("composer-2.5-fast", "Composer 2.5 Fast"),
+            ("gpt-5.2", "GPT-5.2"),
+        ]
+    )
+    assert default_cursor_plan_model(catalog) == "composer-2.5"
+    assert default_cursor_work_model(catalog) == "composer-2.5-fast"
 
 
 def test_parse_and_catalog_agy_models():
@@ -133,6 +170,38 @@ def test_resolve_agent_uses_saved_config():
     spec = resolve_agent(config=cfg)
     assert spec is not None
     assert spec.command == AGENT_PRESETS["opencode"]
+    assert spec.name == "opencode"
+
+
+def test_saved_agent_name_and_model_are_reused():
+    from docflow.core.operations import (
+        agent_key_from_command,
+        infer_agent_model,
+        infer_agent_name,
+        remember_agent,
+    )
+
+    flagged = apply_agent_model(resolve_agent(agent="cursor-agent"), "composer-2.5")
+    assert agent_key_from_command(flagged.command) == "cursor-agent"
+    cfg = DocFlowConfig()
+    cfg.source_path = "/tmp/.docflow/config.yml"
+    remember_agent(cfg, flagged)
+    assert cfg.agent.name == "cursor-agent"
+    assert cfg.agent.model == "composer-2.5"
+    assert infer_agent_name(cfg) == "cursor-agent"
+    assert infer_agent_model(cfg) == "composer-2.5"
+    flagged.plan_model = "gpt-5.2"
+    remember_agent(cfg, flagged)
+    assert cfg.agent.plan_model == "gpt-5.2"
+    from docflow.core.operations import infer_plan_model
+
+    assert infer_plan_model(cfg) == "gpt-5.2"
+    reused = resolve_agent(config=cfg)
+    assert reused is not None
+    assert reused.name == "cursor-agent"
+    assert reused.model == "composer-2.5"
+    assert reused.plan_model == "gpt-5.2"
+    assert "--model composer-2.5" in reused.command
 
 
 def test_resolve_agent_ignores_defaults_without_file():
@@ -198,10 +267,16 @@ def test_import_docs_never_overwrites(tmp_path):
     assert written.read_text() == "first\n"
 
 
-def test_init_docs_custom_type_and_refuses_rerun(tmp_path):
+def test_init_docs_custom_type_and_refuses_rerun(tmp_path, monkeypatch):
     from git import Repo
 
     from docflow.core.operations import AgentSpec
+
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
 
     app = tmp_path / "app"
     docs = tmp_path / "docs"
@@ -219,12 +294,208 @@ def test_init_docs_custom_type_and_refuses_rerun(tmp_path):
     )
     assert "front-end" in result.types
     assert (docs / "front-end").is_dir()
-    assert (docs / ".docflow.yml").exists()
+    assert (docs / ".docflow" / "config.yml").exists()
+    saved = DocFlowConfig.load(docs_repo_path=str(docs))
+    assert saved.app.branch
+    assert not (app / ".docflow.yml").exists()
+    assert not (app / ".docflow" / "config.yml").exists()
     try:
         init_docs(str(app), str(docs), spec)
         assert False, "expected AlreadyInitialized"
     except AlreadyInitialized:
         pass
+
+
+def test_discover_skips_noisy_defaults(tmp_path):
+    from git import Repo
+
+    from docflow.core.git_analyzer import DEFAULT_IGNORE, GitAnalyzer
+    from docflow.core.operations import DEFAULT_DOC_TYPES, discover_init_sections, suggested_section_included
+
+    app = tmp_path / "app"
+    app.mkdir()
+    Repo.init(app)
+    (app / "README.md").write_text("# App\n")
+    (app / ".gitlab-ci.yml").write_text("image: php\n")
+    auth = app / "src" / "auth"
+    auth.mkdir(parents=True)
+    (auth / "login.py").write_text("def login():\n    return True\n")
+    github = app / ".github" / "workflows"
+    github.mkdir(parents=True)
+    (github / "ci.yml").write_text("name: ci\n")
+
+    analyzer = GitAnalyzer(str(app))
+    candidates = discover_init_sections(
+        analyzer,
+        DEFAULT_DOC_TYPES,
+        ignore_patterns=DEFAULT_IGNORE,
+        skip_dirs=set(),
+    )
+    names = {item.name for item in candidates if item.doc_type == "functions"}
+    all_names = {item.name for item in candidates}
+    assert "github" not in all_names
+    assert "gitlab" not in all_names
+    assert "auth" not in names
+    assert "login" in names
+    assert "main" not in all_names
+    assert suggested_section_included("git") is False
+    assert suggested_section_included("login") is True
+
+
+def test_init_docs_review_keeps_selection_and_extra(tmp_path, monkeypatch):
+    from git import Repo
+
+    from docflow.config.settings import DocFlowConfig
+    from docflow.core.operations import AgentSpec, SectionCandidate
+
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+
+    app = tmp_path / "app"
+    docs = tmp_path / "docs"
+    app.mkdir()
+    repo = Repo.init(app)
+    (app / "README.md").write_text("# App\n")
+    auth = app / "src" / "auth"
+    auth.mkdir(parents=True)
+    (auth / "login.py").write_text("def login():\n    return True\n")
+    payments = app / "payments"
+    payments.mkdir()
+    (payments / "charge.py").write_text("def charge():\n    return 1\n")
+    repo.index.add(["README.md", "src/auth/login.py", "payments/charge.py"])
+    repo.index.commit("init")
+    spec = AgentSpec(mode="manual", command="", name="manual")
+
+    def review(candidates):
+        for item in candidates:
+            item.included = item.name in {"architecture", "login"}
+        candidates.append(
+            SectionCandidate(
+                doc_type="functions",
+                name="payments/charge.py",
+                included=True,
+                extra=True,
+            )
+        )
+        return candidates
+
+    result = init_docs(
+        app_repo_path=str(app),
+        docs_repo_path=str(docs),
+        agent=spec,
+        on_review_sections=review,
+    )
+    assert "architecture" in result.types
+    assert "functions" in result.types
+    pending = docs / ".docflow" / "prompts" / "pending"
+    assert (pending / "init-functions-login.md").exists()
+    assert (pending / "init-functions-charge.md").exists()
+    assert not (pending / "init-functions-core.md").exists()
+    assert not (pending / "init-functions-auth.md").exists()
+    saved = DocFlowConfig.load(docs_repo_path=str(docs))
+    assert "login" in (saved.generation.features or [])
+    assert "charge" in (saved.generation.features or [])
+    assert "core" not in (saved.generation.features or [])
+    extra_names = {item.name: item.paths for item in saved.generation.extra_features}
+    assert extra_names["login"] == ["src/auth/login.py"]
+    assert extra_names["charge"] == ["payments/charge.py"]
+    dash = get_dashboard(str(app), str(docs))
+    assert dash.project_name == "app"
+    assert dash.app_repo_path == str(app)
+    assert dash.docs_repo_path == str(docs)
+    assert dash.configured is True
+    assert dash.source_path.endswith("config.yml")
+
+
+def test_init_uses_plan_model_for_survey_and_work_model_for_writing(tmp_path, monkeypatch):
+    from git import Repo
+
+    from docflow.core.models import AgentRunResult
+    from docflow.core.operations import AgentSpec
+
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+
+    app = tmp_path / "app"
+    docs = tmp_path / "docs"
+    app.mkdir()
+    repo = Repo.init(app)
+    (app / "README.md").write_text("# App\n")
+    repo.index.add(["README.md"])
+    repo.index.commit("init")
+
+    templates: list = []
+
+    class FakeRunner:
+        def __init__(self, mode="shell", command_template=None):
+            templates.append(command_template or "")
+            self.mode = mode
+
+        def run(self, prompt_file, docs_repo, capture=None, on_output=None):
+            return AgentRunResult(
+                success=True,
+                mode="shell",
+                prompt_file_path=prompt_file,
+                output_log="ok",
+            )
+
+    monkeypatch.setattr("docflow.core.operations.AgentRunner", FakeRunner)
+    spec = AgentSpec(
+        mode="shell",
+        command=AGENT_PRESETS["cursor-agent"],
+        name="cursor-agent",
+        model="composer-2.5-fast",
+        plan_model="gpt-5.2",
+    )
+    result = init_docs(app_repo_path=str(app), docs_repo_path=str(docs), agent=spec)
+    assert result.features
+    assert any("gpt-5.2" in (t or "") for t in templates)
+    assert any("composer-2.5-fast" in (t or "") for t in templates)
+    assert templates[0].startswith("agent --model gpt-5.2 ")
+    assert templates[1].startswith("agent --model composer-2.5-fast ")
+    saved = DocFlowConfig.load(docs_repo_path=str(docs))
+    assert saved.agent.model == "composer-2.5-fast"
+    assert saved.agent.plan_model == "gpt-5.2"
+
+
+def test_init_docs_cancel_writes_nothing(tmp_path, monkeypatch):
+    from git import Repo
+
+    from docflow.core.operations import AgentSpec, InitCancelled
+
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+
+    app = tmp_path / "app"
+    docs = tmp_path / "docs"
+    app.mkdir()
+    repo = Repo.init(app)
+    (app / "README.md").write_text("# App\n")
+    repo.index.add(["README.md"])
+    repo.index.commit("init")
+    spec = AgentSpec(mode="manual", command="", name="manual")
+
+    try:
+        init_docs(
+            app_repo_path=str(app),
+            docs_repo_path=str(docs),
+            agent=spec,
+            on_review_sections=lambda _candidates: None,
+        )
+        assert False, "expected InitCancelled"
+    except InitCancelled:
+        pass
+    assert not (docs / ".docflow.yml").exists()
+    assert not (docs / ".docflow" / "config.yml").exists()
 
 
 def test_generate_cursor_tracks_new_commits_only(tmp_path):
@@ -253,6 +524,79 @@ def test_generate_cursor_tracks_new_commits_only(tmp_path):
     assert [c.sha for c in new_commits] == [second.hexsha]
 
 
+def test_default_app_branch_prefers_main(tmp_path):
+    from git import Repo
+
+    app = tmp_path / "app"
+    app.mkdir()
+    repo = Repo.init(app)
+    (app / "README.md").write_text("# App\n")
+    repo.index.add(["README.md"])
+    repo.index.commit("init")
+    if "main" not in [head.name for head in repo.heads]:
+        repo.create_head("main")
+    if "master" not in [head.name for head in repo.heads]:
+        repo.create_head("master")
+    if "develop" not in [head.name for head in repo.heads]:
+        repo.create_head("develop")
+    assert default_app_branch(str(app)) == "main"
+
+
+def test_generate_checks_new_items_when_branch_changes(tmp_path, monkeypatch):
+    from git import Repo
+
+    from docflow.core.agent_runner import AgentRunResult
+    from docflow.core.operations import AgentSpec
+
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+
+    app = tmp_path / "app"
+    docs = tmp_path / "docs"
+    app.mkdir()
+    repo = Repo.init(app)
+    src = app / "src"
+    src.mkdir()
+    (src / "login.py").write_text("def login():\n    return True\n")
+    repo.index.add(["src/login.py"])
+    repo.index.commit("login")
+    base_name = repo.active_branch.name
+    spec = AgentSpec(mode="manual", command="", name="manual")
+    init_docs(app_repo_path=str(app), docs_repo_path=str(docs), agent=spec, branch=base_name)
+    saved = DocFlowConfig.load(docs_repo_path=str(docs))
+    assert saved.app.branch == base_name
+
+    other = repo.create_head("develop")
+    other.checkout()
+    (src / "billing.py").write_text("def charge():\n    return 1\n")
+    repo.index.add(["src/billing.py"])
+    repo.index.commit("billing")
+    repo.heads[base_name].checkout()
+
+    seen = []
+
+    def review(candidates):
+        seen.extend(item.name for item in candidates)
+        return candidates
+
+    generate_docs(
+        app_repo_path=str(app),
+        docs_repo_path=str(docs),
+        agent=spec,
+        app_branch="develop",
+        sync_remote=False,
+        on_review_sections=review,
+    )
+    assert "billing" in seen
+    saved = DocFlowConfig.load(docs_repo_path=str(docs))
+    assert saved.app.branch == "develop"
+    dash = get_dashboard(str(app), str(docs))
+    assert dash.app_branch == "develop"
+
+
 def test_generate_section_names_groups_wrappers_and_features():
     from docflow.core.models import FileChange
 
@@ -264,6 +608,32 @@ def test_generate_section_names_groups_wrappers_and_features():
     ]
     assert generate_section_names(files) == ["auth", "billing", "ui"]
     assert generate_section_names(files, feature="billing") == ["billing"]
+    scaffold = files + [
+        FileChange(path="bootstrap/app.php", change_type="modified"),
+        FileChange(path="vendor/laravel/framework/src/Application.php", change_type="modified"),
+    ]
+    skip = {"bootstrap", "vendor", "public"}
+    assert generate_section_names(scaffold, skip_as_feature=skip) == ["auth", "billing", "ui"]
+
+
+def test_generate_section_names_maps_selected_units():
+    from docflow.config.settings import DocFlowConfig, ExtraFeatureSettings, GenerationSettings
+    from docflow.core.models import FileChange
+    from docflow.core.operations import generate_section_names
+
+    files = [
+        FileChange(path="app/Models/User.php", change_type="modified"),
+        FileChange(path="app/Models/Invoice.php", change_type="modified"),
+    ]
+    config = DocFlowConfig(
+        generation=GenerationSettings(
+            extra_features=[
+                ExtraFeatureSettings(name="user", paths=["app/Models/User.php"]),
+                ExtraFeatureSettings(name="invoice", paths=["app/Models/Invoice.php"]),
+            ]
+        )
+    )
+    assert generate_section_names(files, config=config) == ["user", "invoice"]
 
 
 def test_generate_docs_writes_prompts_for_each_feature(tmp_path):
@@ -296,8 +666,8 @@ def test_generate_docs_writes_prompts_for_each_feature(tmp_path):
     )
     names = [item.feature_name for item in result.features]
     assert names == ["auth", "billing"]
-    assert (docs / "prompts" / "pending" / "update-auth.md").exists()
-    assert (docs / "prompts" / "pending" / "update-billing.md").exists()
+    assert (docs / ".docflow" / "prompts" / "pending" / "update-auth.md").exists()
+    assert (docs / ".docflow" / "prompts" / "pending" / "update-billing.md").exists()
     cursor = load_generate_cursor(str(docs))
     assert cursor is not None
 
@@ -341,7 +711,7 @@ def test_generate_docs_pulls_when_remote_is_ahead(tmp_path):
     assert not result.already_current
     names = [item.feature_name for item in result.features]
     assert "auth" in names
-    assert (docs / "prompts" / "pending" / "update-auth.md").exists()
+    assert (docs / ".docflow" / "prompts" / "pending" / "update-auth.md").exists()
     assert Repo(app).head.commit.hexsha != first.hexsha
 
 
@@ -357,3 +727,140 @@ def test_pull_without_origin_reports_failure(tmp_path):
     result = pull_app_repo(str(app), str(tmp_path / "docs"))
     assert result.success is False
     assert result.output
+
+
+def test_picker_group_labels_and_toggle():
+    from docflow.core.operations import (
+        SectionCandidate,
+        kind_heading,
+        kind_item_label,
+        resolve_picker_group,
+        toggle_group_included,
+    )
+
+    assert kind_heading("models") == "Eloquent models"
+    assert kind_heading("database") == "Migrations"
+    assert kind_item_label("model") == "Eloquent model"
+    user = SectionCandidate(doc_type="models", name="user", title="User", kind="model")
+    assert user.label == "User  (Eloquent model)"
+
+    migrations = [
+        SectionCandidate(doc_type="database", name="users-table", title="users", kind="migration", included=True),
+        SectionCandidate(doc_type="database", name="posts-table", title="posts", kind="migration", included=True),
+        SectionCandidate(doc_type="models", name="user", title="User", kind="model", included=True),
+    ]
+    assert resolve_picker_group("migrations", ["database", "models"]) == "database"
+    assert toggle_group_included(migrations, "database") is True
+    assert migrations[0].included is False
+    assert migrations[1].included is False
+    assert migrations[2].included is True
+    toggle_group_included(migrations, "database")
+    assert migrations[0].included is True
+    assert migrations[1].included is True
+
+
+def test_dashboard_reads_nested_config_and_shows_app(tmp_path, monkeypatch):
+    from docflow.core.operations import get_dashboard, is_configured, resolve_paths
+    from docflow.core.projects import register_project
+    from docflow.core.workspace import write_config_path
+
+    home = tmp_path / "home"
+    xdg = tmp_path / "xdg"
+    home.mkdir()
+    xdg.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+
+    app = tmp_path / "shop"
+    docs = tmp_path / "shop-docs"
+    app.mkdir()
+    docs.mkdir()
+    config_path = write_config_path(str(docs))
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    Path(config_path).write_text(
+        "project:\n  name: Shop\n"
+        f"app:\n  repo_path: {app}\n"
+        f"docs:\n  repo_path: {docs}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    register_project(str(docs), str(app), "Shop")
+    paths = resolve_paths(require=False)
+    assert paths.docs_repo_path == str(docs.resolve())
+    assert paths.app_repo_path == str(app.resolve())
+    dash = get_dashboard()
+    assert dash.project_name == "Shop"
+    assert dash.app_repo_path == str(app.resolve())
+    assert dash.docs_repo_path == str(docs.resolve())
+    assert is_configured(paths.config) is True
+
+
+def test_dashboard_skips_last_project_when_use_last_false(tmp_path, monkeypatch):
+    from docflow.core.operations import get_dashboard, resolve_paths
+    from docflow.core.projects import register_project
+    from docflow.core.workspace import write_config_path
+
+    home = tmp_path / "home"
+    xdg = tmp_path / "xdg"
+    home.mkdir()
+    xdg.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+
+    app = tmp_path / "shop"
+    docs = tmp_path / "shop-docs"
+    app.mkdir()
+    docs.mkdir()
+    config_path = write_config_path(str(docs))
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    Path(config_path).write_text(
+        "project:\n  name: Shop\n"
+        f"app:\n  repo_path: {app}\n"
+        f"docs:\n  repo_path: {docs}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    register_project(str(docs), str(app), "Shop")
+    paths = resolve_paths(require=False, use_last=False)
+    assert paths.docs_repo_path == ""
+    dash = get_dashboard(use_last=False)
+    assert dash.docs_repo_path == ""
+    assert dash.configured is False
+
+
+def test_cwd_pointer_config_uses_real_docs_repo(tmp_path, monkeypatch):
+    from docflow.core.operations import resolve_paths
+    from docflow.core.workspace import write_config_path
+
+    home = tmp_path / "home"
+    xdg = tmp_path / "xdg"
+    home.mkdir()
+    xdg.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+
+    app = tmp_path / "app"
+    docs = tmp_path / "docs"
+    tool = tmp_path / "tool"
+    app.mkdir()
+    docs.mkdir()
+    tool.mkdir()
+    config_path = write_config_path(str(docs))
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    Path(config_path).write_text(
+        "project:\n  name: RealApp\n"
+        f"app:\n  repo_path: {app}\n"
+        f"docs:\n  repo_path: {docs}\n",
+        encoding="utf-8",
+    )
+    (tool / ".docflow.yml").write_text(
+        "project:\n  name: Project\n"
+        f"app:\n  repo_path: {app}\n"
+        f"docs:\n  repo_path: {docs}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tool)
+    paths = resolve_paths(require=False)
+    assert paths.docs_repo_path == str(docs.resolve())
+    assert paths.app_repo_path == str(app.resolve())
+    assert paths.config.project.name == "RealApp"

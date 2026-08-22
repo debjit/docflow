@@ -15,9 +15,47 @@ from pathlib import Path
 import shlex
 from typing import Callable, List, Optional, Sequence, Tuple
 
-from docflow.config.settings import DocFlowConfig, DocTypeSettings
+from docflow.config.settings import DocFlowConfig, DocTypeSettings, ExtraFeatureSettings
 from docflow.core.agent_runner import AGENT_PRESETS, AgentRunner
-from docflow.core.git_analyzer import GitAnalyzer, feature_bucket_for_path
+from docflow.core.projects import (
+    find_by_app,
+    find_by_docs,
+    last_usable_project,
+    register_project,
+)
+from docflow.core.git_analyzer import GitAnalyzer, feature_bucket_for_path, posix_rel
+from docflow.core.frameworks import (
+    architecture_seed_paths,
+    effective_ignore,
+    load_stack_file,
+    resolve_framework_name,
+    skip_as_feature_dirs,
+    stack_file_path,
+    stack_guidance,
+)
+from docflow.core.inventory import (
+    APP_KIND_ORDER,
+    KIND_TO_SECTION,
+    inventory_app_items,
+    is_bootstrap_item,
+    is_tooling_item,
+    stack_items_from_payload,
+)
+from docflow.core.workspace import (
+    SPLIT_DOC_TYPES,
+    completed_prompts_dir,
+    docs_root_from_config_path,
+    find_conventions_path,
+    is_docs_project,
+    pending_prompt_path,
+    pending_prompts_dir,
+    prompt_search_dirs,
+    rel_pending_prompt,
+    write_conventions_path,
+    write_state_path,
+    find_state_path,
+)
+from docflow.core.job_runner import Job, RunControl, clamp_concurrency, default_concurrency, run_jobs
 from docflow.core.llms_txt_generator import LLMSTxtGenerator
 from docflow.core.models import AgentRunResult, FeatureChunk, PromptContext
 from docflow.core.prompt_builder import PromptBuilder
@@ -34,14 +72,63 @@ class AlreadyInitialized(ConfigError):
     """Docs folder is already a DocFlow repository."""
 
 
+class InitCancelled(ConfigError):
+    """User cancelled init before any docs were written."""
+
+
+class AgentLaunchError(ConfigError):
+    """The selected coding agent binary could not be started."""
+
+
+_LAUNCH_FAILURE_RE = re.compile(r"exit code 12[67]\b")
+_LAUNCH_FAILURE_MARKERS = (
+    "is not recognized",           # cmd.exe: unknown command
+    "cannot find the path",        # cmd.exe / broken shim
+    "cannot find the file",
+    "command not found",           # POSIX sh
+)
+
+
+def looks_like_agent_launch_failure(error_message: Optional[str]) -> bool:
+    """True when an agent run failed because its executable could not start."""
+    text = (error_message or "").lower()
+    if not text:
+        return False
+    if _LAUNCH_FAILURE_RE.search(text):
+        return True
+    return any(marker in text for marker in _LAUNCH_FAILURE_MARKERS)
+
+
+NOISY_SECTION_NAMES = {
+    "git", "github", "gitlab", "ci", "vendor", "node_modules",
+    "storage", "bootstrap", "public", "tests", "test", "core",
+}
+
+
 DEFAULT_DOC_TYPES: List[DocTypeSettings] = [
     DocTypeSettings(
         name="architecture",
-        description="System layout, hosting, and shared packages",
+        description="System layout, hosting, and packages this app uses",
     ),
     DocTypeSettings(
-        name="features",
-        description="Feature and module documentation scanned from the codebase",
+        name="database",
+        description="Schema and migrations",
+    ),
+    DocTypeSettings(
+        name="models",
+        description="Domain models",
+    ),
+    DocTypeSettings(
+        name="functions",
+        description="Application services, jobs, actions, and controllers",
+    ),
+    DocTypeSettings(
+        name="routes",
+        description="HTTP routes",
+    ),
+    DocTypeSettings(
+        name="pages",
+        description="UI pages and indexes (Inertia, Filament, views)",
     ),
 ]
 
@@ -84,8 +171,8 @@ def configured_types(config: Optional[DocFlowConfig]) -> List[DocTypeSettings]:
 def type_output_dir(doc_type: str, section: str) -> str:
     kind = slug_type_name(doc_type)
     section_slug = slug_type_name(section) if section else kind
-    if kind == "features" and section_slug not in ("", "features"):
-        return f"features/{section_slug}"
+    if kind in SPLIT_DOC_TYPES and section_slug not in ("", kind):
+        return f"{kind}/{section_slug}"
     return kind
 
 
@@ -93,6 +180,17 @@ def resolve_doc_section(config: Optional[DocFlowConfig], feature: str) -> Tuple[
     types = configured_types(config)
     wanted = slug_type_name(feature) if feature else ""
     by_name = {t.name: t for t in types}
+    extras = list(config.generation.extra_features or []) if config else []
+    for extra in extras:
+        if extra.name == wanted:
+            dtype = slug_type_name(extra.doc_type) if extra.doc_type else ""
+            if dtype in by_name:
+                t = by_name[dtype]
+                return t.name, t.description, type_output_dir(t.name, wanted)
+            mapped = KIND_TO_SECTION.get(dtype)
+            if mapped and mapped in by_name:
+                t = by_name[mapped]
+                return t.name, t.description, type_output_dir(t.name, wanted)
     if wanted and wanted in by_name:
         t = by_name[wanted]
         return t.name, t.description, type_output_dir(t.name, t.name)
@@ -101,32 +199,453 @@ def resolve_doc_section(config: Optional[DocFlowConfig], feature: str) -> Tuple[
         return features.name, features.description, type_output_dir("features", wanted)
     if wanted and by_name:
         t = next(iter(types))
-        return t.name, t.description, type_output_dir(t.name, t.name)
+        return t.name, t.description, type_output_dir(t.name, wanted)
     if types:
         t = types[0]
         return t.name, t.description, type_output_dir(t.name, t.name)
-    return "features", "", type_output_dir("features", wanted or "core")
+    return "architecture", "", type_output_dir("architecture", wanted or "architecture")
 
 
-def generate_section_names(changed_files: Sequence, feature: str = "") -> List[str]:
+def generate_section_names(
+    changed_files: Sequence,
+    feature: str = "",
+    skip_as_feature: Optional[set] = None,
+    config: Optional[DocFlowConfig] = None,
+) -> List[str]:
     """Unique feature/section buckets for a generate run, preserving first-seen order."""
     if feature:
         return [feature]
     names: List[str] = []
     seen = set()
+    skip = skip_as_feature or set()
     for item in changed_files:
         path = item.path if hasattr(item, "path") else str(item)
-        bucket = feature_bucket_for_path(path)
-        if bucket not in seen:
-            seen.add(bucket)
-            names.append(bucket)
+        bucket = documented_name_for_path(path, config, skip)
+        if not bucket or bucket in seen:
+            continue
+        seen.add(bucket)
+        names.append(bucket)
     return names or ["architecture"]
+
+
+def documented_name_for_path(
+    path: str,
+    config: Optional[DocFlowConfig] = None,
+    skip_as_feature: Optional[set] = None,
+) -> Optional[str]:
+    """Map a changed file to a selected documentation unit, else a folder bucket."""
+    posix = posix_rel(path)
+    extras = []
+    if config is not None:
+        extras = list(config.generation.extra_features or [])
+    for extra in extras:
+        for raw in extra.paths or []:
+            mapped = posix_rel(raw)
+            if not mapped:
+                continue
+            if posix == mapped or posix.startswith(mapped.rstrip("/") + "/") or mapped.startswith(posix.rstrip("/") + "/"):
+                return extra.name
+    return feature_bucket_for_path(posix, skip_as_feature=skip_as_feature)
+
+
+def allowed_feature_names(config: Optional[DocFlowConfig]) -> Optional[set]:
+    if not config:
+        return None
+    extras = [item.name for item in config.generation.extra_features or []]
+    stored = config.generation.features
+    has_features = any(t.name == "features" for t in config.docs.types)
+    if not has_features:
+        return set(extras) if extras else None
+    if stored is None and not extras:
+        return None
+    return set(stored or []) | set(extras)
+
+
+@dataclass
+class SectionCandidate:
+    """One discovered application unit (class, page, resource) the user can include or skip."""
+
+    doc_type: str
+    name: str
+    description: str = ""
+    file_paths: List[str] = field(default_factory=list)
+    included: bool = True
+    extra: bool = False
+    sample_snippets: dict = field(default_factory=dict)
+    kind: str = ""
+    title: str = ""
+
+    @property
+    def key(self) -> str:
+        if self.doc_type == "features":
+            return f"features/{self.name}"
+        return self.doc_type
+
+    @property
+    def display_name(self) -> str:
+        return self.title or self.name
+
+    @property
+    def label(self) -> str:
+        kind = self.kind or self.doc_type
+        return f"{self.display_name}  ({kind_item_label(kind)})"
+
+    def to_chunk(self) -> FeatureChunk:
+        desc = self.description or f"{self.kind or 'feature'}: {self.display_name}"
+        return FeatureChunk(
+            feature_name=self.name,
+            description=desc,
+            file_paths=self.file_paths,
+            sample_snippets=self.sample_snippets,
+        )
+
+
+def suggested_section_included(name: str, has_architecture: bool = False, kind: str = "") -> bool:
+    if is_tooling_item(name, kind) or is_bootstrap_item(name, kind):
+        return False
+    if name in NOISY_SECTION_NAMES:
+        return False
+    if has_architecture and name == "core":
+        return False
+    return True
+
+
+def _candidate_from_item(
+    item: dict,
+    analyzer: GitAnalyzer,
+    known_types: Optional[set] = None,
+    fallback_type: str = "features",
+    rev: str = "",
+) -> Optional[SectionCandidate]:
+    title = str(item.get("title") or item.get("id") or "").strip()
+    kind = str(item.get("kind") or "module").strip()
+    rel = str(item.get("path") or "").strip()
+    name = slug_type_name(str(item.get("id") or title))
+    if not name or is_tooling_item(title or name, kind, rel) or is_bootstrap_item(title or name, kind, rel):
+        return None
+    paths = [rel.replace("\\", "/")] if rel else []
+    snippets = analyzer._snippets_for(paths[:1], rev=rev or None) if paths else {}
+    included = bool(item.get("include", True))
+    if not suggested_section_included(name, kind=kind):
+        included = False
+    doc_type = _section_for_item(item, known_types or set(), fallback_type)
+    return SectionCandidate(
+        doc_type=doc_type,
+        name=name,
+        title=title or name,
+        kind=kind,
+        description=f"{kind}: {title or name}",
+        file_paths=paths,
+        included=included,
+        sample_snippets=snippets,
+    )
+
+
+def _section_for_item(item: dict, known_types: set, fallback_type: str) -> str:
+    kind = str(item.get("kind") or "").strip().lower()
+    section = slug_type_name(str(item.get("section") or ""))
+    if kind in ("architecture", "overview") and "architecture" in known_types:
+        return "architecture"
+    if section in known_types:
+        return section
+    mapped = KIND_TO_SECTION.get(kind)
+    if mapped and mapped in known_types:
+        return mapped
+    if "features" in known_types:
+        return "features"
+    return fallback_type or "architecture"
+
+
+def discover_init_sections(
+    analyzer: GitAnalyzer,
+    types: Sequence[DocTypeSettings],
+    ignore_patterns: set,
+    skip_dirs: set,
+    arch_seeds: Optional[List[str]] = None,
+    on_progress: Optional[Callable[[str], None]] = None,
+    stack_payload: Optional[dict] = None,
+    rev: str = "",
+) -> List[SectionCandidate]:
+    """Return individual application units (not folders) for the init picker."""
+    del skip_dirs
+    known = [t.name for t in types]
+    known_set = set(known)
+    fallback = known[0] if known else "features"
+    has_architecture = "architecture" in known_set
+    if on_progress:
+        on_progress("Finding application units to document…")
+    agent_items = stack_items_from_payload(stack_payload, analyzer.repo_path)
+    tree_paths = analyzer.list_tree_paths(rev) if rev else None
+    raw_items = agent_items or inventory_app_items(
+        analyzer.repo_path,
+        ignore_patterns,
+        paths=tree_paths,
+    )
+    candidates: List[SectionCandidate] = []
+    seen = set()
+    covered: set = set()
+    for raw in raw_items:
+        candidate = _candidate_from_item(raw, analyzer, known_set, fallback, rev=rev)
+        if candidate is None or candidate.name in seen:
+            continue
+        if has_architecture and candidate.name == "core":
+            candidate.included = False
+        seen.add(candidate.name)
+        covered.add(candidate.doc_type)
+        candidates.append(candidate)
+    prefix: List[SectionCandidate] = []
+    for doc_type in types:
+        if doc_type.name in covered or doc_type.name in SPLIT_DOC_TYPES:
+            continue
+        seed_paths = list(arch_seeds or []) if doc_type.name == "architecture" else []
+        prefix.append(
+            SectionCandidate(
+                doc_type=doc_type.name,
+                name=doc_type.name,
+                title=doc_type.name.replace("-", " ").title(),
+                kind="overview",
+                description=doc_type.description,
+                file_paths=seed_paths,
+                included=True,
+            )
+        )
+    return prefix + candidates
+
+
+def apply_section_filters(
+    candidates: List[SectionCandidate],
+    include: Sequence[str] = (),
+    exclude: Sequence[str] = (),
+) -> List[SectionCandidate]:
+    include_keys = {_normalize_section_filter(item) for item in include if str(item).strip()}
+    exclude_keys = {_normalize_section_filter(item) for item in exclude if str(item).strip()}
+    if include_keys:
+        for candidate in candidates:
+            candidate.included = _candidate_matches(candidate, include_keys)
+    for candidate in candidates:
+        if _candidate_matches(candidate, exclude_keys):
+            candidate.included = False
+    return candidates
+
+
+def _normalize_section_filter(value: str) -> str:
+    text = (value or "").strip().lower().replace("\\", "/")
+    if text.startswith("features/"):
+        text = text.split("/", 1)[1]
+    return text
+
+
+def _candidate_matches(candidate: SectionCandidate, keys: set) -> bool:
+    if not keys:
+        return False
+    names = {
+        candidate.key.lower(),
+        candidate.name.lower(),
+        candidate.doc_type.lower(),
+        (candidate.title or "").lower(),
+        f"features/{candidate.name}".lower(),
+    }
+    return bool(names & keys)
+
+
+def extra_section_from_entry(
+    analyzer: GitAnalyzer,
+    raw: str,
+    ignore_patterns: set,
+    skip_dirs: set,
+    doc_type: str = "functions",
+) -> SectionCandidate:
+    chunk = analyzer.chunk_from_entry(raw, ignore_patterns, skip_dirs)
+    requested = posix_rel(raw)
+    requested_full = os.path.join(analyzer.repo_path, requested) if requested else ""
+    posix = posix_rel(chunk.file_paths[0] if chunk.file_paths else raw)
+    stem = Path(posix).stem if posix else chunk.feature_name
+    if requested_full and os.path.isdir(requested_full):
+        name = slug_type_name(Path(requested).name or chunk.feature_name)
+        title = Path(requested).name or chunk.feature_name
+    elif requested_full and os.path.isfile(requested_full):
+        name = slug_type_name(stem)
+        title = stem
+    else:
+        name = slug_type_name(chunk.feature_name)
+        title = chunk.feature_name
+    mapped = KIND_TO_SECTION.get("function", "functions")
+    chosen_type = doc_type if doc_type != "features" else mapped
+    return SectionCandidate(
+        doc_type=chosen_type,
+        name=name,
+        title=title,
+        kind="function",
+        description=chunk.description,
+        file_paths=list(chunk.file_paths),
+        included=True,
+        extra=True,
+        sample_snippets=dict(chunk.sample_snippets),
+    )
+
+
+def selected_sections(candidates: Sequence[SectionCandidate]) -> List[SectionCandidate]:
+    return [item for item in candidates if item.included]
+
+
+KIND_HEADINGS = {
+    "architecture": "Architecture",
+    "overview": "Architecture",
+    "database": "Migrations",
+    "models": "Eloquent models",
+    "functions": "Functions",
+    "routes": "Routes",
+    "pages": "Pages",
+    "features": "Features",
+    "other": "Also important",
+    "model": "Eloquent models",
+    "migration": "Migrations",
+    "filament-resource": "Pages",
+    "filament-page": "Pages",
+    "controller": "Functions",
+    "policy": "Policies",
+    "job": "Jobs",
+    "service": "Services",
+    "action": "Actions",
+    "function": "Functions",
+    "page": "Pages",
+    "component": "Components",
+    "route": "Routes",
+    "module": "Functions",
+}
+
+KIND_ITEM_LABELS = {
+    "model": "Eloquent model",
+    "models": "Eloquent model",
+    "migration": "migration",
+    "database": "migration",
+    "architecture": "architecture",
+    "overview": "architecture",
+    "filament-resource": "Filament resource",
+    "filament-page": "Filament page",
+    "controller": "controller",
+    "function": "function",
+    "functions": "function",
+    "page": "page",
+    "pages": "page",
+    "route": "route",
+    "routes": "route",
+    "module": "function",
+}
+
+
+def kind_heading(kind: str) -> str:
+    key = (kind or "").strip().lower()
+    if key in KIND_HEADINGS:
+        return KIND_HEADINGS[key]
+    return (kind or "other").replace("-", " ").title() or "Other"
+
+
+def kind_item_label(kind: str) -> str:
+    key = (kind or "").strip().lower()
+    if key in KIND_ITEM_LABELS:
+        return KIND_ITEM_LABELS[key]
+    return key.replace("-", " ") or "item"
+
+
+def group_match_keys(kind: str) -> set:
+    heading = kind_heading(kind).lower()
+    keys = {
+        kind.lower(),
+        heading,
+        heading.replace(" ", "-"),
+        heading.replace(" ", ""),
+    }
+    extras = {
+        "database": {"migrations", "migration", "db"},
+        "migration": {"migrations", "database", "db"},
+        "models": {"model", "eloquent", "eloquent-models", "eloquent models"},
+        "model": {"models", "eloquent"},
+    }
+    keys.update(extras.get(kind.lower(), set()))
+    return keys
+
+
+def resolve_picker_group(query: str, groups: Sequence[str]) -> Optional[str]:
+    text = (query or "").strip().lower()
+    if not text:
+        return None
+    for kind in groups:
+        if text in group_match_keys(kind):
+            return kind
+    return None
+
+
+def toggle_group_included(candidates: Sequence[SectionCandidate], group: str) -> bool:
+    """Select all in a picker group, or deselect all if every item is already on."""
+    indices = [i for i, item in enumerate(candidates) if picker_group(item) == group]
+    if not indices:
+        return False
+    want = not all(candidates[i].included for i in indices)
+    for i in indices:
+        candidates[i].included = want
+    return True
+
+
+def picker_group(item: SectionCandidate) -> str:
+    if (item.kind or "").strip().lower() == "other":
+        return "other"
+    if item.doc_type and item.doc_type != "features":
+        return item.doc_type
+    return (item.kind or item.doc_type or "module").strip().lower() or "module"
+
+
+def group_candidates(candidates: Sequence[SectionCandidate]) -> List[Tuple[str, List[int]]]:
+    """Group picker rows; values are indexes into `candidates`."""
+    buckets: dict[str, List[int]] = {}
+    for index, item in enumerate(candidates):
+        buckets.setdefault(picker_group(item), []).append(index)
+    grouped: List[Tuple[str, List[int]]] = []
+    order = [
+        "architecture", "overview",
+        "models", "database", "functions", "routes", "pages", "features",
+        *APP_KIND_ORDER, "other",
+    ]
+    seen_keys = set()
+    for kind in order:
+        if kind in buckets and kind not in seen_keys:
+            grouped.append((kind, buckets.pop(kind)))
+            seen_keys.add(kind)
+    for kind in sorted(buckets):
+        grouped.append((kind, buckets[kind]))
+    return grouped
+
+
+def _generation_context(app_repo_path: str, config: DocFlowConfig) -> Tuple[Optional[str], set, set]:
+    """Resolve framework profile, merged ignore patterns, and skip-as-feature dirs."""
+    framework_name = resolve_framework_name(app_repo_path, config.generation.framework)
+    ignore = effective_ignore(app_repo_path, config.generation.ignore, framework_name)
+    skip = skip_as_feature_dirs(framework_name)
+    return framework_name, ignore, skip
+
+
+def _documentation_guidance(
+    docs_repo_path: str,
+    framework_name: Optional[str],
+) -> Optional[str]:
+    return stack_guidance(docs_repo_path, framework_name)
+
+
+def _persist_detected_framework(
+    config: DocFlowConfig,
+    framework_name: Optional[str],
+    app_repo_path: str,
+    docs_repo_path: str,
+) -> None:
+    if config.generation.framework == "auto" and framework_name:
+        config.generation.framework = framework_name
+        save_project_config(config, app_repo_path, docs_repo_path)
 
 
 def is_initialized(docs_repo_path: str) -> bool:
     if not docs_repo_path:
         return False
-    return os.path.isfile(os.path.join(os.path.abspath(docs_repo_path), ".docflow.yml"))
+    return is_docs_project(docs_repo_path)
 
 
 def assert_can_init(docs_repo_path: str) -> None:
@@ -152,6 +671,8 @@ class AgentSpec:
     mode: str
     command: str
     name: str = ""
+    model: str = ""
+    plan_model: str = ""
 
 
 @dataclass(frozen=True)
@@ -162,6 +683,7 @@ class ModelChoice:
     value: str
     label: str
     group: str  # current | third_party
+    group_label: str = ""
 
 
 @dataclass
@@ -227,6 +749,8 @@ class GenerateResult:
     used_cursor: bool = False
     features: List[FeatureRunResult] = field(default_factory=list)
     synced_remote: bool = False
+    app_branch: str = ""
+    new_items: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -249,6 +773,11 @@ class Dashboard:
     doc_types: List[str] = field(default_factory=list)
     last_documented: Optional[CommitInfo] = None
     new_commits: List[CommitInfo] = field(default_factory=list)
+    concurrency: int = 1
+    agent_name: str = ""
+    agent_model: str = ""
+    plan_model: str = ""
+    app_branch: str = ""
 
 
 @dataclass
@@ -305,9 +834,96 @@ AGENT_CHOICES: Sequence[Tuple[str, str]] = (
 
 CURSOR_AGENT_KEYS = frozenset({"cursor", "cursor-agent", "cursor-interactive"})
 AGY_AGENT_KEYS = frozenset({"agy", "agy-interactive"})
+OPENCODE_AGENT_KEYS = frozenset({"opencode"})
+PREFERRED_APP_BRANCHES = ("main", "master", "develop")
+DEFAULT_CURSOR_MODEL = "composer-2.5"
+DEFAULT_CURSOR_PLAN_MODEL = "composer-2.5"
+DEFAULT_CURSOR_WORK_MODEL = "composer-2.5-fast"
+CURSOR_GROUP_LABELS = {
+    "current": "Cursor included usage",
+    "third_party": "Third-party API usage",
+}
+AGY_GROUP_LABELS = {
+    "current": "Current",
+    "third_party": "Third-party",
+}
 _MODEL_FLAG = re.compile(
     r"\s+--model(?:\s+|=)(?:'(?:\\'|[^'])*'|\"(?:\\\"|[^\"])*\"|\S+)"
 )
+_MODEL_VALUE = re.compile(
+    r"--model(?:\s+|=)('(?:\\'|[^'])*'|\"(?:\\\"|[^\"])*\"|\S+)"
+)
+
+
+def command_without_model(command: str) -> str:
+    return re.sub(r"\s+", " ", _MODEL_FLAG.sub("", command or "")).strip()
+
+
+def model_from_command(command: str) -> str:
+    match = _MODEL_VALUE.search(command or "")
+    if not match:
+        return ""
+    raw = match.group(1).strip()
+    if len(raw) >= 2 and raw[0] in {"'", '"'} and raw[-1] == raw[0]:
+        return raw[1:-1]
+    return raw
+
+
+def agent_key_from_command(command: str) -> str:
+    """Map a saved shell command back to an AGENT_CHOICES key."""
+    cmd = command_without_model(command)
+    if not cmd:
+        return ""
+    matches = [
+        key
+        for key, preset in AGENT_PRESETS.items()
+        if key not in {"manual", "cursor"} and command_without_model(preset) == cmd
+    ]
+    if matches:
+        return matches[0]
+    first = cmd.split()[0]
+    aliases = {"agent": "cursor-agent", "agy": "agy", "claude": "claude", "cline": "cline", "opencode": "opencode"}
+    return aliases.get(first, "")
+
+
+def infer_agent_name(config: Optional[DocFlowConfig]) -> str:
+    if config is None:
+        return ""
+    name = (config.agent.name or "").strip().lower()
+    if name and name not in {"saved", "shell"}:
+        return name
+    if (config.agent.mode or "").lower() == "manual":
+        return "manual"
+    return agent_key_from_command(config.agent.command or "")
+
+
+def infer_agent_model(config: Optional[DocFlowConfig]) -> str:
+    if config is None:
+        return ""
+    saved = (config.agent.model or "").strip()
+    if saved:
+        return saved
+    return model_from_command(config.agent.command or "")
+
+
+def infer_plan_model(config: Optional[DocFlowConfig]) -> str:
+    if config is None:
+        return ""
+    return (config.agent.plan_model or "").strip()
+
+
+def remember_agent(config: DocFlowConfig, spec: AgentSpec) -> None:
+    """Keep the last agent + models so the next run can reuse them."""
+    name = spec.name if spec.name not in {"saved", "shell", ""} else agent_key_from_command(spec.command)
+    if spec.mode == "manual":
+        name = "manual"
+    config.agent.mode = spec.mode
+    config.agent.command = spec.command
+    config.agent.name = name or infer_agent_name(config)
+    work = (spec.model or "").strip() or model_from_command(spec.command)
+    config.agent.model = work
+    if (spec.plan_model or "").strip():
+        config.agent.plan_model = spec.plan_model.strip()
 
 
 def project_root() -> str:
@@ -320,13 +936,46 @@ def default_docs_path(app_repo_path: str) -> str:
     )
 
 
+def docs_dir_from_config(config: DocFlowConfig) -> str:
+    """Docs repo root for a loaded config (`.docflow/config.yml` or legacy `.docflow.yml`)."""
+    if config.source_path:
+        return docs_root_from_config_path(config.source_path)
+    if config.docs.repo_path:
+        return os.path.abspath(config.docs.repo_path)
+    return ""
+
+
+def docs_repo_from_cwd(cwd: Optional[str] = None) -> str:
+    """If this folder is a docs project, return it.
+
+    A leftover config in an app/tool repo often still points at the real docs
+    folder (`docs.repo_path`). Prefer that when it is a DocFlow project.
+    """
+    folder = os.path.abspath(cwd or os.getcwd())
+    if not is_initialized(folder):
+        return ""
+    config = DocFlowConfig.load(docs_repo_path=folder)
+    pointed = (config.docs.repo_path or "").strip()
+    if pointed:
+        pointed = os.path.abspath(pointed)
+        if pointed != folder and is_initialized(pointed):
+            return pointed
+    return folder
+
+
 def is_configured(config: Optional[DocFlowConfig] = None) -> bool:
     cfg = config or DocFlowConfig.load()
-    return bool(cfg.source_path and cfg.app.repo_path and cfg.docs.repo_path)
+    docs_dir = docs_dir_from_config(cfg)
+    app_path = (cfg.app.repo_path or "").strip()
+    return bool(docs_dir and is_initialized(docs_dir) and app_path)
 
 
 def agent_supports_models(agent_key: str) -> bool:
-    return agent_key in CURSOR_AGENT_KEYS or agent_key in AGY_AGENT_KEYS
+    return (
+        agent_key in CURSOR_AGENT_KEYS
+        or agent_key in AGY_AGENT_KEYS
+        or agent_key in OPENCODE_AGENT_KEYS
+    )
 
 
 def parse_cursor_model_list(output: str) -> List[Tuple[str, str]]:
@@ -375,6 +1024,23 @@ def parse_agy_model_list(output: str) -> List[Tuple[str, str]]:
     return rows
 
 
+def parse_opencode_model_list(output: str) -> List[Tuple[str, str]]:
+    """Parse `opencode models` output: one provider/model id per line."""
+    rows: List[Tuple[str, str]] = []
+    seen = set()
+    pattern = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*/[A-Za-z0-9][A-Za-z0-9._+-]*$")
+    for raw in (output or "").splitlines():
+        line = raw.strip()
+        if not line or "/" not in line:
+            continue
+        key = line.split()[0]
+        if not pattern.match(key) or key in seen:
+            continue
+        seen.add(key)
+        rows.append((key, key))
+    return rows
+
+
 def _label_normal_variants(rows: Sequence[Tuple[str, str]]) -> List[Tuple[str, str]]:
     keys = {key for key, _ in rows}
     labeled: List[Tuple[str, str]] = []
@@ -404,7 +1070,7 @@ def _cursor_current_rank(key: str) -> Tuple[int, str, int]:
 
 
 def catalog_cursor_models(rows: Sequence[Tuple[str, str]]) -> List[ModelChoice]:
-    """Current (Composer, Grok, Auto) first; third-party models underneath."""
+    """Included usage (Composer, Grok, Auto) first; third-party API models underneath."""
     rows = _label_normal_variants(list(rows))
     if not any(key == "auto" for key, _ in rows):
         rows = [("auto", "Auto (default)")] + rows
@@ -413,12 +1079,61 @@ def catalog_cursor_models(rows: Sequence[Tuple[str, str]]) -> List[ModelChoice]:
     current.sort(key=lambda item: _cursor_current_rank(item[0]))
     third.sort(key=lambda item: item[1].lower())
     choices = [
-        ModelChoice(key=k, value=k, label=lab, group="current") for k, lab in current
+        ModelChoice(
+            key=k,
+            value=k,
+            label=lab,
+            group="current",
+            group_label=CURSOR_GROUP_LABELS["current"],
+        )
+        for k, lab in current
     ]
     choices.extend(
-        ModelChoice(key=k, value=k, label=lab, group="third_party") for k, lab in third
+        ModelChoice(
+            key=k,
+            value=k,
+            label=lab,
+            group="third_party",
+            group_label=CURSOR_GROUP_LABELS["third_party"],
+        )
+        for k, lab in third
     )
     return choices
+
+
+def default_cursor_model(catalog: Sequence[ModelChoice]) -> str:
+    """DocFlow default for Cursor: composer-2.5, else first composer-*, else auto."""
+    keys = [c.key for c in catalog]
+    if DEFAULT_CURSOR_MODEL in keys:
+        return DEFAULT_CURSOR_MODEL
+    for key in keys:
+        if key.startswith("composer-") and not key.endswith("-fast"):
+            return key
+    for key in keys:
+        if key.startswith("composer-"):
+            return key
+    if "auto" in keys:
+        return "auto"
+    return keys[0] if keys else ""
+
+
+def default_cursor_plan_model(catalog: Sequence[ModelChoice]) -> str:
+    """Bigger default for search / stack survey."""
+    keys = [c.key for c in catalog]
+    if DEFAULT_CURSOR_PLAN_MODEL in keys:
+        return DEFAULT_CURSOR_PLAN_MODEL
+    return default_cursor_model(catalog)
+
+
+def default_cursor_work_model(catalog: Sequence[ModelChoice]) -> str:
+    """Smaller default for writing docs from a prepared prompt."""
+    keys = [c.key for c in catalog]
+    if DEFAULT_CURSOR_WORK_MODEL in keys:
+        return DEFAULT_CURSOR_WORK_MODEL
+    for key in keys:
+        if key.endswith("-fast"):
+            return key
+    return default_cursor_model(catalog)
 
 
 def catalog_agy_models(rows: Sequence[Tuple[str, str]]) -> List[ModelChoice]:
@@ -426,13 +1141,33 @@ def catalog_agy_models(rows: Sequence[Tuple[str, str]]) -> List[ModelChoice]:
     current = [(k, lab) for k, lab in rows if k.startswith("gemini-")]
     third = [(k, lab) for k, lab in rows if not k.startswith("gemini-")]
     choices = [
-        ModelChoice(key="default", value="", label="Default (agy default)", group="current")
+        ModelChoice(
+            key="default",
+            value="",
+            label="Default (agy default)",
+            group="current",
+            group_label=AGY_GROUP_LABELS["current"],
+        )
     ]
     choices.extend(
-        ModelChoice(key=k, value=k, label=lab, group="current") for k, lab in current
+        ModelChoice(
+            key=k,
+            value=k,
+            label=lab,
+            group="current",
+            group_label=AGY_GROUP_LABELS["current"],
+        )
+        for k, lab in current
     )
     choices.extend(
-        ModelChoice(key=k, value=k, label=lab, group="third_party") for k, lab in third
+        ModelChoice(
+            key=k,
+            value=k,
+            label=lab,
+            group="third_party",
+            group_label=AGY_GROUP_LABELS["third_party"],
+        )
+        for k, lab in third
     )
     return choices
 
@@ -471,24 +1206,99 @@ def list_agent_models(agent_key: str) -> List[ModelChoice]:
         return catalog_cursor_models(list_cursor_models())
     if agent_key in AGY_AGENT_KEYS:
         return catalog_agy_models(list_agy_models())
+    if agent_key in OPENCODE_AGENT_KEYS:
+        return catalog_opencode_models(list_opencode_models())
     return []
+
+
+def list_opencode_models(timeout: float = 30.0) -> List[Tuple[str, str]]:
+    """Ask the OpenCode CLI which models the configured providers offer."""
+    try:
+        proc = subprocess.run(
+            ["opencode", "models"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
+    return parse_opencode_model_list((proc.stdout or "") + "\n" + (proc.stderr or ""))
+
+
+def catalog_opencode_models(rows: Sequence[Tuple[str, str]]) -> List[ModelChoice]:
+    """OpenCode Zen providers first; other configured providers underneath."""
+    current = [(k, lab) for k, lab in rows if k.split("/", 1)[0].startswith("opencode")]
+    third = [(k, lab) for k, lab in rows if not k.split("/", 1)[0].startswith("opencode")]
+    choices = [
+        ModelChoice(
+            key="default",
+            value="",
+            label="Default (opencode default)",
+            group="current",
+            group_label="Default",
+        )
+    ]
+    choices.extend(
+        ModelChoice(
+            key=k,
+            value=k,
+            label=lab,
+            group="current",
+            group_label="OpenCode included",
+        )
+        for k, lab in sorted(current)
+    )
+    choices.extend(
+        ModelChoice(
+            key=k,
+            value=k,
+            label=lab,
+            group="third_party",
+            group_label="Configured providers",
+        )
+        for k, lab in sorted(third)
+    )
+    return choices
 
 
 def apply_agent_model(spec: AgentSpec, model: Optional[str]) -> AgentSpec:
     """Insert or strip `--model` on Cursor/agy/Claude command templates."""
     cmd = _MODEL_FLAG.sub("", spec.command or "")
     chosen = (model or "").strip()
-    if not chosen or chosen == "auto":
-        return AgentSpec(mode=spec.mode, command=cmd, name=spec.name)
-    quoted = shlex.quote(chosen)
-    stripped = cmd.lstrip()
-    if spec.name in CURSOR_AGENT_KEYS or stripped.startswith("agent "):
-        cmd = re.sub(r"^(\s*agent)\b", rf"\1 --model {quoted}", cmd, count=1)
-    elif spec.name in AGY_AGENT_KEYS or stripped.startswith("agy "):
-        cmd = re.sub(r"^(\s*agy)\b", rf"\1 --model {quoted}", cmd, count=1)
-    elif spec.name == "claude" or stripped.startswith("claude "):
-        cmd = re.sub(r"^(\s*claude)\b", rf"\1 --model {quoted}", cmd, count=1)
-    return AgentSpec(mode=spec.mode, command=cmd, name=spec.name)
+    work = "" if not chosen or chosen == "auto" else chosen
+    if work:
+        quoted = shlex.quote(work)
+        stripped = cmd.lstrip()
+        if spec.name in CURSOR_AGENT_KEYS or stripped.startswith("agent "):
+            cmd = re.sub(r"^(\s*agent)\b", rf"\1 --model {quoted}", cmd, count=1)
+        elif spec.name in AGY_AGENT_KEYS or stripped.startswith("agy "):
+            cmd = re.sub(r"^(\s*agy)\b", rf"\1 --model {quoted}", cmd, count=1)
+        elif spec.name == "claude" or stripped.startswith("claude "):
+            cmd = re.sub(r"^(\s*claude)\b", rf"\1 --model {quoted}", cmd, count=1)
+        elif spec.name in OPENCODE_AGENT_KEYS or stripped.startswith("opencode"):
+            cmd = re.sub(
+                r"^(\s*opencode(?:\s+run)?)\b", rf"\1 --model {quoted}", cmd, count=1
+            )
+    return AgentSpec(
+        mode=spec.mode,
+        command=cmd,
+        name=spec.name,
+        model=work,
+        plan_model=spec.plan_model,
+    )
+
+
+def attach_agent_models(
+    spec: AgentSpec,
+    model: Optional[str] = None,
+    plan_model: Optional[str] = None,
+) -> AgentSpec:
+    """Set the work model on the command and remember the plan model separately."""
+    work = (model if model is not None else spec.model) or ""
+    plan = (plan_model if plan_model is not None else spec.plan_model) or ""
+    updated = apply_agent_model(spec, work)
+    updated.plan_model = "" if plan.strip() == "auto" else plan.strip()
+    return updated
 
 
 def resolve_agent(
@@ -497,6 +1307,7 @@ def resolve_agent(
     command: Optional[str] = None,
     config: Optional[DocFlowConfig] = None,
     model: Optional[str] = None,
+    plan_model: Optional[str] = None,
 ) -> Optional[AgentSpec]:
     """Resolve agent execution from flags, then saved config. Returns None if unset."""
     spec: Optional[AgentSpec] = None
@@ -514,51 +1325,82 @@ def resolve_agent(
             spec = AgentSpec(mode="manual", command="", name="manual")
         else:
             cfg_cmd = (config.agent.command if config else "") or AGENT_PRESETS["agy"]
-            spec = AgentSpec(mode=mode, command=cfg_cmd, name="shell")
+            spec = AgentSpec(mode=mode, command=cfg_cmd, name=infer_agent_name(config) or "shell")
     elif config and config.source_path:
+        name = infer_agent_name(config)
         saved_mode = (config.agent.mode or "manual").lower()
-        if saved_mode == "manual":
+        if name == "manual" or saved_mode == "manual":
             spec = AgentSpec(mode="manual", command="", name="manual")
+        elif name == "custom":
+            spec = AgentSpec(mode="shell", command=config.agent.command or "", name="custom")
+        elif name and name in AGENT_PRESETS:
+            spec = AgentSpec(mode="shell", command=AGENT_PRESETS[name], name=name)
         else:
             spec = AgentSpec(
-                mode=saved_mode,
+                mode=saved_mode if saved_mode in {"shell", "manual"} else "shell",
                 command=config.agent.command or AGENT_PRESETS["agy"],
-                name="saved",
+                name=name or "saved",
             )
+        if not model:
+            model = infer_agent_model(config)
+        if not plan_model:
+            plan_model = infer_plan_model(config)
     if spec is None:
         return None
-    if model:
-        spec = apply_agent_model(spec, model)
-    return spec
+    return attach_agent_models(spec, model=model or spec.model, plan_model=plan_model or spec.plan_model)
 
 
 def resolve_paths(
     repo: Optional[str] = None,
     docs: Optional[str] = None,
     require: bool = True,
+    use_last: bool = True,
 ) -> ResolvedPaths:
-    config = DocFlowConfig.load(repo or None)
+    docs_repo_path = ""
+    if docs:
+        docs_repo_path = os.path.abspath(docs)
+    elif repo:
+        entry = find_by_app(repo)
+        if entry:
+            docs_repo_path = entry.docs_path
+        else:
+            docs_repo_path = docs_repo_from_cwd()
+    else:
+        docs_repo_path = docs_repo_from_cwd()
+        if not docs_repo_path and use_last:
+            entry = last_usable_project()
+            if entry:
+                docs_repo_path = entry.docs_path
+
+    if not docs_repo_path:
+        if require:
+            raise ConfigError(
+                "No DocFlow project is selected. Run `docflow init` or "
+                "`docflow projects`, or pass --docs / --repo."
+            )
+        return ResolvedPaths(app_repo_path="", docs_repo_path="", config=DocFlowConfig())
+
+    config = DocFlowConfig.load(docs_repo_path=docs_repo_path)
     app_repo_path = ""
     if repo:
         app_repo_path = os.path.abspath(repo)
     elif config.app.repo_path:
         app_repo_path = os.path.abspath(config.app.repo_path)
-
-    if app_repo_path:
-        reloaded = DocFlowConfig.load(app_repo_path)
-        if reloaded.source_path:
-            config = reloaded
-
-    docs_repo_path = ""
-    if docs:
-        docs_repo_path = os.path.abspath(docs)
-    elif config.docs.repo_path:
-        docs_repo_path = os.path.abspath(config.docs.repo_path)
+    else:
+        indexed = find_by_docs(docs_repo_path)
+        if indexed and indexed.app_path:
+            app_repo_path = indexed.app_path
 
     if require and not app_repo_path:
-        raise ConfigError("Application repo is not set. Run `docflow init` or pass --repo.")
-    if require and not docs_repo_path:
-        raise ConfigError("Docs repo is not set. Run `docflow init` or pass --docs.")
+        raise ConfigError(
+            "Application repo is not set in the docs `.docflow/config.yml`. "
+            "Run `docflow init` or pass --repo."
+        )
+    if require and not is_initialized(docs_repo_path):
+        raise ConfigError(
+            f"Docs folder is not a DocFlow project: {docs_repo_path}. "
+            "Run `docflow init` or `docflow projects add --docs PATH`."
+        )
 
     return ResolvedPaths(
         app_repo_path=app_repo_path,
@@ -568,25 +1410,22 @@ def resolve_paths(
 
 
 def save_project_config(config: DocFlowConfig, app_repo_path: str, docs_repo_path: str) -> List[str]:
-    saved: List[str] = []
-    for path in (app_repo_path, docs_repo_path):
-        try:
-            saved.append(config.save(path))
-        except Exception:
-            pass
+    saved = [config.save(docs_repo_path)]
+    register_project(docs_repo_path, app_repo_path, config.project.name)
     return saved
 
 
 def _conventions_text(docs_repo_path: str, copy_from_package: bool = False) -> str:
-    dest = os.path.join(docs_repo_path, "CONVENTIONS.md")
+    dest = write_conventions_path(docs_repo_path) if copy_from_package else find_conventions_path(docs_repo_path)
     src = os.path.join(project_root(), "CONVENTIONS.md")
     if copy_from_package and os.path.exists(src):
-        os.makedirs(docs_repo_path, exist_ok=True)
-        shutil.copy(src, dest)
+        os.makedirs(os.path.dirname(write_conventions_path(docs_repo_path)), exist_ok=True)
+        shutil.copy(src, write_conventions_path(docs_repo_path))
         with open(src, "r", encoding="utf-8") as f:
             return f.read()
-    if os.path.exists(dest):
-        with open(dest, "r", encoding="utf-8") as f:
+    existing = dest if dest and os.path.exists(dest) else find_conventions_path(docs_repo_path)
+    if existing and os.path.exists(existing):
+        with open(existing, "r", encoding="utf-8") as f:
             return f.read()
     return ""
 
@@ -606,21 +1445,95 @@ def list_app_branches(app_repo_path: str) -> List[str]:
     return GitAnalyzer(app_repo_path).list_branches()
 
 
+def default_app_branch(app_repo_path: str) -> str:
+    """Prefer main, then master, then develop, then the current checkout."""
+    if not app_repo_path or not os.path.isdir(app_repo_path):
+        return "HEAD"
+    try:
+        names = list_app_branches(app_repo_path)
+    except Exception:
+        names = []
+    by_lower = {name.lower(): name for name in names}
+    for want in PREFERRED_APP_BRANCHES:
+        if want in by_lower:
+            return by_lower[want]
+    current = _current_branch(app_repo_path)
+    if current and current != "HEAD":
+        return current
+    return names[0] if names else "HEAD"
+
+
+def resolve_branch_rev(app_repo_path: str, branch: str) -> str:
+    """Map a branch name to a local rev, falling back to origin/<name>."""
+    name = (branch or "").strip() or "HEAD"
+    if name == "HEAD":
+        return "HEAD"
+    if _rev_exists(app_repo_path, name):
+        return name
+    remote = f"origin/{name}"
+    if _rev_exists(app_repo_path, remote):
+        return remote
+    return name
+
+
+def infer_app_branch(config: Optional[DocFlowConfig], app_repo_path: str = "") -> str:
+    saved = ""
+    if config is not None:
+        saved = (getattr(config.app, "branch", None) or "").strip()
+    if saved:
+        if not app_repo_path:
+            return saved
+        if _rev_exists(app_repo_path, saved) or _rev_exists(app_repo_path, f"origin/{saved}"):
+            return saved
+    if app_repo_path:
+        return default_app_branch(app_repo_path)
+    return saved or "HEAD"
+
+
+def merge_base_sha(app_repo_path: str, a: str, b: str) -> str:
+    try:
+        proc = _git(app_repo_path, ["merge-base", a, b])
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip()
+
+
+def documented_unit_names(config: DocFlowConfig, docs_repo_path: str) -> set:
+    names: set = set()
+    if config.generation.features:
+        names.update(config.generation.features)
+    for extra in config.generation.extra_features or []:
+        if extra.name:
+            names.add(extra.name)
+    for doc_type in config.docs.types:
+        folder = os.path.join(docs_repo_path, doc_type.name)
+        if not os.path.isdir(folder):
+            continue
+        if doc_type.name == "architecture":
+            names.add("architecture")
+            continue
+        for entry in os.listdir(folder):
+            if os.path.isdir(os.path.join(folder, entry)):
+                names.add(entry)
+    return names
+
+
 def list_commits_in_range(app_repo_path: str, base_ref: str, head_ref: str) -> List[CommitInfo]:
     analyzer = GitAnalyzer(app_repo_path)
     return [CommitInfo(**row) for row in analyzer.commits_between(base_ref, head_ref)]
 
 
-STATE_FILENAME = ".docflow-state.json"
-
-
 def _state_path(docs_repo_path: str) -> str:
-    return os.path.join(os.path.abspath(docs_repo_path), STATE_FILENAME)
+    path = write_state_path(docs_repo_path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return path
 
 
 def load_generate_cursor(docs_repo_path: str) -> Optional[GenerateCursor]:
-    path = _state_path(docs_repo_path)
-    if not os.path.isfile(path):
+    path = find_state_path(docs_repo_path)
+    if not path or not os.path.isfile(path):
         return None
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -905,7 +1818,9 @@ def pull_app_repo(
     if cursor:
         last = CommitInfo(sha=cursor.head_sha, short_sha=cursor.short_sha, message=cursor.message)
     if success and docs_repo_path:
-        _, new_commits, _ = new_commits_since(app_repo_path, docs_repo_path)
+        cfg = DocFlowConfig.load(docs_repo_path=docs_repo_path)
+        rev = resolve_branch_rev(app_repo_path, infer_app_branch(cfg, app_repo_path))
+        _, new_commits, _ = new_commits_since(app_repo_path, docs_repo_path, rev=rev)
     already = success and ("already up to date" in output.lower())
     return PullResult(
         success=success,
@@ -922,6 +1837,81 @@ def find_existing_docs(app_repo_path: str) -> dict:
 
 
 _IMPORT_EXTS = {".md", ".mdx", ".txt", ".rst", ".json", ".yaml", ".yml"}
+_IMPORT_PROGRESS_EVERY = 10
+
+
+def _job_concurrency(config: DocFlowConfig, override: Optional[int] = None) -> int:
+    if override is not None:
+        return clamp_concurrency(override, 1)
+    raw = os.getenv("DOCFLOW_JOBS")
+    if raw not in (None, ""):
+        return default_concurrency()
+    return clamp_concurrency(config.generation.concurrency, 1)
+
+
+def _agent_capture(concurrency: int, capture_output: bool) -> Optional[bool]:
+    if concurrency > 1:
+        return True
+    return True if capture_output else None
+
+
+def _complete_prompt(prompt_file: str, docs_repo_path: str) -> None:
+    if not os.path.exists(prompt_file):
+        return
+    completed_dir = completed_prompts_dir(docs_repo_path)
+    os.makedirs(completed_dir, exist_ok=True)
+    shutil.move(prompt_file, os.path.join(completed_dir, os.path.basename(prompt_file)))
+
+
+def _run_shell_jobs(
+    runner: AgentRunner,
+    specs: Sequence[Tuple[str, str, str]],
+    docs_repo_path: str,
+    concurrency: int,
+    capture_output: bool,
+    on_progress: Optional[Callable[[str], None]],
+    run_control: Optional[RunControl] = None,
+) -> List[FeatureRunResult]:
+    """Run agent jobs in parallel. specs are (result_name, prompt_file, stored_prompt_path)."""
+    capture = _agent_capture(concurrency, capture_output)
+    on_output = on_progress if concurrency <= 1 else None
+
+    def make_run(result_name: str, prompt_file: str, stored_prompt: str):
+        def run() -> FeatureRunResult:
+            res = runner.run(
+                prompt_file,
+                docs_repo_path,
+                capture=capture,
+                on_output=on_output,
+            )
+            if res.success:
+                _complete_prompt(prompt_file, docs_repo_path)
+            return FeatureRunResult(
+                feature_name=result_name,
+                prompt_file=stored_prompt,
+                success=res.success,
+                error_message=res.error_message,
+                output_log=res.output_log or "",
+            )
+
+        return run
+
+    job_objs = [Job(key=name, run=make_run(name, prompt_file, stored)) for name, prompt_file, stored in specs]
+    raw = run_jobs(job_objs, concurrency=concurrency, on_progress=on_progress, run_control=run_control)
+    results: List[FeatureRunResult] = []
+    for (name, _prompt_file, stored), result in zip(specs, raw):
+        if isinstance(result, FeatureRunResult):
+            results.append(result)
+        else:
+            results.append(
+                FeatureRunResult(
+                    feature_name=name,
+                    prompt_file=stored,
+                    success=False,
+                    error_message="job failed",
+                )
+            )
+    return results
 
 
 def import_docs(
@@ -937,23 +1927,31 @@ def import_docs(
     dest_type = slug_type_name(type_name)
     dest_root = os.path.join(os.path.abspath(docs_repo_path), dest_type)
     os.makedirs(dest_root, exist_ok=True)
+    if on_progress:
+        on_progress(f"Importing from {src}")
     copied: List[str] = []
     skipped: List[str] = []
+    considered = 0
+
+    def maybe_count_progress() -> None:
+        if on_progress and considered and considered % _IMPORT_PROGRESS_EVERY == 0:
+            on_progress(f"Importing… {len(copied)} copied, {len(skipped)} skipped")
 
     def consider(full_path: str, rel: str) -> None:
+        nonlocal considered
         if Path(full_path).suffix.lower() not in _IMPORT_EXTS and Path(full_path).name.upper() != "README":
             return
         dest = os.path.join(dest_root, rel)
         if os.path.exists(dest):
             skipped.append(rel)
-            if on_progress:
-                on_progress(f"Skip (exists): {dest_type}/{rel}")
+            considered += 1
+            maybe_count_progress()
             return
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         shutil.copy2(full_path, dest)
         copied.append(rel)
-        if on_progress:
-            on_progress(f"Imported {dest_type}/{rel}")
+        considered += 1
+        maybe_count_progress()
 
     if os.path.isfile(src):
         consider(src, os.path.basename(src))
@@ -965,6 +1963,9 @@ def import_docs(
                 rel = os.path.relpath(full, src)
                 consider(full, rel)
 
+    if on_progress and considered and considered % _IMPORT_PROGRESS_EVERY != 0:
+        on_progress(f"Importing… {len(copied)} copied, {len(skipped)} skipped")
+
     type_added = False
     cfg = DocFlowConfig.load(docs_repo_path)
     if cfg.source_path:
@@ -974,8 +1975,6 @@ def import_docs(
             cfg.docs.types = existing
             try:
                 cfg.save(docs_repo_path)
-                if cfg.app.repo_path:
-                    cfg.save(cfg.app.repo_path)
                 type_added = True
                 if on_progress:
                     on_progress(f"Added doc type '{dest_type}' to config")
@@ -1001,14 +2000,20 @@ def list_features(docs_repo_path: str) -> List[str]:
 
 
 def list_pending_prompts(docs_repo_path: str) -> List[str]:
-    prompts_dir = os.path.join(docs_repo_path, "prompts", "pending")
-    if not os.path.isdir(prompts_dir):
-        return []
-    return sorted(f for f in os.listdir(prompts_dir) if f.endswith(".md"))
+    names: List[str] = []
+    for prompts_dir in prompt_search_dirs(docs_repo_path):
+        if not os.path.isdir(prompts_dir):
+            continue
+        names.extend(f for f in os.listdir(prompts_dir) if f.endswith(".md"))
+    return sorted(set(names))
 
 
-def get_dashboard(repo: Optional[str] = None, docs: Optional[str] = None) -> Dashboard:
-    paths = resolve_paths(repo, docs, require=False)
+def get_dashboard(
+    repo: Optional[str] = None,
+    docs: Optional[str] = None,
+    use_last: bool = True,
+) -> Dashboard:
+    paths = resolve_paths(repo, docs, require=False, use_last=use_last)
     app_path = paths.app_repo_path
     docs_path = paths.docs_repo_path
     cfg = paths.config
@@ -1017,9 +2022,11 @@ def get_dashboard(repo: Optional[str] = None, docs: Optional[str] = None) -> Das
     types = configured_types(cfg)
     last_documented = None
     new_commits: List[CommitInfo] = []
+    app_branch = infer_app_branch(cfg, app_path)
     if app_path and docs_path and os.path.isdir(app_path):
         try:
-            cursor, new_commits, _stale = new_commits_since(app_path, docs_path)
+            rev = resolve_branch_rev(app_path, app_branch)
+            cursor, new_commits, _stale = new_commits_since(app_path, docs_path, rev=rev)
             if cursor:
                 last_documented = CommitInfo(
                     sha=cursor.head_sha,
@@ -1029,8 +2036,17 @@ def get_dashboard(repo: Optional[str] = None, docs: Optional[str] = None) -> Das
         except Exception:
             last_documented = None
             new_commits = []
+    project_name = (cfg.project.name or "").strip()
+    if not project_name or project_name == "Project":
+        indexed = find_by_docs(docs_path) if docs_path else None
+        if indexed and indexed.name:
+            project_name = indexed.name
+        elif app_path:
+            project_name = os.path.basename(app_path.rstrip(os.sep)) or project_name
+        elif docs_path:
+            project_name = os.path.basename(docs_path.rstrip(os.sep)) or project_name
     return Dashboard(
-        project_name=cfg.project.name,
+        project_name=project_name or "Project",
         app_repo_path=app_path,
         docs_repo_path=docs_path,
         app_exists=bool(app_path and os.path.exists(app_path)),
@@ -1040,11 +2056,16 @@ def get_dashboard(repo: Optional[str] = None, docs: Optional[str] = None) -> Das
         platform=cfg.platform.type,
         features=features,
         pending=pending,
-        configured=is_configured(cfg),
+        configured=is_configured(cfg) or bool(app_path and docs_path and is_initialized(docs_path)),
         source_path=cfg.source_path,
         doc_types=[f"{t.name}: {t.description}" if t.description else t.name for t in types],
         last_documented=last_documented,
         new_commits=new_commits,
+        concurrency=clamp_concurrency(cfg.generation.concurrency, 1),
+        agent_name=infer_agent_name(cfg),
+        agent_model=infer_agent_model(cfg),
+        plan_model=infer_plan_model(cfg),
+        app_branch=app_branch,
     )
 
 
@@ -1064,6 +2085,13 @@ def init_docs(
     types: Optional[List[DocTypeSettings]] = None,
     import_from: Optional[str] = None,
     import_into: Optional[str] = None,
+    concurrency: Optional[int] = None,
+    on_review_sections: Optional[Callable[[List[SectionCandidate]], Optional[List[SectionCandidate]]]] = None,
+    include_sections: Optional[Sequence[str]] = None,
+    exclude_sections: Optional[Sequence[str]] = None,
+    extra_sections: Optional[Sequence[str]] = None,
+    run_control: Optional[RunControl] = None,
+    branch: str = "",
 ) -> InitResult:
     def progress(message: str) -> None:
         if on_progress:
@@ -1073,11 +2101,12 @@ def init_docs(
     docs_repo_path = os.path.abspath(docs_repo_path)
     assert_can_init(docs_repo_path)
 
-    config = config or DocFlowConfig.load(app_repo_path)
+    config = config or DocFlowConfig.load(docs_repo_path=docs_repo_path)
     config.app.repo_path = app_repo_path
     config.docs.repo_path = docs_repo_path
     config.agent.mode = agent.mode
     config.agent.command = agent.command
+    remember_agent(config, agent)
     chosen_types = types or configured_types(config)
     if not chosen_types:
         chosen_types = list(DEFAULT_DOC_TYPES)
@@ -1086,13 +2115,151 @@ def init_docs(
     ]
     if not config.project.name or config.project.name == "Project":
         config.project.name = os.path.basename(app_repo_path)
+    if concurrency is not None:
+        config.generation.concurrency = clamp_concurrency(concurrency, 1)
+    tracked_branch = (branch or "").strip() or default_app_branch(app_repo_path)
+    config.app.branch = tracked_branch
+
+    analyzer = GitAnalyzer(app_repo_path)
+    framework_name, ignore_patterns, skip_dirs = _generation_context(app_repo_path, config)
+    arch_seeds = architecture_seed_paths(app_repo_path, framework_name)
+    builder = PromptBuilder()
+    work_model = agent.model or model_from_command(agent.command)
+    plan_model = agent.plan_model or work_model
+    plan_runner = AgentRunner(
+        mode=agent.mode,
+        command_template=apply_agent_model(agent, plan_model).command,
+    )
+    runner = AgentRunner(
+        mode=agent.mode,
+        command_template=apply_agent_model(agent, work_model).command,
+    )
+    features: List[FeatureRunResult] = []
+
+    created_docs = not os.path.isdir(docs_repo_path)
+    os.makedirs(docs_repo_path, exist_ok=True)
+    conventions_text = _conventions_text(docs_repo_path, copy_from_package=True)
+
+    stack_payload = load_stack_file(docs_repo_path)
+    tracked_rev = resolve_branch_rev(app_repo_path, tracked_branch)
+    if agent.mode == "shell" and not stack_payload:
+        progress("Asking the plan model what to document from composer/packages…")
+        survey_prompt = pending_prompt_path(docs_repo_path, "init-stack-survey.md")
+        survey_context = PromptContext(
+            task_type="stack-survey",
+            project_name=config.project.name,
+            feature_name="stack-survey",
+            app_repo_path=app_repo_path,
+            docs_repo_path=docs_repo_path,
+            conventions_text=conventions_text,
+            doc_type="stack",
+            doc_type_description="Identify application units and sections to document vs skip.",
+            output_dir=".",
+            available_sections=[
+                {"name": t.name, "description": t.description} for t in config.docs.types
+            ],
+        )
+        builder.save_prompt(survey_context, survey_prompt)
+        survey_res = plan_runner.run(
+            survey_prompt,
+            docs_repo_path,
+            capture=True if capture_output else None,
+            on_output=on_progress,
+        )
+        features.append(
+            FeatureRunResult(
+                feature_name="stack-survey",
+                prompt_file=rel_pending_prompt("init-stack-survey.md"),
+                success=survey_res.success,
+                error_message=survey_res.error_message,
+                output_log=survey_res.output_log,
+            )
+        )
+        if survey_res.success:
+            progress("Stack survey complete.")
+        else:
+            progress(f"Stack survey failed: {survey_res.error_message or 'unknown error'}")
+            if looks_like_agent_launch_failure(survey_res.error_message):
+                if created_docs:
+                    shutil.rmtree(docs_repo_path, ignore_errors=True)
+                raise AgentLaunchError(
+                    f"The '{config.agent.name or 'selected'}' agent could not be started: "
+                    f"{survey_res.error_message}. Install it on this system (check PATH), "
+                    "then retry Setup — or pick a different agent."
+                )
+        stack_payload = load_stack_file(docs_repo_path)
+
+    candidates = discover_init_sections(
+        analyzer,
+        config.docs.types,
+        ignore_patterns,
+        skip_dirs,
+        arch_seeds=arch_seeds,
+        on_progress=on_progress,
+        stack_payload=stack_payload,
+        rev=tracked_rev,
+    )
+    apply_section_filters(candidates, include_sections or (), exclude_sections or ())
+    for raw in extra_sections or ():
+        if str(raw).strip():
+            candidates.append(extra_section_from_entry(analyzer, raw, ignore_patterns, skip_dirs))
+
+    if on_review_sections:
+        progress("Waiting for you to confirm the agent's list…")
+        reviewed = on_review_sections(candidates)
+        if reviewed is None:
+            if created_docs:
+                shutil.rmtree(docs_repo_path, ignore_errors=True)
+            raise InitCancelled("Init cancelled — no docs were written.")
+        candidates = list(reviewed)
+
+    expanded: List[SectionCandidate] = []
+    for item in candidates:
+        if item.extra and not item.file_paths:
+            filled = extra_section_from_entry(analyzer, item.name, ignore_patterns, skip_dirs)
+            filled.included = item.included
+            expanded.append(filled)
+        else:
+            expanded.append(item)
+    candidates = expanded
+
+    chosen = selected_sections(candidates)
+    if not chosen:
+        if created_docs:
+            shutil.rmtree(docs_repo_path, ignore_errors=True)
+        raise ConfigError("No items selected to document.")
+
+    type_by_name = {t.name: t for t in config.docs.types}
+    kept_types: List[DocTypeSettings] = []
+    seen_types = set()
+    for item in chosen:
+        if item.doc_type in seen_types:
+            continue
+        seen_types.add(item.doc_type)
+        kept_types.append(
+            type_by_name.get(item.doc_type)
+            or DocTypeSettings(name=item.doc_type, description=item.description)
+        )
+    config.docs.types = kept_types or list(config.docs.types)
+    config.generation.features = [
+        item.name for item in chosen if item.doc_type != "architecture"
+    ]
+    config.generation.extra_features = [
+        ExtraFeatureSettings(
+            name=item.name,
+            paths=list(item.file_paths[:40]),
+            doc_type=item.doc_type,
+        )
+        for item in chosen
+        if item.file_paths
+    ]
 
     progress("Creating blank docs skeleton…")
-    os.makedirs(docs_repo_path, exist_ok=True)
     for doc_type in config.docs.types:
         os.makedirs(os.path.join(docs_repo_path, doc_type.name), exist_ok=True)
     config_paths = save_project_config(config, app_repo_path, docs_repo_path)
-    conventions_text = _conventions_text(docs_repo_path, copy_from_package=True)
+    if framework_name:
+        _persist_detected_framework(config, framework_name, app_repo_path, docs_repo_path)
 
     imported = ImportResult(dest_type=slug_type_name(import_into or (config.docs.types[0].name)))
     if import_from:
@@ -1106,40 +2273,37 @@ def init_docs(
     elif import_existing:
         progress("No --import-from path given; skipping copy. Use a path/folder to import files.")
 
-    analyzer = GitAnalyzer(app_repo_path)
-    builder = PromptBuilder()
-    runner = AgentRunner(mode=agent.mode, command_template=agent.command)
+    doc_guidance = _documentation_guidance(docs_repo_path, framework_name)
+
     jobs: List[Tuple[str, str, str, FeatureChunk]] = []
-    for doc_type in config.docs.types:
-        if doc_type.name == "features":
-            progress("Scanning the app repo for feature modules…")
-            chunks = analyzer.scan_features(include_architecture=False)
-            for chunk in chunks:
-                jobs.append((doc_type.name, doc_type.description, type_output_dir("features", chunk.feature_name), chunk))
-        else:
-            chunk = FeatureChunk(
-                feature_name=doc_type.name,
-                description=doc_type.description,
-                file_paths=[],
-                sample_snippets={},
+    type_desc_by_name = {t.name: t.description for t in config.docs.types}
+    for item in chosen:
+        chunk = item.to_chunk()
+        jobs.append(
+            (
+                item.doc_type,
+                type_desc_by_name.get(item.doc_type, item.description),
+                type_output_dir(item.doc_type, item.name),
+                chunk,
             )
-            jobs.append((doc_type.name, doc_type.description, type_output_dir(doc_type.name, doc_type.name), chunk))
+        )
 
     total = len(jobs)
-    progress(f"Writing init prompts for {total} section(s).")
-    features: List[FeatureRunResult] = []
+    progress(f"Writing init prompts for {total} section(s) with the work model.")
     imported_note = None
     if imported.copied:
         imported_note = "Imported files (do not overwrite):\n" + "\n".join(f"- {p}" for p in imported.copied[:40])
 
+    prepared: List[Tuple[str, str, str]] = []
     for index, (doc_type, type_desc, output_dir, chunk) in enumerate(jobs, start=1):
         feature_name = chunk.feature_name
-        rel_prompt_file = os.path.join("prompts", "pending", f"init-{doc_type}-{feature_name}.md")
-        prompt_file = os.path.join(docs_repo_path, rel_prompt_file)
+        rel_prompt_file = rel_pending_prompt(f"init-{doc_type}-{feature_name}.md")
+        prompt_file = pending_prompt_path(docs_repo_path, f"init-{doc_type}-{feature_name}.md")
         context = PromptContext(
             task_type="init",
             project_name=config.project.name,
             feature_name=feature_name,
+            app_repo_path=app_repo_path,
             docs_repo_path=docs_repo_path,
             feature_chunk=chunk,
             existing_index_md=imported_note if doc_type == imported.dest_type else None,
@@ -1147,28 +2311,27 @@ def init_docs(
             doc_type=doc_type,
             doc_type_description=type_desc,
             output_dir=output_dir,
+            extra_instructions=doc_guidance,
         )
         progress(f"[{index}/{total}] Writing prompt for {doc_type}/{feature_name}…")
         builder.save_prompt(context, prompt_file)
+        result_name = f"{doc_type}/{feature_name}"
         if agent.mode == "shell":
-            progress(f"[{index}/{total}] Running agent on {doc_type}/{feature_name}…")
+            prepared.append((result_name, prompt_file, rel_prompt_file))
+            continue
         res = runner.run(
             prompt_file,
             docs_repo_path,
             capture=True if capture_output else None,
             on_output=on_progress,
         )
-        if res.success and agent.mode == "shell" and os.path.exists(prompt_file):
-            completed_dir = os.path.join(docs_repo_path, "prompts", "completed")
-            os.makedirs(completed_dir, exist_ok=True)
-            shutil.move(prompt_file, os.path.join(completed_dir, os.path.basename(prompt_file)))
         if res.success:
             progress(f"[{index}/{total}] ✓ {doc_type}/{feature_name}")
         else:
             progress(f"[{index}/{total}] ✗ {doc_type}/{feature_name}: {res.error_message}")
         features.append(
             FeatureRunResult(
-                feature_name=f"{doc_type}/{feature_name}",
+                feature_name=result_name,
                 prompt_file=rel_prompt_file,
                 success=res.success,
                 error_message=res.error_message,
@@ -1176,10 +2339,22 @@ def init_docs(
             )
         )
 
+    if agent.mode == "shell" and prepared:
+        workers = _job_concurrency(config, concurrency)
+        features = features + _run_shell_jobs(
+            runner,
+            prepared,
+            docs_repo_path,
+            concurrency=workers,
+            capture_output=capture_output,
+            on_progress=on_progress,
+            run_control=run_control,
+        )
+
     progress("Generating llms.txt…")
     LLMSTxtGenerator(docs_repo_path).generate(config.project.name)
     try:
-        mark_repo_documented(app_repo_path, docs_repo_path)
+        mark_repo_documented(app_repo_path, docs_repo_path, rev=tracked_rev)
     except Exception:
         pass
 
@@ -1192,12 +2367,111 @@ def init_docs(
         imported=bool(imported.copied),
         features=features,
         docs_inside_app=docs_repo_path.startswith(app_repo_path),
-        pending_dir=os.path.join(docs_repo_path, "prompts", "pending"),
+        pending_dir=pending_prompts_dir(docs_repo_path),
         config_paths=config_paths,
         imported_copied=imported.copied,
         imported_skipped=imported.skipped,
         types=[t.name for t in config.docs.types],
     )
+
+
+def _merge_section_into_config(config: DocFlowConfig, item: SectionCandidate) -> None:
+    features = list(config.generation.features or [])
+    if item.doc_type != "architecture" and item.name not in features:
+        features.append(item.name)
+        config.generation.features = features
+    extras = list(config.generation.extra_features or [])
+    if item.file_paths and not any(extra.name == item.name for extra in extras):
+        extras.append(
+            ExtraFeatureSettings(
+                name=item.name,
+                paths=list(item.file_paths[:40]),
+                doc_type=item.doc_type,
+            )
+        )
+        config.generation.extra_features = extras
+    type_names = {t.name for t in config.docs.types}
+    if item.doc_type and item.doc_type not in type_names:
+        config.docs.types.append(DocTypeSettings(name=item.doc_type, description=item.description))
+
+
+def _run_init_jobs_for_sections(
+    chosen: Sequence[SectionCandidate],
+    config: DocFlowConfig,
+    app_repo_path: str,
+    docs_repo_path: str,
+    agent: AgentSpec,
+    capture_output: bool,
+    on_progress: Optional[Callable[[str], None]],
+    concurrency: Optional[int],
+    run_control: Optional[RunControl],
+    extra_instructions: str = "",
+    conventions_text: str = "",
+) -> List[FeatureRunResult]:
+    builder = PromptBuilder()
+    work_model = agent.model or model_from_command(agent.command)
+    runner = AgentRunner(
+        mode=agent.mode,
+        command_template=apply_agent_model(agent, work_model).command,
+    )
+    type_desc_by_name = {t.name: t.description for t in config.docs.types}
+    prepared: List[Tuple[str, str, str]] = []
+    features: List[FeatureRunResult] = []
+    total = len(chosen)
+    for index, item in enumerate(chosen, start=1):
+        chunk = item.to_chunk()
+        output_dir = type_output_dir(item.doc_type, item.name)
+        os.makedirs(os.path.join(docs_repo_path, output_dir), exist_ok=True)
+        feature_name = chunk.feature_name
+        rel_prompt_file = rel_pending_prompt(f"init-{item.doc_type}-{feature_name}.md")
+        prompt_file = pending_prompt_path(docs_repo_path, f"init-{item.doc_type}-{feature_name}.md")
+        context = PromptContext(
+            task_type="init",
+            project_name=config.project.name,
+            feature_name=feature_name,
+            app_repo_path=app_repo_path,
+            docs_repo_path=docs_repo_path,
+            feature_chunk=chunk,
+            conventions_text=conventions_text,
+            doc_type=item.doc_type,
+            doc_type_description=type_desc_by_name.get(item.doc_type, item.description),
+            output_dir=output_dir,
+            extra_instructions=extra_instructions,
+        )
+        if on_progress:
+            on_progress(f"[{index}/{total}] Writing prompt for {item.doc_type}/{feature_name}…")
+        builder.save_prompt(context, prompt_file)
+        result_name = f"{item.doc_type}/{feature_name}"
+        if agent.mode == "shell":
+            prepared.append((result_name, prompt_file, rel_prompt_file))
+            continue
+        res = runner.run(
+            prompt_file,
+            docs_repo_path,
+            capture=True if capture_output else None,
+            on_output=on_progress,
+        )
+        features.append(
+            FeatureRunResult(
+                feature_name=result_name,
+                prompt_file=rel_prompt_file,
+                success=res.success,
+                error_message=res.error_message,
+                output_log=res.output_log,
+            )
+        )
+    if agent.mode == "shell" and prepared:
+        workers = _job_concurrency(config, concurrency)
+        features = features + _run_shell_jobs(
+            runner,
+            prepared,
+            docs_repo_path,
+            concurrency=workers,
+            capture_output=capture_output,
+            on_progress=on_progress,
+            run_control=run_control,
+        )
+    return features
 
 
 def generate_docs(
@@ -1214,19 +2488,33 @@ def generate_docs(
     on_progress: Optional[Callable[[str], None]] = None,
     commit_count: Optional[int] = None,
     sync_remote: bool = True,
+    concurrency: Optional[int] = None,
+    run_control: Optional[RunControl] = None,
+    app_branch: str = "",
+    on_review_sections: Optional[Callable[[List[SectionCandidate]], Optional[List[SectionCandidate]]]] = None,
 ) -> GenerateResult:
     app_repo_path = os.path.abspath(app_repo_path)
     docs_repo_path = os.path.abspath(docs_repo_path)
-    config = config or DocFlowConfig.load(app_repo_path)
+    config = config or DocFlowConfig.load(docs_repo_path=docs_repo_path)
+    remember_agent(config, agent)
+    previous_branch = (config.app.branch or "").strip()
+    tracked = (app_branch or "").strip() or infer_app_branch(config, app_repo_path)
+    branch_changed = bool(previous_branch and tracked and previous_branch != tracked)
+    config.app.branch = tracked
+    if concurrency is not None:
+        config.generation.concurrency = clamp_concurrency(concurrency, 1)
+    save_project_config(config, app_repo_path, docs_repo_path)
 
     is_full = full
     included_count = commit_count or 1
     synced_remote = False
+    tracked_rev = resolve_branch_rev(app_repo_path, tracked)
+    sync_rev = branch or tracked_rev
     if sync_remote and not from_ref and not to_ref:
         sync = ensure_app_repo_current(
             app_repo_path,
             docs_repo_path,
-            rev=branch or "HEAD",
+            rev=sync_rev,
             on_progress=on_progress,
         )
         synced_remote = bool(sync.success and not sync.already_up_to_date)
@@ -1234,11 +2522,66 @@ def generate_docs(
             on_progress(f"Could not update from remote: {sync.output or 'unknown error'}. Using local commits.")
 
     analyzer = GitAnalyzer(app_repo_path)
+    framework_name, ignore_patterns, skip_dirs = _generation_context(app_repo_path, config)
+    conventions_text = _conventions_text(docs_repo_path)
+    doc_guidance = _documentation_guidance(docs_repo_path, framework_name)
+    new_item_names: List[str] = []
+    new_item_runs: List[FeatureRunResult] = []
+    if branch_changed and not feature and not from_ref and not to_ref:
+        if on_progress:
+            on_progress(f"Application branch is now {tracked}. Checking for new items…")
+        stack_payload = load_stack_file(docs_repo_path)
+        arch_seeds = architecture_seed_paths(app_repo_path, framework_name)
+        fresh = discover_init_sections(
+            analyzer,
+            config.docs.types,
+            ignore_patterns,
+            skip_dirs,
+            arch_seeds=arch_seeds,
+            on_progress=on_progress,
+            stack_payload=stack_payload,
+            rev=tracked_rev,
+        )
+        documented = documented_unit_names(config, docs_repo_path)
+        candidates = [
+            item
+            for item in fresh
+            if item.name not in documented
+            and not (item.doc_type == "architecture" and "architecture" in documented)
+        ]
+        for item in candidates:
+            item.included = suggested_section_included(item.name, kind=item.kind)
+        if candidates and on_review_sections:
+            if on_progress:
+                on_progress("Waiting for you to confirm new items…")
+            reviewed = on_review_sections(candidates)
+            candidates = selected_sections(reviewed) if reviewed else []
+        elif candidates:
+            candidates = selected_sections(candidates)
+        if candidates:
+            for item in candidates:
+                _merge_section_into_config(config, item)
+            save_project_config(config, app_repo_path, docs_repo_path)
+            new_item_names = [item.name for item in candidates]
+            new_item_runs = _run_init_jobs_for_sections(
+                candidates,
+                config,
+                app_repo_path,
+                docs_repo_path,
+                agent,
+                capture_output=capture_output,
+                on_progress=on_progress,
+                concurrency=concurrency,
+                run_control=run_control,
+                extra_instructions=doc_guidance,
+                conventions_text=conventions_text,
+            )
+
     used_cursor = False
     watermark_stale = False
     explicit_range = bool(from_ref or to_ref or is_full or commit_count is not None or branch)
     if not is_full and not from_ref and not to_ref:
-        rev = branch or "HEAD"
+        rev = tracked_rev if not branch else resolve_branch_rev(app_repo_path, branch)
         if not explicit_range:
             cursor = load_generate_cursor(docs_repo_path)
             if cursor and analyzer.is_ancestor(cursor.head_sha, rev):
@@ -1248,6 +2591,31 @@ def generate_docs(
                         on_progress(
                             f"Already documented through {cursor.short_sha} {cursor.message}. "
                             "Pass --commits / --full to regenerate."
+                        )
+                    if new_item_runs:
+                        try:
+                            mark_repo_documented(app_repo_path, docs_repo_path, rev=rev)
+                        except Exception:
+                            pass
+                        return GenerateResult(
+                            app_repo_path=app_repo_path,
+                            docs_repo_path=docs_repo_path,
+                            agent_mode=agent.mode,
+                            agent_command=agent.command,
+                            is_full=False,
+                            base_ref=cursor.head_sha,
+                            head_ref=rev,
+                            task_type="init",
+                            feature_name=", ".join(new_item_names),
+                            prompt_file="",
+                            no_changes=False,
+                            already_current=False,
+                            used_cursor=True,
+                            commit_count=0,
+                            synced_remote=synced_remote,
+                            features=new_item_runs,
+                            app_branch=tracked,
+                            new_items=new_item_names,
                         )
                     return GenerateResult(
                         app_repo_path=app_repo_path,
@@ -1265,6 +2633,7 @@ def generate_docs(
                         used_cursor=True,
                         commit_count=0,
                         synced_remote=synced_remote,
+                        app_branch=tracked,
                     )
                 from_ref = cursor.head_sha
                 to_ref = analyzer.head_commit(rev)["sha"] if analyzer.head_commit(rev) else rev
@@ -1273,16 +2642,31 @@ def generate_docs(
             else:
                 if cursor:
                     watermark_stale = True
-                    if on_progress:
-                        on_progress(
-                            f"Last documented commit {cursor.short_sha} is no longer on this branch. "
-                            "Falling back to the latest commit."
-                        )
-                recent = analyzer.list_commits(max_count=1, rev=rev)
-                if recent:
-                    from_ref = f"{recent[0]['sha']}^"
-                    to_ref = recent[0]["sha"]
-                    included_count = 1
+                    base = merge_base_sha(app_repo_path, cursor.head_sha, rev) if branch_changed else ""
+                    if base:
+                        if on_progress:
+                            on_progress(
+                                f"Branch changed to {tracked}. Updating from the common ancestor."
+                            )
+                        from_ref = base
+                        to_ref = analyzer.head_commit(rev)["sha"] if analyzer.head_commit(rev) else rev
+                    else:
+                        if on_progress:
+                            on_progress(
+                                f"Last documented commit {cursor.short_sha} is no longer on this branch. "
+                                "Falling back to the latest commit."
+                            )
+                        recent = analyzer.list_commits(max_count=1, rev=rev)
+                        if recent:
+                            from_ref = f"{recent[0]['sha']}^"
+                            to_ref = recent[0]["sha"]
+                            included_count = 1
+                else:
+                    recent = analyzer.list_commits(max_count=1, rev=rev)
+                    if recent:
+                        from_ref = f"{recent[0]['sha']}^"
+                        to_ref = recent[0]["sha"]
+                        included_count = 1
         else:
             n = max(1, int(commit_count or 1))
             recent = analyzer.list_commits(max_count=n, rev=rev)
@@ -1293,10 +2677,15 @@ def generate_docs(
                 included_count = n
                 branch = ""
     base_ref = from_ref or "HEAD~1"
-    head_ref = to_ref or branch or "HEAD"
+    head_ref = to_ref or branch or tracked_rev
     conventions_text = _conventions_text(docs_repo_path)
 
-    manifest = analyzer.extract_diff(base_ref=base_ref, head_ref=head_ref)
+    manifest = analyzer.extract_diff(
+        base_ref=base_ref,
+        head_ref=head_ref,
+        full_diff_threshold=config.generation.full_diff_threshold,
+        ignore_patterns=ignore_patterns,
+    )
     included_commits: List[CommitInfo] = []
     if not is_full:
         try:
@@ -1316,6 +2705,28 @@ def generate_docs(
             mark_repo_documented(app_repo_path, docs_repo_path, included_commits, head_ref)
         except Exception:
             pass
+        if new_item_runs:
+            return GenerateResult(
+                app_repo_path=app_repo_path,
+                docs_repo_path=docs_repo_path,
+                agent_mode=agent.mode,
+                agent_command=agent.command,
+                is_full=is_full,
+                base_ref=base_ref,
+                head_ref=head_ref,
+                task_type="init",
+                feature_name=", ".join(new_item_names),
+                prompt_file="",
+                no_changes=False,
+                commits=included_commits,
+                commit_count=included_count,
+                used_cursor=used_cursor,
+                watermark_stale=watermark_stale,
+                synced_remote=synced_remote,
+                features=new_item_runs,
+                app_branch=tracked,
+                new_items=new_item_names,
+            )
         return GenerateResult(
             app_repo_path=app_repo_path,
             docs_repo_path=docs_repo_path,
@@ -1333,23 +2744,82 @@ def generate_docs(
             used_cursor=used_cursor,
             watermark_stale=watermark_stale,
             synced_remote=synced_remote,
+            app_branch=tracked,
+            new_items=new_item_names,
         )
 
-    section_names = generate_section_names(manifest.changed_files, feature)
+    section_names = generate_section_names(
+        manifest.changed_files, feature, skip_as_feature=skip_dirs, config=config
+    )
+    allowed = allowed_feature_names(config)
+    if allowed and not feature:
+        filtered = [name for name in section_names if name in allowed]
+        if not filtered and is_full:
+            filtered = list(config.generation.features or [])
+        section_names = filtered
+        if not section_names and not is_full:
+            try:
+                mark_repo_documented(app_repo_path, docs_repo_path, included_commits, head_ref)
+            except Exception:
+                pass
+            if new_item_runs:
+                return GenerateResult(
+                    app_repo_path=app_repo_path,
+                    docs_repo_path=docs_repo_path,
+                    agent_mode=agent.mode,
+                    agent_command=agent.command,
+                    is_full=is_full,
+                    base_ref=base_ref,
+                    head_ref=head_ref,
+                    task_type="init",
+                    feature_name=", ".join(new_item_names),
+                    prompt_file="",
+                    no_changes=False,
+                    commits=included_commits,
+                    commit_count=included_count,
+                    used_cursor=used_cursor,
+                    watermark_stale=watermark_stale,
+                    synced_remote=synced_remote,
+                    features=new_item_runs,
+                    app_branch=tracked,
+                    new_items=new_item_names,
+                )
+            return GenerateResult(
+                app_repo_path=app_repo_path,
+                docs_repo_path=docs_repo_path,
+                agent_mode=agent.mode,
+                agent_command=agent.command,
+                is_full=is_full,
+                base_ref=base_ref,
+                head_ref=head_ref,
+                task_type="update",
+                feature_name=feature or "",
+                prompt_file="",
+                no_changes=True,
+                commits=included_commits,
+                commit_count=included_count,
+                used_cursor=used_cursor,
+                watermark_stale=watermark_stale,
+                synced_remote=synced_remote,
+            )
     task_type = "full-regen" if is_full else "update"
     builder = PromptBuilder()
     runner = AgentRunner(mode=agent.mode, command_template=agent.command)
+    doc_guidance = _documentation_guidance(docs_repo_path, framework_name)
     feature_runs: List[FeatureRunResult] = []
     last_res: Optional[AgentRunResult] = None
     last_prompt = ""
-    all_ok = True
     total = len(section_names)
+    prepared: List[Tuple[str, str, str]] = []
 
     for index, target_feature in enumerate(section_names, start=1):
         section_files = (
             list(manifest.changed_files)
             if feature
-            else [f for f in manifest.changed_files if feature_bucket_for_path(f.path) == target_feature]
+            else [
+                f for f in manifest.changed_files
+                if documented_name_for_path(f.path, config, skip_dirs) == target_feature
+            ]
         )
         section_manifest = manifest.model_copy(update={"changed_files": section_files or list(manifest.changed_files)})
         doc_type, type_desc, output_dir = resolve_doc_section(config, target_feature)
@@ -1369,6 +2839,7 @@ def generate_docs(
             task_type=task_type,
             project_name=config.project.name,
             feature_name=target_feature,
+            app_repo_path=app_repo_path,
             docs_repo_path=docs_repo_path,
             change_manifest=section_manifest,
             existing_index_md=existing_index,
@@ -1377,14 +2848,16 @@ def generate_docs(
             doc_type=doc_type,
             doc_type_description=type_desc,
             output_dir=output_dir,
+            extra_instructions=doc_guidance,
         )
-        prompt_file = os.path.join(docs_repo_path, "prompts", "pending", f"{task_type}-{target_feature}.md")
+        prompt_file = pending_prompt_path(docs_repo_path, f"{task_type}-{target_feature}.md")
         prefix = f"[{index}/{total}] " if total > 1 else ""
         if on_progress:
             on_progress(f"{prefix}Writing {task_type} prompt for {target_feature}…")
         builder.save_prompt(context, prompt_file)
-        if on_progress and agent.mode == "shell":
-            on_progress(f"{prefix}Running agent on {target_feature}…")
+        if agent.mode == "shell":
+            prepared.append((target_feature, prompt_file, prompt_file))
+            continue
         res = runner.run(
             prompt_file,
             docs_repo_path,
@@ -1393,12 +2866,6 @@ def generate_docs(
         )
         last_res = res
         last_prompt = prompt_file
-        if res.success and agent.mode == "shell" and os.path.exists(prompt_file):
-            completed_dir = os.path.join(docs_repo_path, "prompts", "completed")
-            os.makedirs(completed_dir, exist_ok=True)
-            shutil.move(prompt_file, os.path.join(completed_dir, os.path.basename(prompt_file)))
-        if not res.success:
-            all_ok = False
         feature_runs.append(
             FeatureRunResult(
                 feature_name=target_feature,
@@ -1408,6 +2875,31 @@ def generate_docs(
                 output_log=res.output_log or "",
             )
         )
+
+    if agent.mode == "shell" and prepared:
+        workers = _job_concurrency(config, concurrency)
+        feature_runs = _run_shell_jobs(
+            runner,
+            prepared,
+            docs_repo_path,
+            concurrency=workers,
+            capture_output=capture_output,
+            on_progress=on_progress,
+            run_control=run_control,
+        )
+    feature_runs = new_item_runs + feature_runs
+
+    if feature_runs:
+        last = feature_runs[-1]
+        last_prompt = last.prompt_file
+        last_res = AgentRunResult(
+            success=last.success,
+            mode=agent.mode if agent.mode in ("shell", "manual") else "shell",
+            prompt_file_path=last.prompt_file,
+            output_log=last.output_log or "",
+            error_message=last.error_message,
+        )
+    all_ok = all(item.success for item in feature_runs)
 
     if all_ok:
         try:
@@ -1434,6 +2926,8 @@ def generate_docs(
         watermark_stale=watermark_stale,
         features=feature_runs,
         synced_remote=synced_remote,
+        app_branch=tracked,
+        new_items=new_item_names,
     )
 
 

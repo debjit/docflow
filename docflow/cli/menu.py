@@ -17,16 +17,30 @@ from docflow.core.agent_runner import AGENT_PRESETS
 from docflow.core.operations import (
     AGENT_CHOICES,
     ConfigError,
+    CURSOR_AGENT_KEYS,
+    DEFAULT_CURSOR_MODEL,
+    DEFAULT_CURSOR_PLAN_MODEL,
+    DEFAULT_CURSOR_WORK_MODEL,
     DEFAULT_DOC_TYPES,
     AlreadyInitialized,
+    InitCancelled,
+    SectionCandidate,
     agent_supports_models,
-    apply_agent_model,
+    attach_agent_models,
     assert_can_init,
     default_docs_path,
+    default_app_branch,
     generate_docs,
     get_dashboard,
+    infer_agent_model,
+    infer_agent_name,
+    infer_plan_model,
+    group_candidates,
     import_docs,
     init_docs,
+    kind_heading,
+    resolve_picker_group,
+    toggle_group_included,
     list_app_branches,
     list_agent_models,
     parse_doc_type,
@@ -34,10 +48,11 @@ from docflow.core.operations import (
     pull_app_repo,
     resolve_agent,
     resolve_paths,
+    selected_sections,
 )
 
 
-def pick_agent(default_key: str = "agy"):
+def pick_agent(default_key: str = "agy", default_model: str = "", default_plan_model: str = ""):
     ux.console.print("\n[bold]How should DocFlow run your coding agent?[/bold]")
     keys = []
     for i, (key, label) in enumerate(AGENT_CHOICES, start=1):
@@ -53,37 +68,61 @@ def pick_agent(default_key: str = "agy"):
         )
         return resolve_agent(command=cmd)
     spec = resolve_agent(agent=key)
-    return pick_model(spec)
+    return pick_model(
+        spec,
+        model=default_model if key == default_key else "",
+        plan_model=default_plan_model if key == default_key else "",
+    )
 
 
-def pick_model(spec, model: str = ""):
+def pick_model(spec, model: str = "", plan_model: str = ""):
     if spec is None:
         return spec
-    if model:
-        return apply_agent_model(spec, model)
+    if model and plan_model:
+        return attach_agent_models(spec, model=model, plan_model=plan_model)
+    if model and not agent_supports_models(spec.name):
+        return attach_agent_models(spec, model=model, plan_model=plan_model or model)
     if not agent_supports_models(spec.name) and not (spec.command or "").lstrip().startswith(
-        ("agent ", "agy ")
+        ("agent ", "agy ", "opencode ")
     ):
         return spec
     choices = list_agent_models(spec.name)
-    ux.console.print("\n[bold]Which LLM model?[/bold]")
     current = [c for c in choices if c.group == "current"]
     third = [c for c in choices if c.group == "third_party"]
+    is_cursor = spec.name in CURSOR_AGENT_KEYS or (spec.command or "").lstrip().startswith(
+        "agent "
+    )
+    ux.console.print("\n[bold]Which LLM models?[/bold]")
+    ux.console.print("[dim]Plan model searches the app and structures the docs list.[/dim]")
+    ux.console.print("[dim]Work model writes each section from that list.[/dim]")
     if current:
-        ux.console.print("[dim]Current[/dim]")
+        ux.console.print("[dim]Current / included usage[/dim]")
         for choice in current:
             ux.console.print(f"  [cyan]{choice.value or choice.key}[/cyan]  {choice.label}")
     if third:
         ux.console.print("[dim]Third-party[/dim]")
         for choice in third:
             ux.console.print(f"  [cyan]{choice.value or choice.key}[/cyan]  {choice.label}")
-    default = "auto" if spec.name.startswith("cursor") or spec.name == "cursor" else "default"
-    if spec.name in ("agy", "agy-interactive"):
-        default = ""
-    chosen = Prompt.ask("Model", default=default or "default")
-    if chosen in ("default", "auto"):
-        chosen = ""
-    return apply_agent_model(spec, chosen)
+    ids = {c.value or c.key for c in choices}
+    if is_cursor:
+        plan_default = (
+            plan_model
+            or (DEFAULT_CURSOR_PLAN_MODEL if DEFAULT_CURSOR_PLAN_MODEL in ids else DEFAULT_CURSOR_MODEL)
+        )
+        work_default = (
+            model
+            or (DEFAULT_CURSOR_WORK_MODEL if DEFAULT_CURSOR_WORK_MODEL in ids else DEFAULT_CURSOR_MODEL)
+        )
+    else:
+        plan_default = plan_model or model or "default"
+        work_default = model or "default"
+    chosen_plan = Prompt.ask("Plan model (search & structure)", default=plan_default)
+    chosen_work = Prompt.ask("Work model (write docs)", default=work_default)
+    if chosen_plan in ("default", "auto"):
+        chosen_plan = ""
+    if chosen_work in ("default", "auto"):
+        chosen_work = ""
+    return attach_agent_models(spec, model=chosen_work, plan_model=chosen_plan)
 
 
 def ensure_paths(repo: str, docs: str, prompt_missing: bool = True):
@@ -104,7 +143,11 @@ def ensure_paths(repo: str, docs: str, prompt_missing: bool = True):
 def ensure_agent(paths, agent: Optional[str] = None, mode: Optional[str] = None, command: Optional[str] = None):
     spec = resolve_agent(agent=agent, mode=mode, command=command, config=paths.config)
     if spec is None:
-        spec = pick_agent()
+        spec = pick_agent(
+            default_key=infer_agent_name(paths.config) or "agy",
+            default_model=infer_agent_model(paths.config),
+            default_plan_model=infer_plan_model(paths.config),
+        )
     if spec is None:
         raise click.Abort()
     return spec
@@ -116,8 +159,11 @@ def collect_doc_types(explicit: Sequence[str] = ()) -> List[DocTypeSettings]:
     if not sys.stdout.isatty():
         return list(DEFAULT_DOC_TYPES)
     ux.console.print("\n[bold]Documentation types[/bold]")
-    ux.console.print("Each type is a folder. Example: [cyan]front-end[/cyan] — React UI docs.")
-    ux.console.print("Suggested: [cyan]architecture[/cyan], [cyan]features[/cyan]")
+    ux.console.print("Each type is a folder for application docs.")
+    ux.console.print(
+        "Suggested: [cyan]architecture[/cyan], [cyan]database[/cyan], "
+        "[cyan]models[/cyan], [cyan]functions[/cyan], [cyan]routes[/cyan], [cyan]pages[/cyan]"
+    )
     types: List[DocTypeSettings] = []
     if Confirm.ask("Use suggested types as a starting set?", default=True):
         types = list(DEFAULT_DOC_TYPES)
@@ -154,11 +200,166 @@ def collect_import(
     return "", ""
 
 
+def _print_section_candidates(
+    candidates: Sequence[SectionCandidate],
+) -> tuple[List[int], List[str]]:
+    ux.console.print("\n[bold]Agent recommendations — remove or add before writing docs[/bold]")
+    ux.console.print(
+        "[dim]Number toggles one item. g1 / migrations / models toggles a whole group. "
+        "Git, GitLab, and CI are not listed. Add a file path if something is missing.[/dim]"
+    )
+    order: List[int] = []
+    groups: List[str] = []
+    for gi, (kind, indices) in enumerate(group_candidates(candidates), start=1):
+        groups.append(kind)
+        all_on = all(candidates[i].included for i in indices)
+        mark = "[green]Y[/green]" if all_on else "[red]N[/red]"
+        ux.console.print(
+            f"\n  [cyan]g{gi}[/cyan]. [{mark}] [bold]{kind_heading(kind)}[/bold]  [dim](all)[/dim]"
+        )
+        for i in indices:
+            order.append(i)
+            item = candidates[i]
+            item_mark = "[green]Y[/green]" if item.included else "[red]N[/red]"
+            ux.console.print(f"      [cyan]{len(order)}[/cyan]. [{item_mark}] {item.label}")
+    included = len(selected_sections(candidates))
+    ux.console.print(f"\n[dim]{included}/{len(candidates)} selected[/dim]")
+    return order, groups
+
+
+def review_init_sections(
+    candidates: List[SectionCandidate],
+    add_extra=None,
+) -> Optional[List[SectionCandidate]]:
+    """TTY picker: toggle individual units and optionally add more."""
+    if not candidates:
+        return []
+    items = list(candidates)
+    while True:
+        order, groups = _print_section_candidates(items)
+        ux.console.print(
+            "  [cyan]number[/cyan] one item   [cyan]g1[/cyan] / [cyan]migrations[/cyan] a group   "
+            "[cyan]a[/cyan] add   [cyan]all[/cyan]/[cyan]none[/cyan]   "
+            "[cyan]done[/cyan] continue   [cyan]q[/cyan] cancel"
+        )
+        choice = Prompt.ask("Item", default="done").strip().lower()
+        if choice in ("", "done", "y", "yes"):
+            picked = selected_sections(items)
+            if not picked:
+                ux.print_warning("Select at least one item, or add a file path.")
+                continue
+            return picked
+        if choice in ("q", "quit", "cancel"):
+            return None
+        if choice == "all":
+            for item in items:
+                item.included = True
+            continue
+        if choice == "none":
+            for item in items:
+                item.included = False
+            continue
+        if choice in ("a", "add"):
+            raw = Prompt.ask("File path to add (blank to skip)", default="").strip()
+            if not raw:
+                continue
+            if add_extra:
+                extra = add_extra(raw)
+            else:
+                extra = SectionCandidate(
+                    doc_type="functions",
+                    name=raw,
+                    title=os.path.splitext(os.path.basename(raw.replace("\\", "/")))[0] or raw,
+                    kind="function",
+                    description=f"Extra unit '{raw}'",
+                    included=True,
+                    extra=True,
+                )
+            items.append(extra)
+            ux.console.print(f"  Added [cyan]{extra.display_name}[/cyan].")
+            continue
+        if choice.startswith("g") and choice[1:].isdigit():
+            index = int(choice[1:]) - 1
+            if 0 <= index < len(groups):
+                toggle_group_included(items, groups[index])
+            continue
+        grouped = resolve_picker_group(choice, groups)
+        if grouped is not None:
+            toggle_group_included(items, grouped)
+            continue
+        if choice.isdigit():
+            index = int(choice) - 1
+            if 0 <= index < len(order):
+                items[order[index]].included = not items[order[index]].included
+            continue
+        ux.print_warning("Use a number, g1, a group name, a, all, none, done, or q.")
+
+
+def _cli_progress(message: str) -> None:
+    ux.console.print(f"  [dim]{message}[/dim]")
+
+
+def pick_open_project(repo: str = "", docs: str = "", force_list: bool = False) -> tuple[str, str]:
+    """Last project → open, or pick from the list. Does not write into the app repo."""
+    from docflow.core.projects import last_project, load_index, open_project, remove_project
+
+    if docs:
+        return repo, docs
+    last = last_project()
+    entries = load_index()
+    if not sys.stdout.isatty():
+        if last:
+            return last.app_path or repo, last.docs_path
+        return repo, docs
+    if last and not force_list:
+        ux.console.print(
+            f"\nLast project: [cyan]{last.name}[/cyan]  {last.docs_path}"
+        )
+        if Confirm.ask("Open this project?", default=True):
+            open_project(last.docs_path)
+            return last.app_path or repo, last.docs_path
+    if entries:
+        ux.console.print("\n[bold]Open a docs project[/bold]")
+        for i, entry in enumerate(entries, start=1):
+            ux.console.print(f"  [cyan]{i}[/cyan]. {entry.name}  {entry.docs_path}")
+        ux.console.print("  [cyan]n[/cyan]. New project (init)")
+        ux.console.print("  [cyan]d[/cyan]. Delete a project")
+        choices = [str(i) for i in range(1, len(entries) + 1)] + ["n", "d"]
+        choice = Prompt.ask("Project", choices=choices, default="n" if not last else "1")
+        if choice == "d":
+            which = Prompt.ask(
+                "Number to delete",
+                choices=[str(i) for i in range(1, len(entries) + 1)],
+            )
+            entry = entries[int(which) - 1]
+            purge = Confirm.ask(
+                f"Also delete the docs folder on disk?  ({entry.docs_path})",
+                default=False,
+            )
+            removed, note = remove_project(entry.docs_path, delete_docs=purge)
+            if removed:
+                ux.console.print(f"  Removed [cyan]{entry.name}[/cyan]. {note}".rstrip())
+            else:
+                ux.print_warning("Could not remove that project.")
+            return pick_open_project(repo, docs, force_list=True)
+        if choice != "n":
+            entry = entries[int(choice) - 1]
+            open_project(entry.docs_path)
+            return entry.app_path or repo, entry.docs_path
+    return repo, docs
+
+
 def run_init(repo: str = "", docs: str = "", agent: Optional[str] = None,
              mode: Optional[str] = None, command: Optional[str] = None,
              model: str = "",
+             plan_model: str = "",
+             branch: str = "",
              import_existing: Optional[bool] = None, import_from: str = "",
-             import_into: str = "", doc_types: Sequence[str] = ()) -> None:
+             import_into: str = "", doc_types: Sequence[str] = (),
+             yes: bool = False,
+             include_sections: Sequence[str] = (),
+             exclude_sections: Sequence[str] = (),
+             extra_sections: Sequence[str] = ()) -> None:
     app = repo or Prompt.ask("Application repo path", default=os.getcwd())
     app = os.path.abspath(app)
     paths = resolve_paths(app, docs or None, require=False)
@@ -171,9 +372,33 @@ def run_init(repo: str = "", docs: str = "", agent: Optional[str] = None,
     except (AlreadyInitialized, ConfigError) as exc:
         ux.print_error(str(exc))
         raise click.Abort()
-    spec = resolve_agent(agent=agent, mode=mode, command=command, config=paths.config, model=model) or pick_agent()
+    spec = resolve_agent(
+        agent=agent,
+        mode=mode,
+        command=command,
+        config=paths.config,
+        model=model,
+        plan_model=plan_model,
+    ) or pick_agent(
+        default_key=infer_agent_name(paths.config) or "agy",
+        default_model=infer_agent_model(paths.config) or model,
+        default_plan_model=infer_plan_model(paths.config) or plan_model,
+    )
     types = collect_doc_types(doc_types)
     source, into = collect_import(types, import_from, import_into, import_existing)
+    if not branch and sys.stdout.isatty():
+        branches = []
+        try:
+            branches = list_app_branches(app)
+        except Exception:
+            branches = []
+        default_branch = default_app_branch(app)
+        if branches:
+            ux.console.print("\n[bold]Application branch[/bold]")
+            for name in branches:
+                ux.console.print(f"  [cyan]{name}[/cyan]")
+        branch = Prompt.ask("Application branch (main / master / develop)", default=default_branch)
+    reviewer = review_init_sections if sys.stdout.isatty() and not yes else None
     try:
         result = init_docs(
             app_repo_path=app,
@@ -184,11 +409,21 @@ def run_init(repo: str = "", docs: str = "", agent: Optional[str] = None,
             types=types,
             import_from=source or None,
             import_into=into or None,
+            on_progress=_cli_progress,
+            on_review_sections=reviewer,
+            include_sections=include_sections,
+            exclude_sections=exclude_sections,
+            extra_sections=extra_sections,
+            branch=branch,
         )
+    except InitCancelled as exc:
+        ux.print_warning(str(exc))
+        raise click.Abort()
     except ConfigError as exc:
         ux.print_error(str(exc))
         raise click.Abort()
     ux.print_init_result(result)
+    ux.print_dashboard(get_dashboard(result.app_repo_path, result.docs_repo_path))
 
 
 def run_import(docs: str = "", source: str = "", type_name: str = "") -> None:
@@ -225,17 +460,23 @@ def run_import(docs: str = "", source: str = "", type_name: str = "") -> None:
 def run_generate(repo: str = "", docs: str = "", agent: Optional[str] = None,
                  mode: Optional[str] = None, command: Optional[str] = None,
                  model: str = "",
+                 plan_model: str = "",
                  branch: str = "", from_ref: str = "", to_ref: str = "",
                  feature: str = "", full: bool = False, interactive_mode: bool = False,
-                 commit_count: Optional[int] = None) -> None:
+                 commit_count: Optional[int] = None,
+                 concurrency: Optional[int] = None,
+                 app_branch: str = "") -> None:
     paths = ensure_paths(repo, docs)
     spec = ensure_agent(paths, agent, mode, command)
-    spec = apply_agent_model(spec, model) if model else spec
+    if model or plan_model:
+        spec = attach_agent_models(spec, model=model or spec.model, plan_model=plan_model or spec.plan_model)
     is_full = full
     if interactive_mode and not from_ref and not to_ref and not branch and not full and commit_count is None:
         dash = get_dashboard(paths.app_repo_path, paths.docs_repo_path)
         ux.console.print("\n[bold]Update docs from[/bold]")
         new_n = len(dash.new_commits)
+        if dash.app_branch:
+            ux.console.print(f"  Application branch: [cyan]{dash.app_branch}[/cyan]")
         if dash.last_documented:
             ux.console.print(
                 f"  Last documented: [cyan]{dash.last_documented.short_sha}[/cyan]  "
@@ -247,9 +488,25 @@ def run_generate(repo: str = "", docs: str = "", agent: Optional[str] = None,
         ux.console.print("  [cyan]2[/cyan]. Last N commits (any number)")
         ux.console.print("  [cyan]3[/cyan]. Branch — last N commits on a named branch")
         ux.console.print("  [cyan]4[/cyan]. Full regeneration of existing docs")
-        choice = Prompt.ask("Choice", choices=["1", "2", "3", "4"], default="1")
+        ux.console.print("  [cyan]5[/cyan]. Change application branch (main / master / develop)")
+        choice = Prompt.ask("Choice", choices=["1", "2", "3", "4", "5"], default="1")
         if choice == "4":
             is_full = True
+        elif choice == "5":
+            branches = []
+            try:
+                branches = list_app_branches(paths.app_repo_path)
+            except Exception:
+                branches = []
+            if branches:
+                ux.console.print("  Branches:")
+                for name in branches:
+                    ux.console.print(f"    [cyan]{name}[/cyan]")
+            app_branch = Prompt.ask(
+                "Application branch",
+                default=app_branch or dash.app_branch or default_app_branch(paths.app_repo_path),
+            )
+            commit_count = None
         elif choice == "1":
             commit_count = None
         elif choice == "2":
@@ -268,6 +525,14 @@ def run_generate(repo: str = "", docs: str = "", agent: Optional[str] = None,
             branch = Prompt.ask("Branch name", default=branches[0] if branches else "HEAD")
             commit_count = int(Prompt.ask("How many commits on that branch", default="1"))
             commit_count = max(1, commit_count)
+    if concurrency is None and interactive_mode:
+        from docflow.core.job_runner import clamp_concurrency
+
+        default_jobs = str(clamp_concurrency(paths.config.generation.concurrency, 1))
+        concurrency = clamp_concurrency(
+            Prompt.ask("Parallel agents (1 is safest)", default=default_jobs),
+            1,
+        )
     try:
         result = generate_docs(
             app_repo_path=paths.app_repo_path,
@@ -280,6 +545,10 @@ def run_generate(repo: str = "", docs: str = "", agent: Optional[str] = None,
             feature=feature,
             full=is_full,
             commit_count=commit_count,
+            concurrency=concurrency,
+            on_progress=_cli_progress,
+            app_branch=app_branch,
+            on_review_sections=review_init_sections if sys.stdout.isatty() else None,
         )
     except Exception as exc:
         ux.print_error(str(exc))
@@ -305,7 +574,11 @@ def maybe_regen_last_docs(paths, spec, result, feature: str = "") -> None:
         ux.console.print("[dim]Exiting without regenerating.[/dim]")
         return
     default_key = spec.name if spec and spec.name in {key for key, _ in AGENT_CHOICES} else "agy"
-    spec = pick_agent(default_key=default_key)
+    spec = pick_agent(
+        default_key=default_key,
+        default_model=infer_agent_model(paths.config),
+        default_plan_model=infer_plan_model(paths.config),
+    )
     if spec is None:
         return
     try:
@@ -381,7 +654,7 @@ def run_serve(docs: str = "", transport: str = "stdio", port: int = 8080) -> Non
         server.run(transport="sse", port=port)
 
 
-def run_ui() -> None:
+def run_ui(repo: str = "", docs: str = "") -> None:
     try:
         from docflow.tui.app import run_tui
     except ImportError as exc:
@@ -390,10 +663,11 @@ def run_ui() -> None:
         )
         ux.print_error(str(exc))
         raise click.Abort()
-    run_tui()
+    run_tui(repo=repo, docs=docs)
 
 
 def run_menu(repo: str = "", docs: str = "") -> None:
+    repo, docs = pick_open_project(repo, docs)
     dash = get_dashboard(repo or None, docs or None)
     ux.print_dashboard(dash)
     ux.console.print("\n[bold]What do you want to do?[/bold]")
@@ -405,7 +679,7 @@ def run_menu(repo: str = "", docs: str = "") -> None:
         if choice == "1":
             run_init(repo, docs)
         elif choice == "2":
-            run_ui()
+            run_ui(repo, docs)
         return
 
     ux.console.print("  [cyan]1[/cyan]. Update docs from git changes")
@@ -415,8 +689,9 @@ def run_menu(repo: str = "", docs: str = "") -> None:
     ux.console.print("  [cyan]5[/cyan]. Start MCP server")
     ux.console.print("  [cyan]6[/cyan]. Open visual UI")
     ux.console.print("  [cyan]7[/cyan]. Import existing files (never overwrites)")
+    ux.console.print("  [cyan]8[/cyan]. Switch docs project")
     ux.console.print("  [cyan]q[/cyan]. Quit")
-    choice = Prompt.ask("Choice", choices=["1", "2", "3", "4", "5", "6", "7", "q"], default="1")
+    choice = Prompt.ask("Choice", choices=["1", "2", "3", "4", "5", "6", "7", "8", "q"], default="1")
     if choice == "1":
         run_generate(repo, docs, interactive_mode=True)
     elif choice == "2":
@@ -432,6 +707,9 @@ def run_menu(repo: str = "", docs: str = "") -> None:
             port = int(Prompt.ask("Port", default="8080"))
         run_serve(docs, transport=transport, port=port)
     elif choice == "6":
-        run_ui()
+        run_ui(repo, docs)
     elif choice == "7":
         run_import(docs)
+    elif choice == "8":
+        repo, docs = pick_open_project(repo, "", force_list=True)
+        run_menu(repo, docs)

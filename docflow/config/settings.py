@@ -1,11 +1,13 @@
 """
-Settings model and loader for .docflow.yml and environment variable overrides.
+Settings model and loader for docs-repo `.docflow/config.yml` (legacy `.docflow.yml`).
 """
 
 import os
 from typing import Optional, List
 import yaml
 from pydantic import BaseModel, Field, ConfigDict
+
+from docflow.core.workspace import find_config_path, write_config_path
 
 
 class ProjectSettings(BaseModel):
@@ -15,6 +17,7 @@ class ProjectSettings(BaseModel):
 
 class AppSettings(BaseModel):
     repo_path: str = ""
+    branch: str = ""  # tracked app branch: main, master, develop, …
 
 
 class DocTypeSettings(BaseModel):
@@ -29,7 +32,10 @@ class DocsSettings(BaseModel):
 
 class AgentSettings(BaseModel):
     mode: str = "manual"  # shell | manual
-    command: str = 'agy --dangerously-skip-permissions --add-dir {docs_repo} -p "$(cat {prompt_file})"'
+    command: str = 'agy --dangerously-skip-permissions --add-dir {docs_repo} -p "Follow every instruction in {prompt_file}."'
+    name: str = ""  # agy, cursor-agent, …
+    model: str = ""  # work model (writes docs)
+    plan_model: str = ""  # search / structure (stack survey)
 
 
 class PlatformSettings(BaseModel):
@@ -38,10 +44,20 @@ class PlatformSettings(BaseModel):
     notify_branch_owner: bool = True
 
 
+class ExtraFeatureSettings(BaseModel):
+    name: str
+    paths: List[str] = Field(default_factory=list)
+    doc_type: str = ""
+
+
 class GenerationSettings(BaseModel):
     skill_token_budget: int = 8000
     full_diff_threshold: int = 200
+    concurrency: int = 1
+    framework: str = "auto"  # auto | none | laravel
     ignore: List[str] = Field(default_factory=lambda: ["*.lock", "node_modules/", "dist/", "__pycache__/"])
+    features: Optional[List[str]] = None
+    extra_features: List[ExtraFeatureSettings] = Field(default_factory=list)
 
 
 class DocFlowConfig(BaseModel):
@@ -56,46 +72,51 @@ class DocFlowConfig(BaseModel):
     source_path: Optional[str] = Field(default=None, exclude=True)
 
     def save(self, config_dir: str) -> str:
-        """Saves current configuration to .docflow.yml in specified directory."""
-        target_dir = os.path.abspath(config_dir)
-        os.makedirs(target_dir, exist_ok=True)
-        target_path = os.path.join(target_dir, ".docflow.yml")
+        """Saves configuration to `.docflow/config.yml` in the docs repository."""
+        target_path = write_config_path(config_dir)
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
         with open(target_path, "w", encoding="utf-8") as f:
             yaml.safe_dump(self.model_dump(exclude={"source_path"}), f, sort_keys=False)
         return target_path
 
     @classmethod
-    def load(cls, app_repo_path: Optional[str] = None) -> "DocFlowConfig":
+    def load(
+        cls,
+        app_repo_path: Optional[str] = None,
+        docs_repo_path: Optional[str] = None,
+    ) -> "DocFlowConfig":
         config_data = {}
         candidate_paths = []
 
-        if app_repo_path and os.path.exists(app_repo_path):
-            candidate_paths.append(os.path.join(os.path.abspath(app_repo_path), ".docflow.yml"))
+        def add_docs_config(directory: Optional[str]) -> None:
+            if not directory:
+                return
+            cpath = find_config_path(directory)
+            if cpath:
+                candidate_paths.append(cpath)
 
-        cwd = os.getcwd()
-        candidate_paths.append(os.path.join(cwd, ".docflow.yml"))
+        add_docs_config(docs_repo_path)
+        # First positional path may itself be a docs folder.
+        add_docs_config(app_repo_path)
 
-        # Search parent directories for .docflow.yml
-        parent = os.path.dirname(cwd)
-        while parent and parent != os.path.dirname(parent):
-            candidate_paths.append(os.path.join(parent, ".docflow.yml"))
-            parent = os.path.dirname(parent)
+        cwd_config = find_config_path(os.getcwd())
+        if cwd_config:
+            candidate_paths.append(cwd_config)
 
-        # Global user fallback ~/.docflow.yml
-        user_home = os.path.expanduser("~")
-        candidate_paths.append(os.path.join(user_home, ".docflow.yml"))
-
+        seen = set()
         for cpath in candidate_paths:
-            if os.path.exists(cpath):
-                try:
-                    with open(cpath, "r", encoding="utf-8") as f:
-                        loaded = yaml.safe_load(f)
-                        if isinstance(loaded, dict) and loaded:
-                            config_data = loaded
-                            config_data["source_path"] = cpath
-                            break
-                except Exception:
-                    pass
+            if cpath in seen:
+                continue
+            seen.add(cpath)
+            try:
+                with open(cpath, "r", encoding="utf-8") as f:
+                    loaded = yaml.safe_load(f)
+                    if isinstance(loaded, dict) and loaded:
+                        config_data = loaded
+                        config_data["source_path"] = cpath
+                        break
+            except Exception:
+                pass
 
         # Environment variable overrides
         if env_app_path := os.getenv("DOCFLOW_APP_REPO"):

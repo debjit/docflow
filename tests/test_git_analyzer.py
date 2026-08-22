@@ -75,14 +75,34 @@ def test_list_commits_and_range(temp_git_repo):
     assert len(on_branch) >= 1
     assert analyzer.is_ancestor(commit1, commit2)
     assert analyzer.head_commit()["sha"] == commit2
+    tree = analyzer.list_tree_paths()
+    assert "src/auth/login.py" in tree
+    assert "README.md" in tree
 
 
 def test_feature_bucket_and_ignore_globs():
     assert feature_bucket_for_path("src/auth/login.py") == "auth"
     assert feature_bucket_for_path("auth/login.py") == "auth"
     assert feature_bucket_for_path("README.md") == "core"
+    skip = {"bootstrap", "public", "vendor"}
+    assert feature_bucket_for_path("bootstrap/app.php", skip_as_feature=skip) is None
+    assert feature_bucket_for_path("public/index.php", skip_as_feature=skip) is None
+    assert feature_bucket_for_path("app/Models/User.php", skip_as_feature=skip) == "Models"
     ignore = {"node_modules/", "*.lock", "dist"}
     assert path_is_ignored("node_modules/pkg/index.js", ignore)
     assert path_is_ignored("app/package.lock", ignore)
     assert path_is_ignored("dist/bundle.js", ignore)
     assert not path_is_ignored("src/auth/login.py", ignore)
+
+
+def test_dot_paths_are_ignored_and_not_stripped():
+    from docflow.core.git_analyzer import DEFAULT_IGNORE, posix_rel
+
+    assert posix_rel(".github/workflows/ci.yml") == ".github/workflows/ci.yml"
+    assert posix_rel("./src/auth/login.py") == "src/auth/login.py"
+    assert path_is_ignored(".github/workflows/ci.yml", DEFAULT_IGNORE)
+    assert path_is_ignored(".git/config", DEFAULT_IGNORE)
+    assert path_is_ignored(".gitlab-ci.yml", DEFAULT_IGNORE)
+    assert path_is_ignored(".gitlab/ci.yml", DEFAULT_IGNORE)
+    assert feature_bucket_for_path(".github/workflows/ci.yml") == "config"
+    assert feature_bucket_for_path(".gitlab-ci.yml") == "core"

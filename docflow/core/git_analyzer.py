@@ -5,7 +5,7 @@ Git repository analyzer for extracting change manifests and feature chunks.
 import fnmatch
 import os
 from pathlib import Path
-from typing import List, Dict, Optional, Set
+from typing import Callable, List, Dict, Optional, Set
 from git import Repo
 from unidiff import PatchSet
 
@@ -34,20 +34,33 @@ LANGUAGE_MAP = {
     ".sql": "sql",
     ".html": "html",
     ".css": "css",
+    ".php": "php",
+    ".vue": "vue",
 }
 
 DEFAULT_IGNORE = {
-    ".git", ".github", "node_modules", "dist", "build", "__pycache__",
+    ".git", ".github", ".gitlab", ".gitignore", ".gitattributes",
+    ".gitlab-ci.yml", "gitlab-ci.yml",
+    "node_modules", "dist", "build", "__pycache__",
     ".venv", "venv", ".idea", ".vscode", "*.lock", "package-lock.json",
-    ".pytest_cache", "test-docs-repo", "docs-repo", "*.egg-info", "docflow.egg-info"
+    ".pytest_cache", "test-docs-repo", "docs-repo", "*.egg-info", "docflow.egg-info",
+    ".docflow",
 }
 
 _WRAPPER_DIRS = {"src", "lib", "app", "pkg"}
 
 
+def posix_rel(rel_path: str) -> str:
+    """Normalize a relative path without stripping leading dots from names like .github."""
+    posix = Path(str(rel_path).replace("\\", "/")).as_posix()
+    while posix.startswith("./"):
+        posix = posix[2:]
+    return posix.lstrip("/")
+
+
 def path_is_ignored(rel_path: str, ignore_patterns: Set[str]) -> bool:
     """True if a relative path matches any ignore glob (files or directories)."""
-    posix = Path(str(rel_path).replace("\\", "/")).as_posix().lstrip("./")
+    posix = posix_rel(rel_path)
     if not posix or posix == ".":
         return False
     parts = Path(posix).parts
@@ -57,6 +70,9 @@ def path_is_ignored(rel_path: str, ignore_patterns: Set[str]) -> bool:
         if not pattern:
             continue
         dir_pat = pattern.rstrip("/")
+        if "/" in dir_pat:
+            if posix == dir_pat or posix.startswith(f"{dir_pat}/"):
+                return True
         if any(fnmatch.fnmatch(part, dir_pat) for part in parts):
             return True
         if fnmatch.fnmatch(posix, pattern) or fnmatch.fnmatch(posix, dir_pat):
@@ -66,9 +82,9 @@ def path_is_ignored(rel_path: str, ignore_patterns: Set[str]) -> bool:
     return False
 
 
-def feature_bucket_for_path(path: str) -> str:
+def feature_bucket_for_path(path: str, skip_as_feature: Optional[Set[str]] = None) -> Optional[str]:
     """Map a source path to a feature/section name (same rules as scan_features)."""
-    posix = Path(str(path).replace("\\", "/")).as_posix().lstrip("./")
+    posix = posix_rel(path)
     parts = Path(posix).parts
     dir_parts = parts[:-1] if len(parts) > 1 else ()
     if not dir_parts:
@@ -82,6 +98,9 @@ def feature_bucket_for_path(path: str) -> str:
         name = first
     if name.startswith("."):
         return "config"
+    skip = skip_as_feature or set()
+    if name in skip or first in skip:
+        return None
     return name
 
 
@@ -215,12 +234,43 @@ class GitAnalyzer:
 
     def list_branches(self) -> List[str]:
         names = [head.name for head in self.repo.heads]
+        seen = {name.lower() for name in names}
+        try:
+            for remote in self.repo.remotes:
+                for ref in remote.refs:
+                    try:
+                        short = ref.remote_head
+                    except Exception:
+                        continue
+                    if not short or short == "HEAD":
+                        continue
+                    if short.lower() in seen:
+                        continue
+                    names.append(short)
+                    seen.add(short.lower())
+        except Exception:
+            pass
         try:
             current = self.repo.active_branch.name
             names.sort(key=lambda name: (name != current, name.lower()))
         except Exception:
             names.sort(key=str.lower)
         return names
+
+    def list_tree_paths(self, rev: str = "HEAD") -> List[str]:
+        """File paths in the commit tree for rev, without checking out."""
+        try:
+            commit = self.repo.commit(rev or "HEAD")
+        except Exception:
+            return []
+        paths: List[str] = []
+        try:
+            for item in commit.tree.traverse():
+                if getattr(item, "type", None) == "blob":
+                    paths.append(posix_rel(item.path))
+        except Exception:
+            return []
+        return paths
 
     def is_ancestor(self, maybe_ancestor: str, rev: str = "HEAD") -> bool:
         if not maybe_ancestor:
@@ -254,12 +304,19 @@ class GitAnalyzer:
         self,
         ignore_patterns: Optional[Set[str]] = None,
         include_architecture: bool = True,
+        skip_as_feature: Optional[Set[str]] = None,
+        architecture_seed_paths: Optional[List[str]] = None,
+        on_progress: Optional[Callable[[str], None]] = None,
+        progress_every: int = 50,
     ) -> List[FeatureChunk]:
         """
         Scans the repository structure and groups source files into logical feature chunks for init.
         """
         ignore = ignore_patterns or DEFAULT_IGNORE
+        skip = skip_as_feature or set()
         feature_map: Dict[str, List[str]] = {}
+        scanned = 0
+        every = max(1, int(progress_every) if progress_every else 50)
 
         for root, dirs, files in os.walk(self.repo_path):
             rel_root = os.path.relpath(root, self.repo_path)
@@ -273,8 +330,17 @@ class GitAnalyzer:
                 if path_is_ignored(rel_file_path, ignore):
                     continue
 
-                feature_name = feature_bucket_for_path(rel_file_path)
+                scanned += 1
+                if on_progress and scanned % every == 0:
+                    on_progress(f"Scanning app repo… {scanned} files")
+
+                feature_name = feature_bucket_for_path(rel_file_path, skip_as_feature=skip)
+                if not feature_name:
+                    continue
                 feature_map.setdefault(feature_name, []).append(rel_file_path)
+
+        if on_progress and scanned and scanned % every != 0:
+            on_progress(f"Scanning app repo… {scanned} files")
 
         # Convert feature map to FeatureChunk models
         chunks = []
@@ -285,11 +351,14 @@ class GitAnalyzer:
             infra_files = feature_map.get("core", [])[:5]
 
         if include_architecture:
+            seed_paths = list(architecture_seed_paths or [])
+            if not seed_paths:
+                seed_paths = infra_files or ["pyproject.toml", "Dockerfile", "docker-compose.yml"]
             chunks.append(
                 FeatureChunk(
                     feature_name="architecture",
                     description="System architecture, hosting environment (Dev/Staging/Prod), frameworks, and core dependencies.",
-                    file_paths=infra_files or ["pyproject.toml", "Dockerfile", "docker-compose.yml"],
+                    file_paths=seed_paths,
                     sample_snippets={}
                 )
             )
@@ -297,27 +366,77 @@ class GitAnalyzer:
         for feature, files in feature_map.items():
             if feature == "architecture":
                 continue
-            # Grab short snippets for entry files
-            snippets = {}
-            for fpath in files[:5]:
-                full_p = os.path.join(self.repo_path, fpath)
-                try:
-                    with open(full_p, "r", encoding="utf-8", errors="ignore") as f:
-                        lines = [f.readline() for _ in range(20)]
-                        snippets[fpath] = "".join(lines)
-                except Exception:
-                    pass
-
             chunks.append(
                 FeatureChunk(
                     feature_name=feature,
                     description=f"Feature module for '{feature}' containing {len(files)} file(s).",
                     file_paths=files,
-                    sample_snippets=snippets,
+                    sample_snippets=self._snippets_for(files),
                 )
             )
 
         return chunks
+
+    def _snippets_for(self, files: List[str], limit: int = 5, rev: Optional[str] = None) -> Dict[str, str]:
+        snippets: Dict[str, str] = {}
+        for fpath in files[:limit]:
+            text = ""
+            if rev:
+                try:
+                    text = self.repo.git.show(f"{rev}:{fpath}")
+                except Exception:
+                    text = ""
+            if not text:
+                full_p = os.path.join(self.repo_path, fpath)
+                try:
+                    with open(full_p, "r", encoding="utf-8", errors="ignore") as f:
+                        text = "".join(f.readline() for _ in range(20))
+                except Exception:
+                    text = ""
+            if text:
+                lines = text.splitlines()[:20]
+                snippets[fpath] = "\n".join(lines) + ("\n" if lines else "")
+        return snippets
+
+    def chunk_from_entry(
+        self,
+        raw: str,
+        ignore_patterns: Optional[Set[str]] = None,
+        skip_as_feature: Optional[Set[str]] = None,
+    ) -> FeatureChunk:
+        """Build a feature chunk from a user-supplied module name or relative path."""
+        ignore = ignore_patterns or DEFAULT_IGNORE
+        skip = skip_as_feature or set()
+        rel = posix_rel(raw.strip())
+        full = os.path.join(self.repo_path, rel)
+        files: List[str] = []
+        if os.path.isdir(full):
+            for root, dirs, fnames in os.walk(full):
+                rel_root = os.path.relpath(root, self.repo_path)
+                dirs[:] = [
+                    d for d in dirs
+                    if not path_is_ignored(os.path.normpath(os.path.join(rel_root, d)), ignore)
+                ]
+                for fname in fnames:
+                    rel_file = os.path.normpath(os.path.join(rel_root, fname))
+                    if path_is_ignored(rel_file, ignore):
+                        continue
+                    files.append(rel_file.replace("\\", "/"))
+            name = feature_bucket_for_path(os.path.join(rel, "_"), skip_as_feature=skip)
+            if not name:
+                name = Path(rel).name or "extra"
+        elif os.path.isfile(full):
+            files = [rel]
+            name = feature_bucket_for_path(rel, skip_as_feature=skip) or Path(rel).stem
+        else:
+            name = rel.replace("\\", "/").strip("/").split("/")[-1] or "extra"
+        name = name or "extra"
+        return FeatureChunk(
+            feature_name=name,
+            description=f"Feature module for '{name}' containing {len(files)} file(s).",
+            file_paths=files,
+            sample_snippets=self._snippets_for(files),
+        )
 
     def find_existing_docs(self) -> Dict[str, str]:
         """Finds pre-existing documentation files in the repository (e.g. README.md, docs/, etc.)."""

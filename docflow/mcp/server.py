@@ -8,11 +8,14 @@ import re
 from typing import Optional, Dict, Any, List, Tuple
 from mcp.server import MCPServer
 
+from docflow.core.workspace import SPLIT_DOC_TYPES
+
 SKIP_SEARCH_DIRS = {
     ".git",
     ".venv",
     "venv",
     "prompts",
+    ".docflow",
     "node_modules",
     "__pycache__",
     ".pytest_cache",
@@ -66,6 +69,10 @@ def resolve_doc_dir(target_docs: str, feature_name: str) -> Optional[Tuple[str, 
         (os.path.join(target_docs, name), name),
         (os.path.join(target_docs, "features", name), f"features/{name}"),
     ]
+    for type_name in sorted(SPLIT_DOC_TYPES):
+        candidates.append(
+            (os.path.join(target_docs, type_name, name), f"{type_name}/{name}")
+        )
     for feat_dir, rel in candidates:
         if not _is_within(target_docs, feat_dir) or not os.path.isdir(feat_dir):
             continue
@@ -97,12 +104,12 @@ def list_documented_sections(target_docs: str) -> List[Dict[str, str]]:
         fpath = os.path.join(target_docs, entry)
         if not os.path.isdir(fpath):
             continue
-        if entry == "features":
+        if entry in SPLIT_DOC_TYPES:
             for child in sorted(os.listdir(fpath)):
                 if child.startswith("."):
                     continue
                 child_path = os.path.join(fpath, child)
-                add_dir(child_path, child, f"features/{child}/index.md", "features")
+                add_dir(child_path, child, f"{entry}/{child}/index.md", entry)
             continue
         add_dir(fpath, entry, f"{entry}/index.md", entry)
     return sections
