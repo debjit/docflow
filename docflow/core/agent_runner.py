@@ -10,6 +10,7 @@ import shlex
 import sys
 from typing import Callable, Dict, Optional
 
+from docflow.core.agent_log import record_agent_run
 from docflow.core.models import AgentRunResult
 
 
@@ -139,6 +140,21 @@ class AgentRunner:
         """Returns default command for a given agent name preset."""
         return AGENT_PRESETS.get(agent_name.lower(), f"{agent_name} {{prompt_file}}")
 
+    def _record(
+        self,
+        docs_repo_path: str,
+        result: AgentRunResult,
+        transcript_text: Optional[str] = None,
+    ) -> AgentRunResult:
+        """Persist the run under `<docs repo>/.docflow/logs/`; never raises."""
+        record_agent_run(
+            docs_repo_path,
+            result,
+            command_template=self.command_template,
+            transcript_text=transcript_text,
+        )
+        return result
+
     def run(
         self,
         prompt_file_path: str,
@@ -189,72 +205,62 @@ class AgentRunner:
 
             use_tty = is_tty if capture is None else not capture
 
-            if use_tty:
-                # stdout stays on the TTY; stderr is piped so failures are not "None"
-                res = subprocess.run(
-                    formatted_cmd,
-                    shell=True,
-                    cwd=abs_docs_path,
-                    stdin=sys.stdin,
-                    stdout=sys.stdout,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                )
-                output_text = "Agent executed successfully."
-                err_text = res.stderr or ""
-            else:
-                env = os.environ.copy()
-                env.setdefault("PYTHONUNBUFFERED", "1")
-                proc = subprocess.Popen(
-                    formatted_cmd,
-                    shell=True,
-                    cwd=abs_docs_path,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    env=env,
-                )
-                lines = []
-                assert proc.stdout is not None
-                for line in proc.stdout:
-                    text = line.rstrip("\n")
-                    lines.append(text)
-                    if on_output and text:
-                        on_output(text)
-                returncode = proc.wait()
-                output_text = "\n".join(lines)
-                if returncode == 0:
-                    return AgentRunResult(
+            run_stdin = subprocess.DEVNULL
+            if use_tty and sys.stdin is not None:
+                try:
+                    if sys.stdin.fileno() >= 0:
+                        run_stdin = sys.stdin
+                except Exception:
+                    run_stdin = subprocess.DEVNULL
+
+            env = os.environ.copy()
+            env.setdefault("PYTHONUNBUFFERED", "1")
+            proc = subprocess.Popen(
+                formatted_cmd,
+                shell=True,
+                cwd=abs_docs_path,
+                stdin=run_stdin,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env=env,
+            )
+            lines = []
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                text = line.rstrip("\n")
+                lines.append(text)
+                if use_tty:
+                    sys.stdout.write(text + "\n")
+                    sys.stdout.flush()
+                if on_output and text:
+                    on_output(text)
+            returncode = proc.wait()
+            transcript_text = "\n".join(lines)
+
+            if returncode == 0:
+                return self._record(
+                    abs_docs_path,
+                    AgentRunResult(
                         success=True,
                         mode="shell",
                         prompt_file_path=abs_prompt_path,
-                        output_log=output_text,
-                    )
-                return AgentRunResult(
+                        output_log="Agent executed successfully." if use_tty else transcript_text,
+                    ),
+                    transcript_text=transcript_text,
+                )
+            return self._record(
+                abs_docs_path,
+                AgentRunResult(
                     success=False,
                     mode="shell",
                     prompt_file_path=abs_prompt_path,
-                    output_log=output_text,
-                    error_message=explain_agent_failure(returncode, output_text, ""),
-                )
-
-            if res.returncode == 0:
-                return AgentRunResult(
-                    success=True,
-                    mode="shell",
-                    prompt_file_path=abs_prompt_path,
-                    output_log=output_text
-                )
-            else:
-                return AgentRunResult(
-                    success=False,
-                    mode="shell",
-                    prompt_file_path=abs_prompt_path,
-                    output_log=output_text,
-                    error_message=explain_agent_failure(res.returncode, output_text, err_text)
-                )
+                    output_log=transcript_text,
+                    error_message=explain_agent_failure(returncode, transcript_text, ""),
+                ),
+                transcript_text=transcript_text,
+            )
         except Exception as e:
             return AgentRunResult(
                 success=False,

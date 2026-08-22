@@ -2,6 +2,7 @@
 Tests for AgentRunner module.
 """
 
+import json
 import os
 import tempfile
 from docflow.core.agent_runner import AGENT_PRESETS, AgentRunner, explain_agent_failure
@@ -78,3 +79,68 @@ def test_explain_agent_failure_arg_max():
     assert "Argument list too long" in msg
     assert "file path" in msg.lower()
     assert "$(cat {prompt_file})" in msg
+
+
+def _run_and_read_index(runner, tmpdir, docs_name="docs", **kwargs):
+    prompt_file = os.path.join(tmpdir, "prompt.md")
+    with open(prompt_file, "w") as f:
+        f.write("# Prompt")
+    docs = os.path.join(tmpdir, docs_name)
+    os.makedirs(docs)
+    res = runner.run(prompt_file, docs, **kwargs)
+    index = os.path.join(docs, ".docflow", "logs", "agent-runs.jsonl")
+    with open(index) as f:
+        rows = [json.loads(line) for line in f if line.strip()]
+    return res, rows
+
+
+def test_shell_run_writes_jsonl_index_and_transcript():
+    runner = AgentRunner(mode="shell", command_template="echo Processed {prompt_file}")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        res, rows = _run_and_read_index(runner, tmpdir, capture=True)
+        assert res.success is True
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["success"] is True
+        assert row["agent"] == "echo"
+        assert row["mode"] == "shell"
+        assert os.path.isabs(row["transcript"])
+        with open(row["transcript"]) as f:
+            assert "Processed" in f.read()
+
+
+def test_failed_run_is_logged_with_error_message():
+    runner = AgentRunner(mode="shell", command_template="echo boom >&2; exit 7")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        res, rows = _run_and_read_index(runner, tmpdir, capture=True)
+        assert res.success is False
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["success"] is False
+        assert "7" in (row["error_message"] or "")
+        with open(row["transcript"]) as f:
+            assert "boom" in f.read()
+
+
+def test_tty_mode_teeds_output_into_transcript():
+    runner = AgentRunner(mode="shell", command_template="echo Processed {prompt_file}")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        res, rows = _run_and_read_index(runner, tmpdir, capture=False)
+        assert res.success is True
+        assert res.output_log == "Agent executed successfully."
+        assert len(rows) == 1
+        with open(rows[0]["transcript"]) as f:
+            assert "Processed" in f.read()
+
+
+def test_manual_mode_does_not_create_logs():
+    runner = AgentRunner(mode="manual", command_template="")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        prompt_file = os.path.join(tmpdir, "prompt.md")
+        with open(prompt_file, "w") as f:
+            f.write("# Prompt")
+        docs = os.path.join(tmpdir, "docs")
+        os.makedirs(docs)
+        res = runner.run(prompt_file, docs)
+        assert res.success is True
+        assert not os.path.exists(os.path.join(docs, ".docflow"))
