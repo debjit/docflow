@@ -14,7 +14,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Header, Input, Label, LoadingIndicator, Log, OptionList, ProgressBar, Select, SelectionList, Static, TextArea
+from textual.widgets import Button, Collapsible, Footer, Header, Input, Label, LoadingIndicator, Log, OptionList, ProgressBar, Select, SelectionList, Static, TextArea
 from textual.widgets.option_list import Option
 from textual.widgets.selection_list import Selection
 
@@ -1465,7 +1465,10 @@ class GenerateScreen(ModalScreen[Optional[dict]]):
                 if len(new_commits) > 15:
                     lines.append(f"… {len(new_commits) - 15} more")
             else:
-                lines.append("Nothing new on this branch locally. Update docs will fetch the remote first.")
+                lines.append(
+                    "Nothing new on this branch locally. To rebuild anyway,"
+                    " switch 'What to use' above to 'Full regeneration'."
+                )
             return "\n".join(lines)
         count = self._commit_count()
         try:
@@ -1770,6 +1773,51 @@ class ExportScreen(ModalScreen[Optional[dict]]):
         )
 
 
+class SettingsScreen(ModalScreen[Optional[str]]):
+    """Advanced settings hub: project lifecycle, import/export, pull, switch."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def compose(self) -> ComposeResult:
+        dash = _screen_dashboard(self)
+        configured = dash.configured
+        options = [
+            Option(
+                "New project…  (guided setup wizard)",
+                id="setup",
+            ),
+            Option("Import existing docs…", id="import", disabled=not configured),
+            Option("Switch project…", id="switch"),
+            Option(
+                "Export documentation site…",
+                id="export",
+                disabled=not configured,
+            ),
+            Option("Git pull (application repo)", id="pull"),
+        ]
+        with Vertical(id="dialog"):
+            yield Label("Settings", classes="title")
+            yield Static("Everything except the everyday run actions lives here.", classes="wizard-copy")
+            yield OptionList(*options, id="settings-list")
+            with Horizontal(classes="buttons"):
+                yield Button("Close", id="cancel")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_list.id != "settings-list":
+            return
+        event.stop()
+        if event.option.id:
+            self.dismiss(str(event.option.id))
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == "cancel":
+            self.dismiss(None)
+
+
 class DocFlowApp(App[None]):
     TITLE = "DocFlow"
     SUB_TITLE = "Ready"
@@ -1984,13 +2032,18 @@ class DocFlowApp(App[None]):
     """
 
     BINDINGS = [
-        Binding("g", "generate", "Update"),
-        Binding("u", "pull", "Pull"),
-        Binding("p", "publish", "Publish"),
-        Binding("e", "export", "Export"),
-        Binding("i", "setup", "Setup"),
-        Binding("s", "switch", "Switch"),
-        Binding("m", "mcp", "MCP"),
+        Binding("u", "generate", "Update", show=False),
+        Binding("g", "generate", "Update", show=False),
+        Binding("p", "publish", "Publish", show=False),
+        Binding("m", "mcp", "MCP", show=False),
+        Binding("r", "refresh", "Refresh", show=False),
+        Binding("s", "settings", "Settings", show=False),
+        Binding("comma", "settings", "Settings", show=False),
+        Binding("i", "settings", "Settings", show=False),
+        Binding("l", "pull", "Pull", show=False),
+        Binding("w", "switch", "Switch", show=False),
+        Binding("e", "export", "Export", show=False),
+        Binding("n", "new_project", "New project", show=False),
         Binding("f8", "toggle_pause", "Pause/Resume"),
         Binding("q", "quit", "Quit"),
     ]
@@ -2051,6 +2104,8 @@ class DocFlowApp(App[None]):
         yield Header(show_clock=True)
         with Vertical(id="main"):
             yield Static("Loading…", id="summary")
+            with Collapsible(collapsed=True, title="Details", id="summary-details"):
+                yield Static("", id="summary-extra")
             with Horizontal(id="busy-row"):
                 yield LoadingIndicator(id="busy")
                 yield Static("Ready", id="step")
@@ -2059,20 +2114,17 @@ class DocFlowApp(App[None]):
                 with Vertical(id="progress-pane"):
                     yield Static("Progress", classes="pane-title", id="progress-title")
                     with VerticalScroll(id="progress-scroll"):
-                        yield Static("Ready. Press u to pull, g to update docs from new commits.", id="progress")
+                        yield Static("Ready. Press l to pull, u to update docs from new commits.", id="progress")
                 with Vertical(id="log-pane"):
                     yield Static("Logs", classes="pane-title", id="log-title")
                     yield Log(id="log", highlight=False, max_lines=500)
             with Horizontal(id="actions"):
-                yield Button("Setup", id="btn-setup")
-                yield Button("Pull", id="btn-pull")
-                yield Button("Update docs", variant="primary", id="btn-generate")
-                yield Button("Publish", id="btn-publish")
-                yield Button("Export", id="btn-export")
-                yield Button("MCP (SSE)", id="btn-mcp")
-                yield Button("Refresh", id="btn-refresh")
-                yield Button("Switch", id="btn-switch")
-                yield Button("Pause", id="btn-pause", disabled=True)
+                yield Button("[underline]U[/underline]pdate docs", variant="primary", id="btn-generate")
+                yield Button("[underline]P[/underline]ublish", id="btn-publish")
+                yield Button("[underline]M[/underline]CP (SSE)", id="btn-mcp")
+                yield Button("[underline]R[/underline]efresh", id="btn-refresh")
+                yield Button("[underline]S[/underline]ettings", id="btn-settings")
+                yield Button("Pause (F8)", id="btn-pause", disabled=True)
         yield Footer()
 
     def on_mount(self) -> None:
@@ -2205,59 +2257,57 @@ class DocFlowApp(App[None]):
             self.query_one("#progress-title", Static).update("Progress")
         pause_btn = self.query_one("#btn-pause", Button)
         pause_btn.disabled = not busy
-        for button_id in ("btn-setup", "btn-pull", "btn-generate", "btn-publish", "btn-export", "btn-mcp", "btn-refresh", "btn-switch"):
+        for button_id in ("btn-generate", "btn-publish", "btn-mcp", "btn-refresh", "btn-settings"):
             self.query_one(f"#{button_id}", Button).disabled = busy
 
     def refresh_summary(self) -> None:
+        core_lines: list[str] = []
+        extra_lines: list[str] = []
         if self._blank_session:
             self.title = "DocFlow"
-            self.query_one("#btn-setup", Button).label = "Setup"
-            self.query_one("#summary", Static).update(
-                "\n".join(
-                    [
-                        "Project  [bold]not set[/bold]",
-                        "App      not set",
-                        "Docs     not set",
-                        "Jobs     1 agent(s) at a time",
-                        "Agent    not set",
-                        "Types: none",
-                        "Documented: none yet",
-                        "New commits (0): none",
-                        "Features (0): none",
-                        "Pending prompts (0): none",
-                    ]
-                )
+            core_lines = [
+                "Project  [bold]not set[/bold]",
+                "App      not set",
+                "Docs     not set",
+                "Branch   not set",
+            ]
+            extra_lines = ["Run Settings → New project to begin."]
+        else:
+            dash = self._dashboard()
+            self.title = dash.project_name or "DocFlow"
+            core_lines = [
+                f"Project  [bold]{dash.project_name or 'not set'}[/bold]",
+                f"App      {dash.app_repo_path or 'not set'}  ({'ok' if dash.app_exists else 'missing'})",
+                f"Docs     {dash.docs_repo_path or 'not set'}  ({'ok' if dash.docs_exists else 'missing'})",
+                f"Branch   {dash.app_branch or 'not set'}",
+            ]
+            agent_line = (
+                f"Agent    {dash.agent_name or dash.agent_mode}"
+                + (f"  plan {dash.plan_model}" if getattr(dash, "plan_model", "") else "")
+                + (f"  work {dash.agent_model}" if dash.agent_model else "")
+                + f"  {dash.agent_command or 'manual'}"
             )
-            return
-        dash = self._dashboard()
-        self.title = dash.project_name or "DocFlow"
-        lines = [
-            f"Project  [bold]{dash.project_name or 'not set'}[/bold]",
-            f"App      {dash.app_repo_path or 'not set'}  ({'ok' if dash.app_exists else 'missing'})",
-            f"Docs     {dash.docs_repo_path or 'not set'}  ({'ok' if dash.docs_exists else 'missing'})",
-            f"Branch   {dash.app_branch or 'not set'}",
-            f"Jobs     {dash.concurrency} agent(s) at a time",
-            f"Agent    {dash.agent_name or dash.agent_mode}"
-            + (f"  plan {dash.plan_model}" if getattr(dash, "plan_model", "") else "")
-            + (f"  work {dash.agent_model}" if dash.agent_model else "")
-            + f"  {dash.agent_command or 'manual'}",
-            f"Types: {', '.join(dash.doc_types) or 'none'}",
-            f"Documented: {dash.last_documented.short_sha}  {dash.last_documented.message}"
-            if dash.last_documented
-            else "Documented: none yet",
-            f"New commits ({len(dash.new_commits)}): "
-            + (
-                ", ".join(f"{c.short_sha} {c.message}" for c in dash.new_commits[:3])
-                or "none"
-            ),
-            f"Features ({len(dash.features)}): {', '.join(dash.features) or 'none'}",
-            f"Pending prompts ({len(dash.pending)}): {', '.join(dash.pending) or 'none'}",
-        ]
-        if dash.source_path:
-            lines.append(f"Config {dash.source_path}")
-        setup_btn = self.query_one("#btn-setup", Button)
-        setup_btn.label = "Import" if dash.configured else "Setup"
-        self.query_one("#summary", Static).update("\n".join(lines))
+            extra_lines = [
+                f"Jobs     {dash.concurrency} agent(s) at a time",
+                agent_line,
+                f"Types: {', '.join(dash.doc_types) or 'none'}",
+                (
+                    f"Documented: {dash.last_documented.short_sha}  {dash.last_documented.message}"
+                    if dash.last_documented
+                    else "Documented: none yet"
+                ),
+                f"New commits ({len(dash.new_commits)}): "
+                + (
+                    ", ".join(f"{c.short_sha} {c.message}" for c in dash.new_commits[:3])
+                    or "none"
+                ),
+                f"Features ({len(dash.features)}): {', '.join(dash.features) or 'none'}",
+                f"Pending prompts ({len(dash.pending)}): {', '.join(dash.pending) or 'none'}",
+            ]
+            if dash.source_path:
+                extra_lines.append(f"Config {dash.source_path}")
+        self.query_one("#summary", Static).update("\n".join(core_lines))
+        self.query_one("#summary-extra", Static).update("\n".join(extra_lines))
 
     def _run_dialog(self, coro) -> None:
         # Textual 8: push_screen_wait must run inside a worker, not a message handler.
@@ -2265,14 +2315,11 @@ class DocFlowApp(App[None]):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         mapping = {
-            "btn-setup": self.action_setup,
-            "btn-pull": self.action_pull,
             "btn-generate": self.action_generate,
             "btn-publish": self.action_publish,
-            "btn-export": self.action_export,
+            "btn-settings": self.action_settings,
             "btn-mcp": self.action_mcp,
             "btn-refresh": self.action_refresh,
-            "btn-switch": self.action_switch,
             "btn-pause": self.action_toggle_pause,
         }
         action = mapping.get(event.button.id or "")
@@ -2299,6 +2346,27 @@ class DocFlowApp(App[None]):
             self._run_dialog(self._do_import())
         else:
             self._run_dialog(self._do_setup())
+
+    def action_settings(self) -> None:
+        self._run_dialog(self._do_settings())
+
+    def action_new_project(self) -> None:
+        self._run_dialog(self._do_setup())
+
+    async def _do_settings(self) -> None:
+        choice = await self.push_screen_wait(SettingsScreen())
+        if not choice:
+            return
+        if choice == "setup":
+            await self._do_setup()
+        elif choice == "import":
+            await self._do_import()
+        elif choice == "switch":
+            await self._do_switch()
+        elif choice == "export":
+            await self._do_export()
+        elif choice == "pull":
+            await self._do_pull()
 
     def action_generate(self) -> None:
         self._run_dialog(self._do_generate())

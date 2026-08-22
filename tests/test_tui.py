@@ -60,7 +60,7 @@ async def test_update_docs_modal_has_agent_select(tmp_path):
     app = _configured_app(tmp_path)
     async with app.run_test() as pilot:
         await pilot.pause()
-        await pilot.press("g")
+        await pilot.press("u")
         await pilot.pause()
         generate = next(
             screen for screen in app.screen_stack if screen.__class__.__name__ == "GenerateScreen"
@@ -80,7 +80,7 @@ async def test_update_docs_modal_uses_two_pane_layout(tmp_path):
     app = _configured_app(tmp_path)
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
-        await pilot.press("g")
+        await pilot.press("u")
         await pilot.pause()
         generate = next(
             screen for screen in app.screen_stack if screen.__class__.__name__ == "GenerateScreen"
@@ -102,7 +102,7 @@ async def test_change_model_opens_model_select_modal(tmp_path):
     app = _configured_app(tmp_path)
     async with app.run_test(size=(100, 40)) as pilot:
         await pilot.pause()
-        await pilot.press("g")
+        await pilot.press("u")
         await pilot.pause()
         generate = next(
             screen for screen in app.screen_stack if screen.__class__.__name__ == "GenerateScreen"
@@ -177,13 +177,20 @@ async def test_setup_and_publish_open_modals(tmp_path):
             (
                 screen
                 for screen in app.screen_stack
-                if screen.__class__.__name__ in ("SetupScreen", "ImportScreen")
+                if screen.__class__.__name__
+                in ("SettingsScreen", "SetupWizardScreen", "ImportScreen")
             ),
             None,
         )
         assert setup is not None
         if setup.__class__.__name__ == "SetupScreen":
             assert setup.query_one("#app-branch")
+        if setup.__class__.__name__ == "SettingsScreen":
+            listing = setup.query_one("#settings-list")
+            ids = {opt.id for opt in listing._options}
+            assert {"setup", "import", "switch", "export", "pull"} <= ids
+            import_option = next(opt for opt in listing._options if opt.id == "import")
+            assert not import_option.disabled
         await pilot.press("escape")
         await pilot.pause()
         await pilot.press("p")
@@ -283,7 +290,29 @@ async def test_switch_new_clears_summary_header():
         assert app.sub_title == "New project"
         summary = str(app.query_one("#summary", Static).render())
         assert "not set" in summary
-        assert "Documented: none yet" in summary
+        extra = str(app.query_one("#summary-extra", Static).render())
+        assert "New project" in extra
+
+
+@pytest.mark.asyncio
+async def test_summary_keeps_core_visible_and_details_collapsed(tmp_path):
+    from textual.widgets import Collapsible
+
+    app_repo, docs = _make_project(tmp_path)
+    app = DocFlowApp(repo=app_repo, docs=docs)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        summary = str(app.query_one("#summary", Static).render())
+        for key in ("Project", "App", "Docs", "Branch"):
+            assert key in summary
+        assert "Pending prompts" not in summary
+        assert "Features (" not in summary
+
+        collapsible = app.query_one("#summary-details", Collapsible)
+        assert collapsible.collapsed is True
+        extra = str(app.query_one("#summary-extra", Static).render())
+        assert "Pending prompts" in extra
+        assert "Features (" in extra
 
 
 @pytest.mark.asyncio
@@ -533,3 +562,115 @@ async def test_export_run_reports_summary(tmp_path, monkeypatch):
             await pilot.pause()
         assert calls["args"][1] == out_path
         assert any("Exported 2 page(s)" in line for line in app._progress_lines)
+
+
+@pytest.mark.asyncio
+async def test_main_bar_is_minimal_with_settings_hub(tmp_path):
+    from textual.widgets import Button
+
+    app = _configured_app(tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        ids = {b.id for b in app.query("#actions Button")}
+        assert ids == {
+            "btn-generate",
+            "btn-publish",
+            "btn-mcp",
+            "btn-refresh",
+            "btn-settings",
+            "btn-pause",
+        }
+        assert "#btn-setup" not in str(ids)
+        assert app.query_one("#btn-settings", Button).disabled is False
+
+
+@pytest.mark.asyncio
+async def test_settings_hub_routes_to_export_screen(tmp_path):
+    from textual.widgets import OptionList
+
+    app = _configured_app(tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("i")
+        await pilot.pause()
+        settings = next(
+            screen for screen in app.screen_stack if screen.__class__.__name__ == "SettingsScreen"
+        )
+        listing = settings.query_one("#settings-list")
+        export_option = next(opt for opt in listing._options if opt.id == "export")
+        index = next(
+            i for i, opt in enumerate(listing._options) if opt.id == "export"
+        )
+        listing.post_message(
+            OptionList.OptionSelected(listing, export_option, index)
+        )
+        await pilot.pause()
+        await pilot.pause()
+        assert any(
+            screen.__class__.__name__ == "ExportScreen" for screen in app.screen_stack
+        )
+
+
+@pytest.mark.asyncio
+async def test_settings_import_disabled_until_configured(tmp_path):
+    from docflow.tui.app import SettingsScreen
+
+    app = DocFlowApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.push_screen(SettingsScreen())
+        await pilot.pause()
+        settings = next(
+            screen for screen in app.screen_stack if isinstance(screen, SettingsScreen)
+        )
+        listing = settings.query_one("#settings-list")
+        import_option = next(opt for opt in listing._options if opt.id == "import")
+        export_option = next(opt for opt in listing._options if opt.id == "export")
+        assert import_option.disabled
+        assert export_option.disabled
+
+
+@pytest.mark.asyncio
+async def test_action_buttons_underline_shortcut_letters(tmp_path):
+    from textual.widgets import Button
+
+    app = _configured_app(tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        expected = {
+            "btn-generate": "Update docs",
+            "btn-publish": "Publish",
+            "btn-mcp": "MCP (SSE)",
+            "btn-refresh": "Refresh",
+            "btn-settings": "Settings",
+        }
+        for button_id, plain in expected.items():
+            label = app.query_one(f"#{button_id}", Button).label
+            assert getattr(label, "plain", str(label)) == plain
+            assert any(
+                getattr(span, "style", "") == "underline" and span.start == 0
+                for span in getattr(label, "spans", [])
+            ), f"{button_id} missing underline on first letter"
+
+
+@pytest.mark.asyncio
+async def test_mnemonic_keys_trigger_actions(tmp_path):
+    app = _configured_app(tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("s")
+        await pilot.pause()
+        assert any(
+            screen.__class__.__name__ == "SettingsScreen"
+            for screen in app.screen_stack
+        )
+        await pilot.press("escape")
+        await pilot.pause()
+        await pilot.press("n")
+        for _ in range(3):
+            await pilot.pause()
+        from docflow.tui.app import SetupWizardScreen
+
+        assert any(
+            isinstance(screen, SetupWizardScreen) for screen in app.screen_stack
+        )
