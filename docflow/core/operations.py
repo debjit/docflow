@@ -2126,6 +2126,17 @@ def init_docs(
     builder = PromptBuilder()
     work_model = agent.model or model_from_command(agent.command)
     plan_model = agent.plan_model or work_model
+    if (
+        agent.mode == "shell"
+        and not (agent.plan_model or "").strip()
+        and agent.name
+        in (*CURSOR_AGENT_KEYS, *OPENCODE_AGENT_KEYS, *AGY_AGENT_KEYS)
+    ):
+        progress(
+            "No planner model saved — the repo scan will reuse the writer"
+            " model. Choose models in the UI to split heavy planning from"
+            " light writing."
+        )
     plan_runner = AgentRunner(
         mode=agent.mode,
         command_template=apply_agent_model(agent, plan_model).command,

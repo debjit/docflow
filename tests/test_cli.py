@@ -341,3 +341,67 @@ def test_projects_crud_via_cli(tmp_path, monkeypatch):
     assert listed3.exit_code == 0, listed3.output
     assert str(other) not in listed3.output
 
+
+
+def _docs_repo_with_pages(tmp_path: Path) -> Path:
+    docs = tmp_path / "site-docs"
+    arch = docs / "architecture"
+    auth = docs / "features" / "auth"
+    arch.mkdir(parents=True)
+    auth.mkdir(parents=True)
+    (arch / "index.md").write_text(
+        '---\ntitle: "Architecture"\ntags: ["sys"]\n---\n\n# Arch\n\n> [!NOTE]\n> hi\n'
+    )
+    (auth / "index.md").write_text('---\ntitle: "Auth"\n---\n\n# Auth\n')
+    return docs
+
+
+def test_export_command_writes_site(tmp_path, monkeypatch):
+    _user_dirs(tmp_path, monkeypatch)
+    docs = _docs_repo_with_pages(tmp_path)
+    out = tmp_path / "out" / "docusaurus"
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["export", "--docs", str(docs), "--out", str(out)])
+    assert result.exit_code == 0, result.output
+    assert "Exported 2 page(s)" in result.output
+    assert (out / "docs" / "architecture.md").exists()
+    assert (out / "docs" / "features" / "auth.md").exists()
+    assert (out / "docs" / "features" / "_category_.json").exists()
+    assert not (docs / "site").exists()
+
+
+def test_export_command_rejects_output_inside_docs_repo(tmp_path, monkeypatch):
+    _user_dirs(tmp_path, monkeypatch)
+    docs = _docs_repo_with_pages(tmp_path)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["export", "--docs", str(docs), "--out", str(docs / "site")],
+    )
+    assert result.exit_code != 0
+    assert "inside the docs repo" in result.output
+
+
+def test_export_command_requires_out_option(tmp_path, monkeypatch):
+    _user_dirs(tmp_path, monkeypatch)
+    docs = _docs_repo_with_pages(tmp_path)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["export", "--docs", str(docs)])
+    assert result.exit_code != 0
+
+
+def test_export_command_reports_empty_docs_repo(tmp_path, monkeypatch):
+    _user_dirs(tmp_path, monkeypatch)
+    empty = tmp_path / "empty-docs"
+    empty.mkdir()
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["export", "--docs", str(empty), "--out", str(tmp_path / "out")],
+    )
+    assert result.exit_code != 0
+    assert "No documentation pages found" in result.output

@@ -19,6 +19,7 @@ from docflow.core.operations import (
     resolve_agent,
     resolve_paths,
 )
+from docflow.core.site_exporter import export_site
 
 
 def _from_ctx(ctx: click.Context, name: str, value: str) -> str:
@@ -270,6 +271,35 @@ def info(ctx, repo: str, docs: str):
 def publish(ctx, docs: str, platform: str, message: str):
     """Commit doc updates, push a branch, and open a pull/merge request."""
     menu.run_publish(_from_ctx(ctx, "docs", docs), platform=platform, message=message)
+
+
+@cli.command()
+@click.pass_context
+@click.option("--docs", default="", help="Path to dedicated documentation repository.")
+@click.option(
+    "--format",
+    "fmt",
+    default="docusaurus",
+    show_default=True,
+    help="Target docs app format (docusaurus).",
+)
+@click.option("--out", required=True, help="Output folder; must be outside the docs repo.")
+def export(ctx, docs: str, fmt: str, out: str):
+    """Export human docs to a static-site content folder (no agents needed)."""
+    try:
+        paths = resolve_paths(docs=_from_ctx(ctx, "docs", docs), require=False)
+        if not paths.docs_repo_path:
+            raise click.ClickException(
+                "No DocFlow docs project found. Run `docflow init` or pass --docs."
+            )
+        result = export_site(paths.docs_repo_path, out, fmt=fmt)
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
+    except ConfigError as exc:
+        raise click.ClickException(str(exc))
+    click.echo(f"Exported {result.pages} page(s) → {result.out_dir}")
+    for rel in result.files:
+        click.echo(f"  {rel}")
 
 
 @cli.command()

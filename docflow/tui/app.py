@@ -14,12 +14,13 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Header, Input, Label, LoadingIndicator, Log, OptionList, ProgressBar, Select, SelectionList, Static, TextArea
+from textual.widgets import Button, Collapsible, Footer, Header, Input, Label, LoadingIndicator, Log, OptionList, ProgressBar, Select, SelectionList, Static, TextArea
 from textual.widgets.option_list import Option
 from textual.widgets.selection_list import Selection
 
 from docflow.core.agent_runner import AGENT_PRESETS, missing_agent_binary
 from docflow.core.job_runner import RunControl, clamp_concurrency
+from docflow.core.site_exporter import export_site
 from docflow.core.operations import (
     AGENT_CHOICES,
     CURSOR_AGENT_KEYS,
@@ -286,6 +287,14 @@ def _model_display_name(choices, value: str) -> str:
     return value
 
 
+def _model_label_text(choices, work: str, plan: str) -> str:
+    """Model-row label naming both roles so users pick each wisely."""
+    writer = _model_display_name(choices, work)
+    if plan and plan != work and plan != "auto":
+        return f"Planner (repo scan): {_model_display_name(choices, plan)} · Writer (docs): {writer}"
+    return f"Model: {writer}"
+
+
 def _selected_models(screen) -> tuple[str, str]:
     if hasattr(screen, "_work_model") and hasattr(screen, "_plan_model"):
         return getattr(screen, "_plan_model", ""), getattr(screen, "_work_model", "")
@@ -324,18 +333,24 @@ class ModelSelectScreen(ModalScreen[Optional[dict]]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog", classes="model-select-dialog"):
-            yield Label("Select Model", classes="title")
+            yield Label("Select Models", classes="title")
+            yield Static(
+                "Two passes, two roles: the planner scans the repo and lists what"
+                " to document (pick a strong, heavier model); the writer then"
+                " produces each section from those instructions (pick a light,"
+                " fast one).",
+                classes="model-roles-hint",
+            )
             yield ModelPicker(
-                caption="Target Model (write docs)",
+                caption="Planner model — heavy; repo scan & section list",
+                role="plan",
+                id="plan-model-picker",
+            )
+            yield ModelPicker(
+                caption="Writer model — light & fast; writes docs from instructions",
                 role="work",
                 id="work-model-picker",
             )
-            if self._show_plan:
-                yield ModelPicker(
-                    caption="Plan model (search & structure)",
-                    role="plan",
-                    id="plan-model-picker",
-                )
             with Horizontal(classes="buttons"):
                 yield Button("Select", variant="primary", id="ok")
                 yield Button("Cancel", id="cancel")
@@ -345,8 +360,7 @@ class ModelSelectScreen(ModalScreen[Optional[dict]]):
             self._populate(self._choices)
         else:
             self.query_one("#work-model-picker", ModelPicker).set_loading()
-            if self._show_plan:
-                self.query_one("#plan-model-picker", ModelPicker).set_loading()
+            self.query_one("#plan-model-picker", ModelPicker).set_loading()
             self.run_worker(self._load_choices(), exclusive=True)
 
     async def _load_choices(self) -> None:
@@ -359,9 +373,8 @@ class ModelSelectScreen(ModalScreen[Optional[dict]]):
     def _populate(self, choices: list) -> None:
         work_picker = self.query_one("#work-model-picker", ModelPicker)
         work_picker.set_choices(choices, selected=self._selected_work)
-        if self._show_plan:
-            plan_picker = self.query_one("#plan-model-picker", ModelPicker)
-            plan_picker.set_choices(choices, selected=self._selected_plan)
+        plan_picker = self.query_one("#plan-model-picker", ModelPicker)
+        plan_picker.set_choices(choices, selected=self._selected_plan)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -372,9 +385,7 @@ class ModelSelectScreen(ModalScreen[Optional[dict]]):
             self.dismiss(None)
             return
         work = self.query_one("#work-model-picker", ModelPicker).selected_value()
-        plan = ""
-        if self._show_plan:
-            plan = self.query_one("#plan-model-picker", ModelPicker).selected_value()
+        plan = self.query_one("#plan-model-picker", ModelPicker).selected_value()
         self.dismiss({"model": work, "plan_model": plan})
 
 
@@ -397,6 +408,12 @@ def _jobs_from_input(screen, default: int = 1) -> int:
 
 def _default_types_text() -> str:
     return "\n".join(f"{t.name}: {t.description}" for t in DEFAULT_DOC_TYPES)
+
+
+def default_site_export_path(docs_repo_path: str) -> str:
+    """Sibling folder suggestion for site exports (never inside the docs repo)."""
+    base = os.path.abspath(docs_repo_path or os.getcwd())
+    return os.path.join(os.path.dirname(base), f"{os.path.basename(base)}-site", "docusaurus")
 
 
 class DeleteProjectScreen(ModalScreen[Optional[str]]):
@@ -583,7 +600,7 @@ class SetupScreen(ModalScreen[Optional[dict]]):
                         allow_blank=False,
                     )
                     with Horizontal(id="model-row", classes="model-row"):
-                        yield Label("Target Model: loading…", id="model-label")
+                        yield Label("Models: loading…", id="model-label")
                         yield Button("Change", id="change-model")
                     yield Label("Doc types (one per line: name: description)")
                     yield TextArea(_default_types_text(), id="types")
@@ -602,7 +619,7 @@ class SetupScreen(ModalScreen[Optional[dict]]):
         model_row = self.query_one("#model-row")
         model_row.display = show
         if show:
-            self.query_one("#model-label", Label).update("Target Model: loading…")
+            self.query_one("#model-label", Label).update("Models: loading…")
             self.run_worker(self._load_models(agent_key), exclusive=True, group="models")
 
     async def _load_models(self, agent_key: str) -> None:
@@ -649,15 +666,13 @@ class SetupScreen(ModalScreen[Optional[dict]]):
         self._update_model_label()
 
     def _update_model_label(self) -> None:
-        display = _model_display_name(self._model_choices, self._work_model)
-        if self._plan_model and self._plan_model != self._work_model and self._plan_model != "auto":
-            plan_display = _model_display_name(self._model_choices, self._plan_model)
-            display = f"{display} (plan: {plan_display})"
-        self.query_one("#model-label", Label).update(f"Target Model: {display}")
+        self.query_one("#model-label", Label).update(
+            _model_label_text(self._model_choices, self._work_model, self._plan_model)
+        )
 
     def _open_model_picker(self) -> None:
         agent_key = str(self.query_one("#agent", Select).value)
-        show_plan = agent_key in CURSOR_AGENT_KEYS or agent_key in OPENCODE_AGENT_KEYS
+        show_plan = agent_supports_models(agent_key)
 
         def _on_picked(result: Optional[dict]) -> None:
             if not result:
@@ -734,6 +749,347 @@ class SetupScreen(ModalScreen[Optional[dict]]):
                 "branch": str(self.query_one("#app-branch", Select).value or ""),
             }
         )
+
+
+class SetupWizardScreen(ModalScreen[Optional[dict]]):
+    """Guided first-run wizard. Emits the same payload dict as SetupScreen.
+
+    Dismissing with ``{"manual": True}`` asks the caller to fall back to the
+    classic single-screen SetupScreen instead.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    STEPS = [
+        ("welcome", "Welcome"),
+        ("app", "Application repo"),
+        ("docs", "Docs repo"),
+        ("agent", "Agent"),
+        ("content", "Doc types"),
+        ("review", "Review"),
+    ]
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._step = 0
+        self._work_model = ""
+        self._plan_model = ""
+        self._model_choices: list = []
+        self._last_docs_default = ""
+
+    def compose(self) -> ComposeResult:
+        dash = _screen_dashboard(self)
+        app_default = dash.app_repo_path or os.getcwd()
+        docs_default = default_docs_path(app_default)
+        self._last_docs_default = docs_default
+        agent_default = _agent_key_from_dash(dash)
+        if not dash.configured:
+            prefs = getattr(getattr(self, "app", None), "_agent_defaults", {}) or {}
+            preferred = prefs.get("name") or ""
+            select_keys = {key for key, _ in AGENT_CHOICES if key != "custom"}
+            if preferred in select_keys:
+                agent_default = preferred
+        branch_options, branch_default = _branch_select_options(app_default)
+        with Vertical(id="dialog"):
+            yield Label("Set up DocFlow", classes="title")
+            yield Label("", id="wizard-step-label")
+            with Vertical(id="wizard-body"):
+                with Vertical(id="wizard-welcome", classes="wizard-step wizard-active"):
+                    yield Static(
+                        "DocFlow keeps developer documentation in a dedicated git repo,"
+                        " generated from your application repo by an AI coding agent.\n\n"
+                        "This guide walks through a few quick choices:\n\n"
+                        "  1. Where your application lives\n"
+                        "  2. Where the docs repo should be created\n"
+                        "  3. Which agent writes the docs\n"
+                        "  4. Which sections to document\n\n"
+                        "When your agent supports models, DocFlow uses two:\n"
+                        "  • A heavier planner model scans the repository and"
+                        " decides what to document\n"
+                        "  • A lighter, faster writer model turns each generated"
+                        " instruction into docs\n\n"
+                        "Pick a strong model to plan and a cheap, fast one to write."
+                        " Prefer the classic single-screen form?"
+                        " Choose Manual settings below.",
+                        classes="wizard-copy",
+                    )
+                    yield Button("Manual settings instead", id="wizard-manual")
+                with Vertical(id="wizard-app", classes="wizard-step"):
+                    yield Label("Application repo (git checkout)")
+                    yield Input(value=app_default, id="app-path")
+                    yield Label("Application branch")
+                    yield Select(
+                        branch_options,
+                        value=branch_default,
+                        id="app-branch",
+                        allow_blank=False,
+                    )
+                with Vertical(id="wizard-docs", classes="wizard-step"):
+                    yield Label("Docs repo location (created if missing, must be empty)")
+                    yield Input(value=docs_default, id="docs-path")
+                with Vertical(id="wizard-agent", classes="wizard-step"):
+                    yield Label("Agent")
+                    yield Select(
+                        _agent_select_options(),
+                        value=agent_default,
+                        id="agent",
+                        allow_blank=False,
+                    )
+                    with Horizontal(id="model-row", classes="model-row"):
+                        yield Label("Models: loading…", id="model-label")
+                        yield Button("Change", id="change-model")
+                    yield Static(
+                        "Two passes, two roles: the planner model (pick a strong,"
+                        " heavier one) scans the repo and lists what to document;"
+                        " the writer model (pick a light, fast one) then produces"
+                        " each section from those instructions.",
+                        classes="wizard-copy",
+                    )
+                    yield Label("Parallel agents (1 is safest on most PCs)")
+                    yield Input(value="1", id="jobs")
+                with Vertical(id="wizard-content", classes="wizard-step"):
+                    yield Label("Doc types (one per line: name: description)")
+                    yield TextArea(_default_types_text(), id="types")
+                    yield Label("Import existing docs from path/folder (optional)")
+                    yield Input(placeholder="leave blank to skip", id="import-from")
+                    yield Label("Import into type")
+                    yield Input(placeholder="defaults to the first type", id="import-into")
+                with Vertical(id="wizard-review", classes="wizard-step"):
+                    yield Label("Ready to generate your documentation", classes="pane-title")
+                    yield Static("", id="wizard-summary")
+            yield Label("", id="wizard-error")
+            with Horizontal(id="wizard-nav"):
+                yield Button("Back", id="wizard-back", disabled=True)
+                yield Button("Get started", variant="primary", id="wizard-next")
+                yield Button("Cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        self._show_step(0)
+        self._sync_model_select(str(self.query_one("#agent", Select).value))
+
+    def _show_step(self, index: int) -> None:
+        self._step = max(0, min(index, len(self.STEPS) - 1))
+        for i, (name, _title) in enumerate(self.STEPS):
+            self.query_one(f"#wizard-{name}", Vertical).set_class(
+                i == self._step, "wizard-active"
+            )
+        name, title = self.STEPS[self._step]
+        self.query_one("#wizard-step-label", Label).update(
+            f"Step {self._step + 1} of {len(self.STEPS)} — {title}"
+        )
+        self.query_one("#wizard-back", Button).disabled = self._step == 0
+        next_label = "Next"
+        if name == "welcome":
+            next_label = "Get started"
+        elif name == "review":
+            next_label = "Start setup"
+        self.query_one("#wizard-next", Button).label = next_label
+        if name == "review":
+            self._update_summary()
+
+    def _summary_lines(self) -> list:
+        agent_key = str(self.query_one("#agent", Select).value)
+        lines = [
+            f"Application repo: {self.query_one('#app-path', Input).value.strip()}",
+            f"Branch: {str(self.query_one('#app-branch', Select).value or 'HEAD')}",
+            f"Docs repo: {self.query_one('#docs-path', Input).value.strip()}",
+            f"Agent: {agent_key}",
+        ]
+        if agent_supports_models(agent_key):
+            writer = _model_display_name(self._model_choices, self._work_model) or "default"
+            plan = _model_display_name(self._model_choices, self._plan_model) or "default"
+            lines.append(f"Planner model (scans repo, picks sections): {plan}")
+            lines.append(f"Writer model (writes each section): {writer}")
+        else:
+            lines.append(
+                "Model: "
+                + (_model_display_name(self._model_choices, self._work_model) or "default")
+            )
+        lines.append(f"Parallel agents: {_jobs_from_input(self, 1)}")
+        import_from = self.query_one("#import-from", Input).value.strip()
+        if import_from:
+            into = self.query_one("#import-into", Input).value.strip() or "(first type)"
+            lines.append(f"Import docs from: {import_from} → {into}")
+        return lines
+
+    def _update_summary(self) -> None:
+        self.query_one("#wizard-summary", Static).update("\n".join(self._summary_lines()))
+
+    def _sync_model_select(self, agent_key: str) -> None:
+        show = agent_supports_models(agent_key)
+        self.query_one("#model-row").display = show
+        if show:
+            self.query_one("#model-label", Label).update("Models: loading…")
+            self.run_worker(self._load_models(agent_key), exclusive=True, group="models")
+
+    async def _load_models(self, agent_key: str) -> None:
+        choices = await asyncio.to_thread(list_agent_models, agent_key)
+        if not self.is_attached:
+            return
+        current = str(self.query_one("#agent", Select).value)
+        if current != agent_key:
+            return
+        self._model_choices = choices
+        if choices:
+            keys = {c.key: c.value for c in choices}
+            pick = default_cursor_work_model(choices)
+            if pick in keys and not self._work_model:
+                self._work_model = keys[pick]
+            else:
+                current_choices = [c for c in choices if c.group == "current"]
+                if not self._work_model:
+                    self._work_model = (
+                        current_choices[0] if current_choices else choices[0]
+                    ).value
+            plan_pick = default_cursor_plan_model(choices)
+            if plan_pick in keys and not self._plan_model:
+                self._plan_model = keys[plan_pick]
+        self._update_model_label()
+
+    def _update_model_label(self) -> None:
+        self.query_one("#model-label", Label).update(
+            _model_label_text(self._model_choices, self._work_model, self._plan_model)
+        )
+
+    def _open_model_picker(self) -> None:
+        agent_key = str(self.query_one("#agent", Select).value)
+        show_plan = agent_supports_models(agent_key)
+
+        def _on_picked(result: Optional[dict]) -> None:
+            if not result:
+                return
+            if result.get("model"):
+                self._work_model = result["model"]
+            if "plan_model" in result:
+                self._plan_model = result.get("plan_model") or ""
+            self._update_model_label()
+
+        self.app.push_screen(
+            ModelSelectScreen(
+                agent_key=agent_key,
+                choices=self._model_choices,
+                selected_work=self._work_model,
+                selected_plan=self._plan_model,
+                show_plan=show_plan,
+            ),
+            _on_picked,
+        )
+
+    @staticmethod
+    def _app_repo_error(path: str) -> str:
+        path = (path or "").strip()
+        if not path or not os.path.isdir(path):
+            return "Application repo path does not exist."
+        try:
+            list_app_branches(path)
+        except Exception as exc:
+            return f"Not a usable git repository ({exc})."
+        return ""
+
+    @staticmethod
+    def _docs_repo_error(path: str) -> str:
+        path = (path or "").strip()
+        if not path:
+            return "Choose where the docs repo should live."
+        if os.path.isdir(path):
+            allowed = {".git", ".gitignore", ".gitattributes", ".gitkeep"}
+            leftovers = [entry for entry in os.listdir(path) if entry not in allowed]
+            if leftovers:
+                return (
+                    f"'{path}' is not empty (found {leftovers[0]})."
+                    " DocFlow needs an empty folder for a fresh docs repo."
+                )
+        return ""
+
+    def _validate_current(self) -> str:
+        name = self.STEPS[self._step][0]
+        if name == "app":
+            return self._app_repo_error(str(self.query_one("#app-path", Input).value))
+        if name == "docs":
+            return self._docs_repo_error(str(self.query_one("#docs-path", Input).value))
+        if name == "agent":
+            agent_key = str(self.query_one("#agent", Select).value)
+            missing = missing_agent_binary(agent_key)
+            if agent_key != "manual" and missing:
+                return (
+                    f"'{missing}' was not found on PATH. "
+                    "Install it (or run DocFlow where it is installed, e.g. inside WSL), "
+                    "or choose a different agent."
+                )
+        return ""
+
+    def _show_wizard_error(self, message: str) -> None:
+        error = self.query_one("#wizard-error", Label)
+        error.update(message)
+        error.display = True
+
+    def _advance(self) -> None:
+        error = self._validate_current()
+        if error:
+            self._show_wizard_error(error)
+            return
+        self.query_one("#wizard-error", Label).display = False
+        if self._step >= len(self.STEPS) - 1:
+            self._finish()
+            return
+        self._show_step(self._step + 1)
+
+    def _finish(self) -> None:
+        types = parse_doc_types_text(self.query_one("#types", TextArea).text)
+        self.dismiss(
+            {
+                "app": self.query_one("#app-path", Input).value.strip(),
+                "docs": self.query_one("#docs-path", Input).value.strip(),
+                "agent": str(self.query_one("#agent", Select).value),
+                "model": self._work_model,
+                "plan_model": self._plan_model,
+                "types": types or list(DEFAULT_DOC_TYPES),
+                "import_from": self.query_one("#import-from", Input).value.strip(),
+                "import_into": self.query_one("#import-into", Input).value.strip(),
+                "jobs": _jobs_from_input(self, 1),
+                "branch": str(self.query_one("#app-branch", Select).value or ""),
+            }
+        )
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "app-path":
+            return
+        path = event.value.strip()
+        options, default = _branch_select_options(path)
+        picker = self.query_one("#app-branch", Select)
+        picker.set_options(options)
+        picker.value = default
+        new_default = default_docs_path(path) if path else ""
+        docs_input = self.query_one("#docs-path", Input)
+        if not docs_input.value.strip() or docs_input.value.strip() == self._last_docs_default:
+            docs_input.value = new_default
+        self._last_docs_default = new_default
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "agent":
+            self.query_one("#wizard-error", Label).display = False
+            self._sync_model_select(str(event.value))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == "cancel":
+            self.dismiss(None)
+            return
+        if event.button.id == "wizard-back":
+            self.query_one("#wizard-error", Label).display = False
+            self._show_step(self._step - 1)
+            return
+        if event.button.id == "wizard-manual":
+            self.dismiss({"manual": True})
+            return
+        if event.button.id == "change-model":
+            self._open_model_picker()
+            return
+        if event.button.id == "wizard-next":
+            self._advance()
 
 
 class SectionPickerScreen(ModalScreen[Optional[list]]):
@@ -934,46 +1290,50 @@ class GenerateScreen(ModalScreen[Optional[dict]]):
             self._repo,
             getattr(dash, "app_branch", "") or "",
         )
-        with Vertical(id="dialog"):
+        with Vertical(id="dialog", classes="generate-dialog"):
             yield Label("Update documentation", classes="title")
-            yield Label("Application branch")
-            yield Select(
-                app_branch_options,
-                value=app_branch_default,
-                id="app-branch",
-                allow_blank=False,
-            )
-            yield Label("What to use")
-            yield Select(
-                [
-                    ("New commits since last update", "new"),
-                    ("Last N commits", "commits"),
-                    ("Full regeneration", "full"),
-                ],
-                value="new",
-                id="source",
-                allow_blank=False,
-            )
-            yield Label("Head / branch", id="tip-label")
-            yield Select(tip_options, value="HEAD", id="tip", allow_blank=False)
-            yield Label("How many commits back from that head", id="count-label")
-            yield Input(value="1", id="commit-count")
-            yield Label("Commits included")
-            yield Static("Loading commit preview…", id="preview")
-            yield Label("Feature / type (optional)")
-            yield Input(placeholder="leave blank to infer from the diff", id="feature")
-            yield Label("Agent")
-            yield Select(
-                _agent_select_options(),
-                value=_agent_key_from_dash(dash),
-                id="agent",
-                allow_blank=False,
-            )
-            with Horizontal(id="model-row", classes="model-row"):
-                yield Label("Target Model: loading…", id="model-label")
-                yield Button("Change", id="change-model")
-            yield Label("Parallel agents (1 is safest on most PCs)")
-            yield Input(value=str(dash.concurrency or 1), id="jobs")
+            with Horizontal(id="generate-columns"):
+                with Vertical(classes="setup-pane setup-left"):
+                    yield Label("Update settings", classes="pane-title")
+                    yield Label("Application branch")
+                    yield Select(
+                        app_branch_options,
+                        value=app_branch_default,
+                        id="app-branch",
+                        allow_blank=False,
+                    )
+                    yield Label("What to use")
+                    yield Select(
+                        [
+                            ("New commits since last update", "new"),
+                            ("Last N commits", "commits"),
+                            ("Full regeneration", "full"),
+                        ],
+                        value="new",
+                        id="source",
+                        allow_blank=False,
+                    )
+                    yield Label("Head / branch", id="tip-label")
+                    yield Select(tip_options, value="HEAD", id="tip", allow_blank=False)
+                    yield Label("How many commits back from that head", id="count-label")
+                    yield Input(value="1", id="commit-count")
+                    yield Label("Commits included")
+                    yield Static("Loading commit preview…", id="preview")
+                    yield Label("Feature / type (optional)")
+                    yield Input(placeholder="leave blank to infer from the diff", id="feature")
+                with Vertical(classes="setup-pane setup-right"):
+                    yield Label("Agent", classes="pane-title")
+                    yield Select(
+                        _agent_select_options(),
+                        value=_agent_key_from_dash(dash),
+                        id="agent",
+                        allow_blank=False,
+                    )
+                    with Horizontal(id="model-row", classes="model-row"):
+                        yield Label("Models: loading…", id="model-label")
+                        yield Button("Change", id="change-model")
+                    yield Label("Parallel agents (1 is safest on most PCs)")
+                    yield Input(value=str(dash.concurrency or 1), id="jobs")
             with Horizontal(classes="buttons"):
                 yield Button("Generate", variant="primary", id="ok")
                 yield Button("Cancel", id="cancel")
@@ -987,7 +1347,7 @@ class GenerateScreen(ModalScreen[Optional[dict]]):
         model_row = self.query_one("#model-row")
         model_row.display = show
         if show:
-            self.query_one("#model-label", Label).update("Target Model: loading…")
+            self.query_one("#model-label", Label).update("Models: loading…")
             self.run_worker(self._load_models(agent_key), exclusive=True, group="models")
 
     async def _load_models(self, agent_key: str) -> None:
@@ -1034,15 +1394,13 @@ class GenerateScreen(ModalScreen[Optional[dict]]):
         self._update_model_label()
 
     def _update_model_label(self) -> None:
-        display = _model_display_name(self._model_choices, self._work_model)
-        if self._plan_model and self._plan_model != self._work_model and self._plan_model != "auto":
-            plan_display = _model_display_name(self._model_choices, self._plan_model)
-            display = f"{display} (plan: {plan_display})"
-        self.query_one("#model-label", Label).update(f"Target Model: {display}")
+        self.query_one("#model-label", Label).update(
+            _model_label_text(self._model_choices, self._work_model, self._plan_model)
+        )
 
     def _open_model_picker(self) -> None:
         agent_key = str(self.query_one("#agent", Select).value)
-        show_plan = agent_key in CURSOR_AGENT_KEYS or agent_key in OPENCODE_AGENT_KEYS
+        show_plan = agent_supports_models(agent_key)
 
         def _on_picked(result: Optional[dict]) -> None:
             if not result:
@@ -1107,7 +1465,10 @@ class GenerateScreen(ModalScreen[Optional[dict]]):
                 if len(new_commits) > 15:
                     lines.append(f"… {len(new_commits) - 15} more")
             else:
-                lines.append("Nothing new on this branch locally. Update docs will fetch the remote first.")
+                lines.append(
+                    "Nothing new on this branch locally. To rebuild anyway,"
+                    " switch 'What to use' above to 'Full regeneration'."
+                )
             return "\n".join(lines)
         count = self._commit_count()
         try:
@@ -1206,7 +1567,7 @@ class RegenLastScreen(ModalScreen[Optional[dict]]):
                 allow_blank=False,
             )
             with Horizontal(id="model-row", classes="model-row"):
-                yield Label("Target Model: loading…", id="model-label")
+                yield Label("Models: loading…", id="model-label")
                 yield Button("Change", id="change-model")
             with Horizontal(classes="buttons"):
                 yield Button("Regenerate", variant="primary", id="ok")
@@ -1220,7 +1581,7 @@ class RegenLastScreen(ModalScreen[Optional[dict]]):
         model_row = self.query_one("#model-row")
         model_row.display = show
         if show:
-            self.query_one("#model-label", Label).update("Target Model: loading…")
+            self.query_one("#model-label", Label).update("Models: loading…")
             self.run_worker(self._load_models(agent_key), exclusive=True, group="models")
 
     async def _load_models(self, agent_key: str) -> None:
@@ -1267,15 +1628,13 @@ class RegenLastScreen(ModalScreen[Optional[dict]]):
         self._update_model_label()
 
     def _update_model_label(self) -> None:
-        display = _model_display_name(self._model_choices, self._work_model)
-        if self._plan_model and self._plan_model != self._work_model and self._plan_model != "auto":
-            plan_display = _model_display_name(self._model_choices, self._plan_model)
-            display = f"{display} (plan: {plan_display})"
-        self.query_one("#model-label", Label).update(f"Target Model: {display}")
+        self.query_one("#model-label", Label).update(
+            _model_label_text(self._model_choices, self._work_model, self._plan_model)
+        )
 
     def _open_model_picker(self) -> None:
         agent_key = str(self.query_one("#agent", Select).value)
-        show_plan = agent_key in CURSOR_AGENT_KEYS or agent_key in OPENCODE_AGENT_KEYS
+        show_plan = agent_supports_models(agent_key)
 
         def _on_picked(result: Optional[dict]) -> None:
             if not result:
@@ -1355,6 +1714,108 @@ class PublishScreen(ModalScreen[Optional[dict]]):
                 "platform": str(self.query_one("#platform", Select).value),
             }
         )
+
+
+class ExportScreen(ModalScreen[Optional[dict]]):
+    """Export human docs to a static-site content folder."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def compose(self) -> ComposeResult:
+        dash = _screen_dashboard(self)
+        docs = dash.docs_repo_path or os.getcwd()
+        suggestion = default_site_export_path(docs)
+        with Vertical(id="dialog"):
+            yield Label("Export documentation site", classes="title")
+            yield Label("Format")
+            yield Select(
+                [("Docusaurus", "docusaurus")],
+                value="docusaurus",
+                id="export-format",
+                allow_blank=False,
+            )
+            yield Label("Output folder (outside the docs repo)")
+            yield Input(value=suggestion, id="out-path")
+            yield Static(
+                "Writes converted markdown only — no agents, no network."
+                " The docs repo is never modified.",
+                classes="wizard-copy",
+            )
+            yield Label("", id="export-error")
+            with Horizontal(classes="buttons"):
+                yield Button("Export", variant="primary", id="ok")
+                yield Button("Cancel", id="cancel")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == "cancel":
+            self.dismiss(None)
+            return
+        out = self.query_one("#out-path", Input).value.strip()
+        error = self.query_one("#export-error", Label)
+        try:
+            from docflow.core.site_exporter import validate_out_path
+
+            validate_out_path(_screen_dashboard(self).docs_repo_path, out)
+        except ValueError as exc:
+            error.update(str(exc))
+            error.display = True
+            return
+        error.display = False
+        self.dismiss(
+            {
+                "fmt": str(self.query_one("#export-format", Select).value),
+                "out": out,
+            }
+        )
+
+
+class SettingsScreen(ModalScreen[Optional[str]]):
+    """Advanced settings hub: project lifecycle, import/export, pull, switch."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def compose(self) -> ComposeResult:
+        dash = _screen_dashboard(self)
+        configured = dash.configured
+        options = [
+            Option(
+                "New project…  (guided setup wizard)",
+                id="setup",
+            ),
+            Option("Import existing docs…", id="import", disabled=not configured),
+            Option("Switch project…", id="switch"),
+            Option(
+                "Export documentation site…",
+                id="export",
+                disabled=not configured,
+            ),
+            Option("Git pull (application repo)", id="pull"),
+        ]
+        with Vertical(id="dialog"):
+            yield Label("Settings", classes="title")
+            yield Static("Everything except the everyday run actions lives here.", classes="wizard-copy")
+            yield OptionList(*options, id="settings-list")
+            with Horizontal(classes="buttons"):
+                yield Button("Close", id="cancel")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_list.id != "settings-list":
+            return
+        event.stop()
+        if event.option.id:
+            self.dismiss(str(event.option.id))
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == "cancel":
+            self.dismiss(None)
 
 
 class DocFlowApp(App[None]):
@@ -1444,7 +1905,14 @@ class DocFlowApp(App[None]):
         width: 100%;
         margin: 1 0;
     }
+    #dialog.generate-dialog {
+        width: 100%;
+        margin: 1 0;
+    }
     #setup-columns {
+        height: auto;
+    }
+    #generate-columns {
         height: auto;
     }
     .setup-pane {
@@ -1462,6 +1930,39 @@ class DocFlowApp(App[None]):
         display: none;
         color: $error;
         margin-bottom: 1;
+    }
+    .wizard-step {
+        display: none;
+    }
+    .wizard-step.wizard-active {
+        display: block;
+    }
+    #wizard-step-label {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    .wizard-copy {
+        margin-bottom: 1;
+    }
+    #wizard-summary {
+        border: round $border-blurred;
+        padding: 1;
+        margin-bottom: 1;
+    }
+    #wizard-error {
+        display: none;
+        color: $error;
+        margin-bottom: 1;
+    }
+    .model-roles-hint {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    #wizard-nav {
+        height: auto;
+    }
+    #wizard-nav Button {
+        margin-right: 1;
     }
     #dialog .title {
         text-style: bold;
@@ -1531,12 +2032,18 @@ class DocFlowApp(App[None]):
     """
 
     BINDINGS = [
-        Binding("g", "generate", "Update"),
-        Binding("u", "pull", "Pull"),
-        Binding("p", "publish", "Publish"),
-        Binding("i", "setup", "Setup"),
-        Binding("s", "switch", "Switch"),
-        Binding("m", "mcp", "MCP"),
+        Binding("u", "generate", "Update", show=False),
+        Binding("g", "generate", "Update", show=False),
+        Binding("p", "publish", "Publish", show=False),
+        Binding("m", "mcp", "MCP", show=False),
+        Binding("r", "refresh", "Refresh", show=False),
+        Binding("s", "settings", "Settings", show=False),
+        Binding("comma", "settings", "Settings", show=False),
+        Binding("i", "settings", "Settings", show=False),
+        Binding("l", "pull", "Pull", show=False),
+        Binding("w", "switch", "Switch", show=False),
+        Binding("e", "export", "Export", show=False),
+        Binding("n", "new_project", "New project", show=False),
         Binding("f8", "toggle_pause", "Pause/Resume"),
         Binding("q", "quit", "Quit"),
     ]
@@ -1597,6 +2104,8 @@ class DocFlowApp(App[None]):
         yield Header(show_clock=True)
         with Vertical(id="main"):
             yield Static("Loading…", id="summary")
+            with Collapsible(collapsed=True, title="Details", id="summary-details"):
+                yield Static("", id="summary-extra")
             with Horizontal(id="busy-row"):
                 yield LoadingIndicator(id="busy")
                 yield Static("Ready", id="step")
@@ -1605,19 +2114,17 @@ class DocFlowApp(App[None]):
                 with Vertical(id="progress-pane"):
                     yield Static("Progress", classes="pane-title", id="progress-title")
                     with VerticalScroll(id="progress-scroll"):
-                        yield Static("Ready. Press u to pull, g to update docs from new commits.", id="progress")
+                        yield Static("Ready. Press l to pull, u to update docs from new commits.", id="progress")
                 with Vertical(id="log-pane"):
                     yield Static("Logs", classes="pane-title", id="log-title")
                     yield Log(id="log", highlight=False, max_lines=500)
             with Horizontal(id="actions"):
-                yield Button("Setup", id="btn-setup")
-                yield Button("Pull", id="btn-pull")
-                yield Button("Update docs", variant="primary", id="btn-generate")
-                yield Button("Publish", id="btn-publish")
-                yield Button("MCP (SSE)", id="btn-mcp")
-                yield Button("Refresh", id="btn-refresh")
-                yield Button("Switch", id="btn-switch")
-                yield Button("Pause", id="btn-pause", disabled=True)
+                yield Button("[underline]U[/underline]pdate docs", variant="primary", id="btn-generate")
+                yield Button("[underline]P[/underline]ublish", id="btn-publish")
+                yield Button("[underline]M[/underline]CP (SSE)", id="btn-mcp")
+                yield Button("[underline]R[/underline]efresh", id="btn-refresh")
+                yield Button("[underline]S[/underline]ettings", id="btn-settings")
+                yield Button("Pause (F8)", id="btn-pause", disabled=True)
         yield Footer()
 
     def on_mount(self) -> None:
@@ -1750,59 +2257,57 @@ class DocFlowApp(App[None]):
             self.query_one("#progress-title", Static).update("Progress")
         pause_btn = self.query_one("#btn-pause", Button)
         pause_btn.disabled = not busy
-        for button_id in ("btn-setup", "btn-pull", "btn-generate", "btn-publish", "btn-mcp", "btn-refresh", "btn-switch"):
+        for button_id in ("btn-generate", "btn-publish", "btn-mcp", "btn-refresh", "btn-settings"):
             self.query_one(f"#{button_id}", Button).disabled = busy
 
     def refresh_summary(self) -> None:
+        core_lines: list[str] = []
+        extra_lines: list[str] = []
         if self._blank_session:
             self.title = "DocFlow"
-            self.query_one("#btn-setup", Button).label = "Setup"
-            self.query_one("#summary", Static).update(
-                "\n".join(
-                    [
-                        "Project  [bold]not set[/bold]",
-                        "App      not set",
-                        "Docs     not set",
-                        "Jobs     1 agent(s) at a time",
-                        "Agent    not set",
-                        "Types: none",
-                        "Documented: none yet",
-                        "New commits (0): none",
-                        "Features (0): none",
-                        "Pending prompts (0): none",
-                    ]
-                )
+            core_lines = [
+                "Project  [bold]not set[/bold]",
+                "App      not set",
+                "Docs     not set",
+                "Branch   not set",
+            ]
+            extra_lines = ["Run Settings → New project to begin."]
+        else:
+            dash = self._dashboard()
+            self.title = dash.project_name or "DocFlow"
+            core_lines = [
+                f"Project  [bold]{dash.project_name or 'not set'}[/bold]",
+                f"App      {dash.app_repo_path or 'not set'}  ({'ok' if dash.app_exists else 'missing'})",
+                f"Docs     {dash.docs_repo_path or 'not set'}  ({'ok' if dash.docs_exists else 'missing'})",
+                f"Branch   {dash.app_branch or 'not set'}",
+            ]
+            agent_line = (
+                f"Agent    {dash.agent_name or dash.agent_mode}"
+                + (f"  plan {dash.plan_model}" if getattr(dash, "plan_model", "") else "")
+                + (f"  work {dash.agent_model}" if dash.agent_model else "")
+                + f"  {dash.agent_command or 'manual'}"
             )
-            return
-        dash = self._dashboard()
-        self.title = dash.project_name or "DocFlow"
-        lines = [
-            f"Project  [bold]{dash.project_name or 'not set'}[/bold]",
-            f"App      {dash.app_repo_path or 'not set'}  ({'ok' if dash.app_exists else 'missing'})",
-            f"Docs     {dash.docs_repo_path or 'not set'}  ({'ok' if dash.docs_exists else 'missing'})",
-            f"Branch   {dash.app_branch or 'not set'}",
-            f"Jobs     {dash.concurrency} agent(s) at a time",
-            f"Agent    {dash.agent_name or dash.agent_mode}"
-            + (f"  plan {dash.plan_model}" if getattr(dash, "plan_model", "") else "")
-            + (f"  work {dash.agent_model}" if dash.agent_model else "")
-            + f"  {dash.agent_command or 'manual'}",
-            f"Types: {', '.join(dash.doc_types) or 'none'}",
-            f"Documented: {dash.last_documented.short_sha}  {dash.last_documented.message}"
-            if dash.last_documented
-            else "Documented: none yet",
-            f"New commits ({len(dash.new_commits)}): "
-            + (
-                ", ".join(f"{c.short_sha} {c.message}" for c in dash.new_commits[:3])
-                or "none"
-            ),
-            f"Features ({len(dash.features)}): {', '.join(dash.features) or 'none'}",
-            f"Pending prompts ({len(dash.pending)}): {', '.join(dash.pending) or 'none'}",
-        ]
-        if dash.source_path:
-            lines.append(f"Config {dash.source_path}")
-        setup_btn = self.query_one("#btn-setup", Button)
-        setup_btn.label = "Import" if dash.configured else "Setup"
-        self.query_one("#summary", Static).update("\n".join(lines))
+            extra_lines = [
+                f"Jobs     {dash.concurrency} agent(s) at a time",
+                agent_line,
+                f"Types: {', '.join(dash.doc_types) or 'none'}",
+                (
+                    f"Documented: {dash.last_documented.short_sha}  {dash.last_documented.message}"
+                    if dash.last_documented
+                    else "Documented: none yet"
+                ),
+                f"New commits ({len(dash.new_commits)}): "
+                + (
+                    ", ".join(f"{c.short_sha} {c.message}" for c in dash.new_commits[:3])
+                    or "none"
+                ),
+                f"Features ({len(dash.features)}): {', '.join(dash.features) or 'none'}",
+                f"Pending prompts ({len(dash.pending)}): {', '.join(dash.pending) or 'none'}",
+            ]
+            if dash.source_path:
+                extra_lines.append(f"Config {dash.source_path}")
+        self.query_one("#summary", Static).update("\n".join(core_lines))
+        self.query_one("#summary-extra", Static).update("\n".join(extra_lines))
 
     def _run_dialog(self, coro) -> None:
         # Textual 8: push_screen_wait must run inside a worker, not a message handler.
@@ -1810,13 +2315,11 @@ class DocFlowApp(App[None]):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         mapping = {
-            "btn-setup": self.action_setup,
-            "btn-pull": self.action_pull,
             "btn-generate": self.action_generate,
             "btn-publish": self.action_publish,
+            "btn-settings": self.action_settings,
             "btn-mcp": self.action_mcp,
             "btn-refresh": self.action_refresh,
-            "btn-switch": self.action_switch,
             "btn-pause": self.action_toggle_pause,
         }
         action = mapping.get(event.button.id or "")
@@ -1844,11 +2347,55 @@ class DocFlowApp(App[None]):
         else:
             self._run_dialog(self._do_setup())
 
+    def action_settings(self) -> None:
+        self._run_dialog(self._do_settings())
+
+    def action_new_project(self) -> None:
+        self._run_dialog(self._do_setup())
+
+    async def _do_settings(self) -> None:
+        choice = await self.push_screen_wait(SettingsScreen())
+        if not choice:
+            return
+        if choice == "setup":
+            await self._do_setup()
+        elif choice == "import":
+            await self._do_import()
+        elif choice == "switch":
+            await self._do_switch()
+        elif choice == "export":
+            await self._do_export()
+        elif choice == "pull":
+            await self._do_pull()
+
     def action_generate(self) -> None:
         self._run_dialog(self._do_generate())
 
     def action_publish(self) -> None:
         self._run_dialog(self._do_publish())
+
+    def action_export(self) -> None:
+        self._run_dialog(self._do_export())
+
+    async def _do_export(self) -> None:
+        try:
+            paths = self._resolve(require=False)
+        except ConfigError:
+            paths = None
+        if not paths or not paths.docs_repo_path:
+            self._log("Not configured yet. Run Setup first (press i).")
+            return
+        data = await self.push_screen_wait(ExportScreen())
+        if not data:
+            return
+        fmt, out = data["fmt"], data["out"]
+        self._begin_run(f"Exporting {fmt} content…")
+        try:
+            result = await asyncio.to_thread(export_site, paths.docs_repo_path, out, fmt)
+        except Exception as exc:
+            self._finish_run(f"Export failed: {exc}")
+            return
+        self._finish_run(f"Exported {result.pages} page(s) → {result.out_dir}")
 
     def action_mcp(self) -> None:
         self._run_dialog(self._do_mcp())
@@ -1887,7 +2434,9 @@ class DocFlowApp(App[None]):
         self.refresh_summary()
 
     async def _do_setup(self) -> None:
-        data = await self.push_screen_wait(SetupScreen())
+        data = await self.push_screen_wait(SetupWizardScreen())
+        if data and data.get("manual"):
+            data = await self.push_screen_wait(SetupScreen())
         if not data:
             return
         spec = resolve_agent(

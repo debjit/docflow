@@ -100,6 +100,10 @@ def write_conventions_path(docs_repo_path: str) -> str:
     return os.path.join(docflow_dir(docs_repo_path), CONVENTIONS_FILENAME)
 
 
+def agent_logs_dir(docs_repo_path: str) -> str:
+    return os.path.join(docflow_dir(docs_repo_path), "logs")
+
+
 def pending_prompts_dir(docs_repo_path: str) -> str:
     return os.path.join(docflow_dir(docs_repo_path), "prompts", "pending")
 
